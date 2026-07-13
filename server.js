@@ -2,6 +2,10 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs'); // استيراد التشفير لزرع الأدمن
 const db = require('./config/db');
+const contractRoutes = require('./routes/contractRoutes');
+const siteRoutes = require('./routes/siteRoutes');
+const workerRoutes = require('./routes/workerRoutes');
+const assignmentRoutes = require('./routes/assignmentRoutes');
 require('dotenv').config();
 
 // استيراد المسارات (Routes)
@@ -17,7 +21,10 @@ app.use(express.json());
 // ربط المسارات بالسيرفر
 app.use('/api/auth', authRoutes);
 app.use('/api/projects', projectRoutes); // 👈 تفعيل الـ API الخاص بالمشاريع
-
+app.use('/api/contracts', contractRoutes);
+app.use('/api/sites', siteRoutes);
+app.use('/api/workers', workerRoutes);
+app.use('/api/assignments', assignmentRoutes);
 // 1. فحص الاتصال بقاعدة البيانات وزرع الأدمن (النسخة الأولى - حقول كاملة)
 app.get('/seed-admin-1', async (req, res) => {
     try {
