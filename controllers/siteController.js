@@ -53,3 +53,23 @@ exports.createSite = async (req, res) => {
         return res.status(500).json({ status: 'error', message: 'حدث خطأ في السيرفر أثناء إنشاء الموقع' });
     }
 };
+
+// 3. جلب المواقع التابعة لمشرف معين
+exports.getSitesBySupervisor = async (req, res) => {
+    const { supervisorId } = req.params;
+    try {
+        const query = `
+            SELECT s.*, c.contract_name, p.project_name
+            FROM Sites s
+            LEFT JOIN Contracts c ON s.contract_id = c.contract_id
+            LEFT JOIN Projects p ON c.project_id = p.project_id
+            WHERE s.supervisor_id = ? AND s.site_status = 'Active'
+            ORDER BY s.created_at DESC
+        `;
+        const [rows] = await db.query(query, [supervisorId]);
+        return res.status(200).json({ status: 'success', data: rows });
+    } catch (error) {
+        console.error("🚨 FETCH SUPERVISOR SITES ERROR:", error);
+        return res.status(500).json({ status: 'error', message: 'حدث خطأ أثناء جلب مواقع المشرف' });
+    }
+};

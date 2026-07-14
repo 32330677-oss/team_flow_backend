@@ -56,9 +56,10 @@ exports.login = async (req, res) => {
         }
 
         // 5. توليد الـ JWT مع قيمة احتياطية للـ Secret تجنباً لكراش السيرفر
+        // 5. توليد الـ JWT مع قيمة احتياطية للـ Secret تجنباً لكراش السيرفر
         const jwtSecret = process.env.JWT_SECRET || 'teamflow_super_secure_fallback_key';
         const token = jwt.sign(
-            { id: user.user_id, role: user.role },
+            { user_id: user.user_id, role: user.role }, // تعديل المفتاح هنا إلى user_id
             jwtSecret,
             { expiresIn: '24h' }
         );
