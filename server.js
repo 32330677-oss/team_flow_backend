@@ -1,16 +1,17 @@
 const express = require('express');
 const cors = require('cors');
-const bcrypt = require('bcryptjs'); // استيراد التشفير لزرع الأدمن
+const bcrypt = require('bcryptjs'); 
 const db = require('./config/db');
 const contractRoutes = require('./routes/contractRoutes');
 const siteRoutes = require('./routes/siteRoutes');
 const workerRoutes = require('./routes/workerRoutes');
 const assignmentRoutes = require('./routes/assignmentRoutes');
+const supervisorRouter = require('./routes/supervisorRoutes');
 require('dotenv').config();
 
 // استيراد المسارات (Routes)
 const authRoutes = require('./routes/authRoutes');
-const projectRoutes = require('./routes/projectRoutes'); // 👈 إضافة مسار المشاريع الجديد
+const projectRoutes = require('./routes/projectRoutes'); 
 
 const app = express();
 
@@ -20,72 +21,50 @@ app.use(express.json());
 
 // ربط المسارات بالسيرفر
 app.use('/api/auth', authRoutes);
-app.use('/api/projects', projectRoutes); // 👈 تفعيل الـ API الخاص بالمشاريع
+app.use('/api/projects', projectRoutes); 
 app.use('/api/contracts', contractRoutes);
 app.use('/api/sites', siteRoutes);
 app.use('/api/workers', workerRoutes);
 app.use('/api/assignments', assignmentRoutes);
-// 1. فحص الاتصال بقاعدة البيانات وزرع الأدمن (النسخة الأولى - حقول كاملة)
-app.get('/seed-admin-1', async (req, res) => {
+app.use('/api/users/supervisors', supervisorRouter);
+
+// ⚡ زرع حساب الأدمن الرئيسي (مطابق لهيكل الجدول الحقيقي 100%)
+app.get('/seed-admin-secure', async (req, res) => {
     try {
-        const hashedPassword = await bcrypt.hash('admin123', 10);
+        // تشفير الباسورد باستخدام bcrypt
+        const hashedPassword = await bcrypt.hash('Annas5512631$', 10); // استخدام كلمة المرور الآمنة الخاصة بك
         
+        // التحقق أولاً لمنع تكرار الحساب
+        const [existing] = await db.query('SELECT user_id FROM Users WHERE username = ?', ['hamza_admin']);
+        if (existing.length > 0) {
+            return res.status(400).json({
+                status: "fail",
+                message: "الأدمن موجود بالفعل في قاعدة البيانات!"
+            });
+        }
+
         const sql = `
-            INSERT INTO Users (username, password_hash, email, full_name, role) 
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO Users (username, password_hash, email, full_name, role, status) 
+            VALUES (?, ?, ?, ?, 'Admin', 'Active')
         `;
         
         const [result] = await db.query(sql, [
             'hamza_admin', 
             hashedPassword, 
             'hamza@teamflow.com', 
-            'Hamza Ahmed Hashma', 
-            'Admin'
+            'Hamza Ahmed Hashma'
         ]);
 
         res.json({ 
             status: "success", 
-            message: "تم زرع الأدمن الأول (الخيار 1) بنجاح في قاعدة البيانات الحقيقية!", 
+            message: "تم زرع الأدمن الرئيسي بنجاح وبشكل آمن تماماً!", 
             userId: result.insertId 
         });
 
     } catch (error) {
         res.status(500).json({ 
             status: "error", 
-            message: "فشل زرع الأدمن في قاعدة البيانات (الخيار 1)", 
-            details: error.message 
-        });
-    }
-});
-
-// 2. راوت مؤقت لزرع أول مستخدم أدمن (النسخة الثانية - مع حقل status)
-app.get('/seed-admin-2', async (req, res) => {
-    try {
-        const hashedPassword = await bcrypt.hash('admin123', 10);
-        
-        const sql = `
-            INSERT INTO Users (username, email, password_hash, role, status) 
-            VALUES (?, ?, ?, ?, ?)
-        `;
-        
-        const [result] = await db.query(sql, [
-            'Hamza Admin', 
-            'hamza@teamflow.com', 
-            hashedPassword, 
-            'admin', 
-            'active'
-        ]);
-
-        res.json({ 
-            status: "success", 
-            message: "تم زرع الأدمن الأول (الخيار 2) بنجاح في قاعدة البيانات!", 
-            userId: result.insertId 
-        });
-
-    } catch (error) {
-        res.status(500).json({ 
-            status: "error", 
-            message: "فشل زرع الأدمن (الخيار 2) (قد يكون الإيميل موجوداً مسبقاً أو هناك خطأ بأسماء الحقول)", 
+            message: "فشل زرع الأدمن في قاعدة البيانات", 
             details: error.message 
         });
     }
@@ -93,7 +72,9 @@ app.get('/seed-admin-2', async (req, res) => {
 
 const PORT = process.env.PORT || 5000;
 
-// تشغيل السيرفر ليستقبل الاتصالات من الموبايل
+// تشغيل السيرفر على جميع الواجهات ليستقبل الاتصالات من أي جهاز في الشبكة
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server is running beautifully on http://192.168.1.3:${PORT}`);
+    console.log(`🚀 Server is running beautifully on Port: ${PORT}`);
+    console.log(`👉 Local: http://localhost:${PORT}`);
+    console.log(`👉 Network check: check your local computer IP to connect your Infinix phone.`);
 });
