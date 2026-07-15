@@ -7,6 +7,7 @@ const siteRoutes = require('./routes/siteRoutes');
 const workerRoutes = require('./routes/workerRoutes');
 const assignmentRoutes = require('./routes/assignmentRoutes');
 const supervisorRouter = require('./routes/supervisorRoutes');
+
 require('dotenv').config();
 
 // استيراد المسارات (Routes)
@@ -28,6 +29,7 @@ app.use('/api/workers', workerRoutes);
 app.use('/api/assignments', assignmentRoutes);
 app.use('/api/users/supervisors', supervisorRouter);
 app.use('/api/attendance', require('./routes/attendanceRoutes'));
+
 // ⚡ زرع حساب الأدمن الرئيسي (مطابق لهيكل الجدول الحقيقي 100%)
 app.get('/seed-admin-secure', async (req, res) => {
     try {

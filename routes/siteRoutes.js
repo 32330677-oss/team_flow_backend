@@ -1,9 +1,18 @@
 const express = require('express');
 const router = express.Router();
 const siteController = require('../controllers/siteController');
+const authMiddleware = require('../middleware/authMiddleware');
 
+// حماية شاملة لجميع روابط المواقع
+router.use(authMiddleware);
+
+// الروابط محمية الآن تلقائياً
 router.get('/contract/:contractId', siteController.getSitesByContract);
 router.post('/', siteController.createSite);
-// أضف هذا السطر مع الروتس الأخرى في الأسفل
-router.get('/supervisor/:supervisorId', siteController.getSitesBySupervisor);
+
+// تم حذف السطر الذي كان يسبب الخطأ هنا (getSitesBySupervisor)
+
+router.get('/my-sites', siteController.getMySites);
+// هذا المسار خاص بالأدمن لجلب كل شيء
+router.get('/all-sites', siteController.getAllSites);
 module.exports = router;
