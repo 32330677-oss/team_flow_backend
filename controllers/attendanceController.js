@@ -1,112 +1,152 @@
-const db = require('../config/db'); // تأكد من مسار اتصال قاعدة البيانات لديك
+const db = require('../config/db');
+const attendanceService = require('../services/attendanceService');
 
-// 1. جلب عمال الموقع المحدد مع التحقق من صلاحية المشرف (Authorization)
+// دالة مساعدة لجلب معرف الحضور النشط لليوم الحالي
+async function getAttendanceId(worker_id, site_id) {
+    const [rows] = await db.execute(
+        'SELECT attendance_id FROM attendance WHERE worker_id = ? AND site_id = ? AND record_date = CURDATE()',
+        [worker_id, site_id]
+    );
+    return rows.length > 0 ? rows[0].attendance_id : null;
+}
+
 exports.getSiteWorkers = async (req, res) => {
-    // 1. الحصول على ID المشرف من الـ Middleware
-    const supervisorId = req.user.user_id;
-    const { siteId } = req.params;
-
     try {
-        console.log("🔍 Debugging: Started getSiteWorkers for Site:", siteId);
-
-        // 2. التحقق من أن هذا الموقع يتبع فعلاً لهذا المشرف
-        const [siteCheck] = await db.execute(
-            'SELECT supervisor_id FROM sites WHERE site_id = ?',
-            [siteId]
-        );
-
-        if (siteCheck.length === 0) {
-            return res.status(404).json({ status: 'fail', message: 'الموقع غير موجود.' });
-        }
-
-        // مقارنة القيم كأرقام (لضمان الدقة)
-        if (Number(siteCheck[0].supervisor_id) !== Number(supervisorId)) {
-            return res.status(403).json({ status: 'fail', message: 'غير مصرح لك بالوصول لعمال هذا الموقع.' });
-        }
-
-        // 3. الاستعلام لجلب العمال (تم التأكد من الربط)
+        const { siteId } = req.params;
         const query = `
-            SELECT w.worker_id, w.full_name, w.job_position, w.status
+            SELECT w.*, a.attendance_id, a.status as attendance_status,
+            (SELECT leave_id FROM attendanceleaveperiods alp 
+             WHERE alp.attendance_id = a.attendance_id AND alp.leave_end_time IS NULL 
+             LIMIT 1) as current_leave_id
             FROM workers w
-            INNER JOIN workersiteassignments wa ON w.worker_id = wa.worker_id
-            WHERE wa.site_id = ? 
-              AND wa.unassigned_date IS NULL 
-              AND w.status = 'Active'
+            JOIN workersiteassignments wsa ON w.worker_id = wsa.worker_id
+            LEFT JOIN attendance a ON w.worker_id = a.worker_id AND a.record_date = CURDATE()
+            WHERE wsa.site_id = ? AND wsa.unassigned_date IS NULL AND w.status = 'Active'
         `;
-        
         const [workers] = await db.execute(query, [siteId]);
-
-        // 🚨 طباعة النتيجة لنتأكد ماذا يرى السيرفر
-        console.log("✅ Query Result (Workers Found):", workers);
-
-        return res.status(200).json({ 
-            status: 'success', 
-            results: workers.length,
-            data: workers 
-        });
-
+        res.status(200).json({ status: 'success', data: workers });
     } catch (error) {
-        console.error('🚨 Error in getSiteWorkers:', error);
-        return res.status(500).json({ 
-            status: 'error', 
-            message: 'حدث خطأ في السيرفر أثناء جلب العمال.' 
-        });
+        res.status(500).json({ status: 'error', message: error.message });
     }
 };
 
-// 2. تسجيل الحضور والغياب للموقع (MVP)
-exports.submitAttendance = async (req, res) => {
-    const supervisorId = req.user.user_id;
-    const { siteId, attendance } = req.body; // الـ siteId يتم إرساله بالـ Body للتحقق والـ Audit
-
-    if (!siteId || !attendance || !Array.isArray(attendance)) {
-        return res.status(400).json({ message: 'بيانات الحضور غير مكتملة أو غير صالحة.' });
-    }
-
+// 2. تسجيل الحضور (بداية اليوم) - الحالة تصبح Active
+exports.checkIn = async (req, res) => {
     try {
-        // أ) التحقق من صلاحية المشرف للموقع
-        const [siteCheck] = await db.execute(
-            'SELECT supervisor_id FROM sites WHERE site_id = ?',
+        const { worker_id, site_id } = req.body;
+        const recorded_by_user_id = req.user.user_id; 
+
+       await db.execute(
+    `INSERT INTO attendance (worker_id, site_id, record_date, check_in_time, status, recorded_by_user_id) 
+     VALUES (?, ?, CURDATE(), NOW(), 'Draft', ?)`, // قمنا بتغيير 'Active' إلى 'Draft'
+    [worker_id, site_id, recorded_by_user_id]
+);
+        res.status(201).json({ status: 'success', message: 'تم تسجيل الحضور (نشط)' });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+// 3. الإرسال النهائي لليوم (Submit Day) - الحساب والخصم التلقائي
+exports.submitDay = async (req, res) => {
+    try {
+        const { siteId } = req.body;
+        
+        // تعديل الحالة هنا من "Active" إلى "Draft"
+        const [records] = await db.execute(
+            'SELECT attendance_id FROM attendance WHERE site_id = ? AND record_date = CURDATE() AND status = "Draft"',
             [siteId]
         );
 
-        if (siteCheck.length === 0 || siteCheck[0].supervisor_id !== supervisorId) {
-            return res.status(403).json({ message: 'غير مصرح لك بتسجيل حضور لهذا الموقع.' });
+        for (let record of records) {
+            await attendanceService.calculateWorkingHours(record.attendance_id);
+            // الآن نقوم بتحويلها إلى Submitted
+            await db.execute('UPDATE attendance SET status = "Submitted" WHERE attendance_id = ?', [record.attendance_id]);
         }
 
-        const today = new Date().toISOString().slice(0, 10); // تاريخ اليوم بتنسيق YYYY-MM-DD
-
-        // ب) التحقق من العمال وحفظ الحضور
-        const insertPromises = attendance.map(async (record) => {
-            const { worker_id, status } = record; // status هنا هو 'Present' أو 'Absent'
-
-            // جلب التحقق: هل العامل نشط ومعين في هذا الموقع حالياً؟
-            const [assignmentCheck] = await db.execute(
-                `SELECT assignment_id FROM workersiteassignments 
-                 WHERE worker_id = ? AND site_id = ? AND unassigned_date IS NULL`,
-                [worker_id, siteId]
-            );
-
-            if (assignmentCheck.length > 0) {
-                // حفظ السجل في جدول attendance (نسخة MVP)
-                await db.execute(
-                    `INSERT INTO attendance 
-                     (worker_id, site_id, record_date, attendance_status, recorded_by_user_id, status) 
-                     VALUES (?, ?, ?, ?, ?, 'Pending')
-                     ON DUPLICATE KEY UPDATE attendance_status = ?, recorded_by_user_id = ?, updated_at = CURRENT_TIMESTAMP`,
-                    [worker_id, siteId, today, status, supervisorId, status, supervisorId]
-                );
-            } else {
-                console.warn(`Worker ID ${worker_id} is not assigned to site ${siteId}. Skipping.`);
-            }
-        });
-
-        await Promise.all(insertPromises);
-
-        return res.status(201).json({ status: 'success', message: 'تم حفظ سجل الحضور بنجاح!' });
-
+        res.status(200).json({ status: 'success', message: 'تم إرسال اليوم للمراجعة بنجاح' });
     } catch (error) {
-        console.error('Error in submitAttendance:', error);
-        return res.status(500).json({ message: 'حدث خطأ في السيرفر أثناء حفظ الحضور.' });
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+// 4. تسجيل الخروج النهائي (يُستخدم قبل الـ Submit)
+exports.checkOut = async (req, res) => {
+    try {
+        const { worker_id, site_id } = req.body;
+        const att_id = await getAttendanceId(worker_id, site_id);
+        if (!att_id) return res.status(404).json({ message: 'سجل الحضور غير موجود!' });
+
+        await db.execute('UPDATE attendance SET check_out_time = NOW() WHERE attendance_id = ?', [att_id]);
+        res.status(200).json({ message: 'تم تسجيل الخروج.' });
+    } catch (error) {
+        res.status(500).json({ message: 'خطأ في عملية الخروج' });
+    }
+};
+// جلب السجلات التي رفضها الأدمن لهذا المشرف
+exports.getRejectedRecords = async (req, res) => {
+    try {
+        const supervisor_id = req.user.user_id;
+        const [rows] = await db.execute(
+            `SELECT a.*, w.full_name, s.site_name 
+             FROM attendance a
+             JOIN workers w ON a.worker_id = w.worker_id
+             JOIN sites s ON a.site_id = s.site_id
+             WHERE a.status = 'Rejected' AND a.recorded_by_user_id = ?`,
+            [supervisor_id]
+        );
+        res.status(200).json({ status: 'success', data: rows });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+// 5. إدارة الاستراحات (بدون تغيير، تعمل كما هي)
+exports.startLeave = async (req, res) => {
+    try {
+        const { worker_id, site_id } = req.body;
+        
+        // 1. جلب الـ attendance_id النشط للعامل لهذا اليوم
+        const att_id = await getAttendanceId(worker_id, site_id);
+        if (!att_id) {
+            return res.status(404).json({ message: 'لا يوجد سجل حضور نشط لهذا العامل!' });
+        }
+
+        // 2. إضافة فترة استراحة جديدة في جدول attendanceleaveperiods
+        await db.execute(
+            'INSERT INTO attendanceleaveperiods (attendance_id, leave_start_time) VALUES (?, NOW())',
+            [att_id]
+        );
+
+        res.status(200).json({ status: 'success', message: 'تم بدء الاستراحة بنجاح' });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+exports.endLeave = async (req, res) => {
+    try {
+        const { worker_id, site_id } = req.body;
+        
+        // 1. جلب الـ attendance_id النشط للعامل
+        const att_id = await getAttendanceId(worker_id, site_id);
+        if (!att_id) {
+            return res.status(404).json({ message: 'سجل الحضور غير موجود!' });
+        }
+
+        // 2. تحديث آخر فترة استراحة لم تُغلق بعد (leave_end_time هو NULL)
+        const [result] = await db.execute(
+            `UPDATE attendanceleaveperiods 
+             SET leave_end_time = NOW() 
+             WHERE attendance_id = ? AND leave_end_time IS NULL 
+             ORDER BY leave_id DESC LIMIT 1`,
+            [att_id]
+        );
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ message: 'لا توجد استراحة نشطة لإنهائها!' });
+        }
+
+        res.status(200).json({ status: 'success', message: 'تم إنهاء الاستراحة بنجاح' });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: error.message });
     }
 };
