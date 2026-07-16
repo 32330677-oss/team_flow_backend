@@ -7,7 +7,8 @@ const siteRoutes = require('./routes/siteRoutes');
 const workerRoutes = require('./routes/workerRoutes');
 const assignmentRoutes = require('./routes/assignmentRoutes');
 const supervisorRouter = require('./routes/supervisorRoutes');
-
+const adminAttendanceRoutes = require('./routes/adminAttendanceRoutes');
+const adminPayrollRoutes = require('./routes/adminPayrollRoutes');
 require('dotenv').config();
 
 // استيراد المسارات (Routes)
@@ -29,8 +30,8 @@ app.use('/api/workers', workerRoutes);
 app.use('/api/assignments', assignmentRoutes);
 app.use('/api/users/supervisors', supervisorRouter);
 app.use('/api/attendance', require('./routes/attendanceRoutes'));
-
-// ⚡ زرع حساب الأدمن الرئيسي (مطابق لهيكل الجدول الحقيقي 100%)
+app.use('/api/admin/attendance', adminAttendanceRoutes);
+app.use('/api/admin/payroll', adminPayrollRoutes);
 app.get('/seed-admin-secure', async (req, res) => {
     try {
         // تشفير الباسورد باستخدام bcrypt
