@@ -18,31 +18,67 @@ exports.getPendingRecords = async (req, res) => {
 
 // مراجعة السجل (قبول أو رفض)
 exports.reviewRecord = async (req, res) => {
+    const { attendance_id, status, admin_note } = req.body;
+    const adminId = req.user?.id || req.user?.user_id;
+    
+    if (!adminId) return res.status(401).json({ status: 'error', message: 'لم يتم العثور على هوية الأدمن' });
+
+    const connection = await db.getConnection();
     try {
-        const { attendance_id, status, admin_note } = req.body;
-        
-        // 1. تحديد معرف الأدمن بمرونة (حل مشكلة id أو user_id)
-        const adminId = req.user?.id || req.user?.user_id;
+        await connection.beginTransaction();
 
-        // 2. معالجة القيم لضمان عدم إرسال undefined أبداً للـ SQL
-        const finalNote = status === 'Rejected' ? (admin_note || null) : null;
-        const finalAdminId = status === 'Approved' ? adminId : null;
-
-        // 3. التحقق من وجود المعرف قبل التنفيذ
-        if (status === 'Approved' && !adminId) {
-            return res.status(401).json({ status: 'error', message: 'لم يتم العثور على هوية الأدمن' });
-        }
-
-        // 4. تنفيذ التحديث بأمان
-        await db.execute(
-            'UPDATE attendance SET status = ?, admin_rejection_notes = ?, approved_by_user_id = ?, approval_date = NOW() WHERE attendance_id = ?',
-            [status, finalNote, finalAdminId, attendance_id]
+        // 1. جلب السجل مع التحقق من حالته
+        const [oldRows] = await connection.execute(
+            'SELECT * FROM attendance WHERE attendance_id = ?', 
+            [attendance_id]
         );
         
+        if (oldRows.length === 0) throw new Error('السجل غير موجود');
+        const oldRecord = oldRows[0];
+
+        // --- إضافة منطق الحماية هنا ---
+        // إذا كان السجل مرفوضاً، لا نسمح بـ Approve إلا إذا كان السجل قد مر بـ Resubmit
+        // (يمكنك تعديل هذا الشرط بناءً على منطق عملك)
+        if (status === 'Approved' && oldRecord.status === 'Rejected') {
+            throw new Error('لا يمكن قبول السجل لأنه مرفوض، يجب على المشرف إعادة تقديمه أولاً.');
+        }
+        
+        // منع الموافقة على سجلات ليست 'Submitted' أو 'Rejected'
+        if (oldRecord.status !== 'Submitted' && oldRecord.status !== 'Rejected') {
+             throw new Error('لا يمكن مراجعة هذا السجل لأنه ليس في حالة انتظار (Submitted/Rejected).');
+        }
+        // ------------------------------
+
+        // 2. التحديث
+        await connection.execute(
+            `UPDATE attendance 
+             SET status = ?, admin_rejection_notes = ?, approved_by_user_id = ?, approval_date = NOW() 
+             WHERE attendance_id = ?`,
+            [status, (status === 'Rejected' ? admin_note : null), adminId, attendance_id]
+        );
+
+        // 3. التوثيق في AuditLogs
+        await connection.execute(
+            `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values) 
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [
+                'attendance', 
+                attendance_id, 
+                status.toUpperCase(), 
+                adminId, 
+                JSON.stringify(oldRecord), 
+                JSON.stringify({ status, admin_note })
+            ]
+        );
+
+        await connection.commit();
         res.status(200).json({ status: 'success', message: 'تمت العملية بنجاح' });
     } catch (error) {
-        console.error("Review Error:", error); // تسجيل الخطأ في ترمينال السيرفر
-        res.status(500).json({ status: 'error', message: error.message });
+        await connection.rollback();
+        console.error("Review Error:", error);
+        res.status(400).json({ status: 'error', message: error.message });
+    } finally {
+        connection.release();
     }
 };
 

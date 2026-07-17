@@ -2,17 +2,21 @@ const express = require('express');
 const router = express.Router();
 const siteController = require('../controllers/siteController');
 const authMiddleware = require('../middleware/authMiddleware');
+const restrictTo = require('../middleware/roleMiddleware'); // استدعاء الحارس
 
 // حماية شاملة لجميع روابط المواقع
 router.use(authMiddleware);
 
-// الروابط محمية الآن تلقائياً
-router.get('/contract/:contractId', siteController.getSitesByContract);
-router.post('/', siteController.createSite);
+// 1. جلب مواقع عقد معين: مسموح للأدمن والمشرف
+router.get('/contract/:contractId', restrictTo('Admin', 'Supervisor'), siteController.getSitesByContract);
 
-// تم حذف السطر الذي كان يسبب الخطأ هنا (getSitesBySupervisor)
+// 2. إنشاء موقع جديد: للأدمن فقط
+router.post('/', restrictTo('Admin'), siteController.createSite);
 
-router.get('/my-sites', siteController.getMySites);
-// هذا المسار خاص بالأدمن لجلب كل شيء
-router.get('/all-sites', siteController.getAllSites);
+// 3. مواقعي (للسوبرفايزر): مسموح للمشرف (ويمكن للأدمن أيضاً إذا أردت)
+router.get('/my-sites', restrictTo('Admin', 'Supervisor'), siteController.getMySites);
+
+// 4. جلب كل المواقع: للأدمن فقط (حتى لا يتمكن المشرف من رؤية مواقع ليست تحت إدارته)
+router.get('/all-sites', restrictTo('Admin'), siteController.getAllSites);
+
 module.exports = router;
