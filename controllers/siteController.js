@@ -1,6 +1,6 @@
 const db = require('../config/db');
 
-// 1. جلب المواقع التابعة لعقد معين (يجب أن يكون المشرف هو المسؤول عن الموقع)
+// Get sites by contract ID
 exports.getSitesByContract = async (req, res) => {
     const { contractId } = req.params;
     try {
@@ -15,17 +15,16 @@ exports.getSitesByContract = async (req, res) => {
         return res.status(200).json({ status: 'success', data: rows });
     } catch (error) {
         console.error("🚨 FETCH ERROR:", error);
-        return res.status(500).json({ status: 'error', message: 'حدث خطأ أثناء جلب مواقع العقد' });
+        return res.status(500).json({ status: 'error', message: 'Failed to fetch contract sites' });
     }
 };
 
-// 2. إنشاء موقع جديد (مؤمن: يُسند تلقائياً للمشرف صاحب التوكن)
+// Create a new site
 exports.createSite = async (req, res) => {
-    const { site_name, location, contract_id } = req.body;
-    const supervisor_id = req.user.user_id; // الهوية من التوكن حصراً
+    const { site_name, location, contract_id, supervisor_id } = req.body;
 
     if (!site_name || !contract_id) {
-        return res.status(400).json({ status: 'error', message: 'يرجى إدخال اسم الموقع وتحديد العقد' });
+        return res.status(400).json({ status: 'error', message: 'Please provide site name and contract ID' });
     }
 
     try {
@@ -33,16 +32,69 @@ exports.createSite = async (req, res) => {
             INSERT INTO Sites (site_name, location, contract_id, supervisor_id, site_status) 
             VALUES (?, ?, ?, ?, 'Active')
         `;
-        const [result] = await db.query(query, [site_name, location || null, contract_id, supervisor_id]);
-        return res.status(201).json({ status: 'success', message: 'تم إنشاء الموقع بنجاح', site_id: result.insertId });
+        const [result] = await db.query(query, [site_name, location || null, contract_id, supervisor_id || null]);
+        return res.status(201).json({ status: 'success', message: 'Site created successfully', site_id: result.insertId });
     } catch (error) {
         console.error("🚨 DATABASE ERROR:", error);
-        return res.status(500).json({ status: 'error', message: 'حدث خطأ في السيرفر أثناء إنشاء الموقع' });
+        return res.status(500).json({ status: 'error', message: 'Server error while creating site' });
     }
 };
+
+// Update site details
+exports.updateSite = async (req, res) => {
+    const { siteId } = req.params;
+    const { site_name, location, supervisor_id } = req.body;
+
+    try {
+        const query = `
+            UPDATE Sites 
+            SET site_name = ?, location = ?, supervisor_id = ?
+            WHERE site_id = ?
+        `;
+        const [result] = await db.query(query, [site_name, location || null, supervisor_id || null, siteId]);
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ status: 'error', message: 'Site not found' });
+        }
+
+        return res.status(200).json({ status: 'success', message: 'Site updated successfully' });
+    } catch (error) {
+        console.error("🚨 UPDATE ERROR:", error);
+        return res.status(500).json({ status: 'error', message: 'Server error while updating site' });
+    }
+};
+
+// Toggle site status (Active / Suspended / Completed)
+exports.toggleSiteStatus = async (req, res) => {
+    const { siteId } = req.params;
+    const { status } = req.body;
+
+    if (!['Active', 'Completed', 'Suspended'].includes(status)) {
+        return res.status(400).json({ status: 'error', message: 'Invalid status value' });
+    }
+
+    try {
+        const [result] = await db.query(
+            'UPDATE Sites SET site_status = ? WHERE site_id = ?',
+            [status, siteId]
+        );
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ status: 'error', message: 'Site not found' });
+        }
+
+        return res.status(200).json({
+            status: 'success',
+            message: `Site status updated to ${status}`
+        });
+    } catch (error) {
+        console.error("🚨 STATUS ERROR:", error);
+        return res.status(500).json({ status: 'error', message: 'Server error while updating site status' });
+    }
+};
+
 exports.getAllSites = async (req, res) => {
     try {
-        // بدون أي WHERE، جلب كل المواقع المتاحة
         const query = `
             SELECT site_id, site_name 
             FROM Sites 
@@ -50,17 +102,13 @@ exports.getAllSites = async (req, res) => {
             ORDER BY site_name ASC
         `;
         const [rows] = await db.query(query);
-        
-        return res.status(200).json({ 
-            status: 'success', 
-            data: rows 
-        });
+        return res.status(200).json({ status: 'success', data: rows });
     } catch (error) {
-        console.error("خطأ في جلب المواقع للأدمن:", error);
-        return res.status(500).json({ status: 'error', message: 'فشل جلب قائمة المواقع' });
+        console.error("🚨 FETCH ALL SITES ERROR:", error);
+        return res.status(500).json({ status: 'error', message: 'Failed to fetch sites list' });
     }
 };
-// 3. جلب مواقع المشرف الحالي فقط (هذه هي البوابة الوحيدة للمشرف لرؤية مواقعه)
+
 exports.getMySites = async (req, res) => {
     const supervisorId = req.user.user_id; 
     try {
@@ -73,15 +121,9 @@ exports.getMySites = async (req, res) => {
             ORDER BY s.created_at DESC
         `;
         const [rows] = await db.query(query, [supervisorId]);
-        console.log("--- فحص بيانات المواقع ---");
-console.log("عدد الصفوف المجلوبة:", rows.length);
-if (rows.length > 0) {
-    console.log("مثال عن أول سجل:", JSON.stringify(rows[0], null, 2));
-}
-console.log("--------------------------");
         return res.status(200).json({ status: 'success', data: rows });
     } catch (error) {
         console.error("🚨 FETCH MY SITES ERROR:", error);
-        return res.status(500).json({ status: 'error', message: 'حدث خطأ أثناء جلب مواقعك' });
+        return res.status(500).json({ status: 'error', message: 'Failed to fetch your sites' });
     }
 };

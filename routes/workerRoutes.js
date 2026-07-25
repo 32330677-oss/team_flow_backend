@@ -14,5 +14,5 @@ router.get('/', restrictTo('Admin', 'Supervisor'), workerController.getAllWorker
 // 2. إنشاء عامل جديد:
 // عملية إدارية حساسة، للأدمن فقط
 router.post('/', restrictTo('Admin'), workerController.createWorker);
-
+router.put('/:id', restrictTo('Admin'), workerController.updateWorker);
 module.exports = router;

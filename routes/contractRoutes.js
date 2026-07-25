@@ -15,5 +15,6 @@ router.post('/', restrictTo('Admin'), contractController.createContract);
 
 // 4. تعديل عقد: عملية إدارية حساسة (للأدمن فقط)
 router.put('/:contractId', restrictTo('Admin'), contractController.updateContract);
-
+// 5. تغيير حالة العقد (للأدمن فقط)
+router.patch('/:contractId/status', restrictTo('Admin'), contractController.toggleContractStatus);
 module.exports = router;

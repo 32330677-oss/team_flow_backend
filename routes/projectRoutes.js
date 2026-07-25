@@ -14,5 +14,6 @@ router.get('/', restrictTo('Admin', 'Supervisor'), projectController.getAllProje
 // 2. إنشاء مشروع جديد:
 // عملية إدارية حساسة، للأدمن فقط
 router.post('/', restrictTo('Admin'), projectController.createProject);
-
+router.put('/:id', restrictTo('Admin'), projectController.updateProject);
+router.patch('/:id/status', restrictTo('Admin'), projectController.toggleProjectStatus);
 module.exports = router;

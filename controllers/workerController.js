@@ -49,3 +49,51 @@ exports.createWorker = async (req, res) => {
         return res.status(500).json({ status: 'error', message: 'حدث خطأ في السيرفر أثناء إضافة العامل' });
     }
 };
+
+
+// 3. تعديل بيانات عامل أو تغيير حالته (Update Worker)
+// 3. تعديل بيانات عامل أو تغيير حالته (Update Worker)
+exports.updateWorker = async (req, res) => {
+    const workerId = req.params.id; // هنا سيصل الـ worker_unique_id (مثل 'تيست')
+    const { full_name, phone_number, nationality, job_position, hire_date, notes, status } = req.body;
+
+    try {
+        // التحقق مما إذا كان العامل موجوداً باستخدام worker_unique_id
+        const [existing] = await db.query('SELECT * FROM workers WHERE worker_unique_id = ?', [workerId]);
+        if (existing.length === 0) {
+            return res.status(404).json({ status: 'error', message: 'العامل غير موجود' });
+        }
+
+        // بناء استعلام التعديل
+        const query = `
+            UPDATE workers 
+            SET full_name = COALESCE(?, full_name),
+                phone_number = ?,
+                nationality = ?,
+                job_position = ?,
+                hire_date = COALESCE(?, hire_date),
+                notes = ?,
+                status = COALESCE(?, status)
+            WHERE worker_unique_id = ?
+        `;
+
+        await db.query(query, [
+            full_name || null,
+            phone_number !== undefined ? phone_number : existing[0].phone_number,
+            nationality !== undefined ? nationality : existing[0].nationality,
+            job_position !== undefined ? job_position : existing[0].job_position,
+            hire_date || null,
+            notes !== undefined ? notes : existing[0].notes,
+            status || null,
+            workerId
+        ]);
+
+        return res.status(200).json({
+            status: 'success',
+            message: 'تم تحديث بيانات العامل بنجاح'
+        });
+    } catch (error) {
+        console.error("🚨 UPDATE WORKER ERROR:", error);
+        return res.status(500).json({ status: 'error', message: 'حدث خطأ في السيرفر أثناء تحديث العامل' });
+    }
+};
