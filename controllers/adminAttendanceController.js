@@ -1,6 +1,7 @@
 const db = require('../config/db');
+const settingsCache = require('../services/settingsCache');
 
-// جلب السجلات التي تنتظر المراجعة فقط
+// 1. Fetch pending/rejected records for review
 exports.getPendingRecords = async (req, res) => {
     try {
         const [rows] = await db.execute(
@@ -16,40 +17,33 @@ exports.getPendingRecords = async (req, res) => {
     }
 };
 
-// مراجعة السجل (قبول أو رفض)
+// 2. Review record (Approve or Reject) with strict validation & audit logging
 exports.reviewRecord = async (req, res) => {
     const { attendance_id, status, admin_note } = req.body;
     const adminId = req.user?.id || req.user?.user_id;
     
-    if (!adminId) return res.status(401).json({ status: 'error', message: 'لم يتم العثور على هوية الأدمن' });
+    if (!adminId) return res.status(401).json({ status: 'error', message: 'Admin identification not found' });
 
     const connection = await db.getConnection();
     try {
         await connection.beginTransaction();
 
-        // 1. جلب السجل مع التحقق من حالته
         const [oldRows] = await connection.execute(
             'SELECT * FROM attendance WHERE attendance_id = ?', 
             [attendance_id]
         );
         
-        if (oldRows.length === 0) throw new Error('السجل غير موجود');
+        if (oldRows.length === 0) throw new Error('Record does not exist');
         const oldRecord = oldRows[0];
 
-        // --- إضافة منطق الحماية هنا ---
-        // إذا كان السجل مرفوضاً، لا نسمح بـ Approve إلا إذا كان السجل قد مر بـ Resubmit
-        // (يمكنك تعديل هذا الشرط بناءً على منطق عملك)
         if (status === 'Approved' && oldRecord.status === 'Rejected') {
-            throw new Error('لا يمكن قبول السجل لأنه مرفوض، يجب على المشرف إعادة تقديمه أولاً.');
+            throw new Error('Cannot approve a rejected record. It must be resubmitted first.');
         }
         
-        // منع الموافقة على سجلات ليست 'Submitted' أو 'Rejected'
         if (oldRecord.status !== 'Submitted' && oldRecord.status !== 'Rejected') {
-             throw new Error('لا يمكن مراجعة هذا السجل لأنه ليس في حالة انتظار (Submitted/Rejected).');
+             throw new Error('Record cannot be reviewed as it is not in pending status.');
         }
-        // ------------------------------
 
-        // 2. التحديث
         await connection.execute(
             `UPDATE attendance 
              SET status = ?, admin_rejection_notes = ?, approved_by_user_id = ?, approval_date = NOW() 
@@ -57,7 +51,6 @@ exports.reviewRecord = async (req, res) => {
             [status, (status === 'Rejected' ? admin_note : null), adminId, attendance_id]
         );
 
-        // 3. التوثيق في AuditLogs
         await connection.execute(
             `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values) 
              VALUES (?, ?, ?, ?, ?, ?)`,
@@ -72,7 +65,7 @@ exports.reviewRecord = async (req, res) => {
         );
 
         await connection.commit();
-        res.status(200).json({ status: 'success', message: 'تمت العملية بنجاح' });
+        res.status(200).json({ status: 'success', message: 'Operation completed successfully' });
     } catch (error) {
         await connection.rollback();
         console.error("Review Error:", error);
@@ -82,7 +75,7 @@ exports.reviewRecord = async (req, res) => {
     }
 };
 
-// جلب السجلات ليوم محدد
+// 3. Get records by specific date
 exports.getRecordsByDate = async (req, res) => {
     const { date } = req.query;
     try {
@@ -100,6 +93,7 @@ exports.getRecordsByDate = async (req, res) => {
     }
 };
 
+// 4. Get break & work hours settings
 exports.getBreakSettings = async (req, res) => {
     try {
         const [rows] = await db.execute(
@@ -114,6 +108,7 @@ exports.getBreakSettings = async (req, res) => {
     }
 };
 
+// 5. Update break & work hours settings with Cache refresh and Audit Log
 exports.updateBreakSettings = async (req, res) => {
     const { lunch_start_time, lunch_end_time, standard_work_minutes } = req.body;
     const adminId = req.user.user_id;
@@ -125,10 +120,10 @@ exports.updateBreakSettings = async (req, res) => {
         for (const [key, value] of Object.entries(updates)) {
             if (value === undefined) continue;
             await connection.execute(
-                `INSERT INTO system_settings (setting_key, setting_value, updated_by_user_id)
-                 VALUES (?, ?, ?)
-                 ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value), updated_by_user_id = VALUES(updated_by_user_id)`,
-                [key, String(value), adminId]
+                `INSERT INTO system_settings (setting_key, setting_value)
+                 VALUES (?, ?)
+                 ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)`,
+                [key, String(value)]
             );
             await connection.execute(
                 `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, new_values)
@@ -138,7 +133,11 @@ exports.updateBreakSettings = async (req, res) => {
         }
 
         await connection.commit();
-        res.status(200).json({ status: 'success', message: 'تم تحديث إعدادات أوقات الراحة' });
+        
+        // Refresh the memory cache immediately so calculations update instantly
+        await settingsCache.refresh();
+
+        res.status(200).json({ status: 'success', message: 'Settings updated successfully' });
     } catch (error) {
         await connection.rollback();
         res.status(400).json({ status: 'error', message: error.message });

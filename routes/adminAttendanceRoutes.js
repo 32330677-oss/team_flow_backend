@@ -2,19 +2,21 @@ const express = require('express');
 const router = express.Router();
 const adminAttendanceController = require('../controllers/adminAttendanceController');
 const authMiddleware = require('../middleware/authMiddleware');
-const restrictTo = require('../middleware/roleMiddleware'); // استدعاء حارس البوابة
+const restrictTo = require('../middleware/roleMiddleware');
 
-// 1. جلب السجلات التي تنتظر المراجعة: 
-// يمكن للأدمن والمشرف رؤيتها (سنتحكم في البيانات لاحقاً داخل الـ Controller)
+// Get pending records (Admin & Supervisor)
 router.get('/pending', authMiddleware, restrictTo('Admin', 'Supervisor'), adminAttendanceController.getPendingRecords);
 
-// 2. مراجعة السجل (قبول أو رفض):
-// عملية حساسة جداً، مسموح للأدمن فقط
+// Review record (Admin only)
 router.post('/review', authMiddleware, restrictTo('Admin'), adminAttendanceController.reviewRecord);
 
-// 3. جلب السجلات ليوم محدد:
-// أيضاً للأدمن والمشرف
+// Get records by date (Admin & Supervisor)
 router.get('/records', authMiddleware, restrictTo('Admin', 'Supervisor'), adminAttendanceController.getRecordsByDate);
+
+// Get break settings (Admin only)
 router.get('/settings/breaks', authMiddleware, restrictTo('Admin'), adminAttendanceController.getBreakSettings);
+
+// Update break settings (Admin only)
 router.put('/settings/breaks', authMiddleware, restrictTo('Admin'), adminAttendanceController.updateBreakSettings);
+
 module.exports = router;
