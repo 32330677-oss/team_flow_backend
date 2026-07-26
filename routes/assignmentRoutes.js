@@ -58,6 +58,7 @@ router.delete('/:assignment_id', authMiddleware, restrictTo('Admin'), async (req
 });
 // 2. إضافة التعيين:
 // هذه عملية إدارية حساسة، يجب أن تكون محصورة بـ 'Admin' فقط
+// 2. إضافة التعيين:
 router.post('/', authMiddleware, restrictTo('Admin'), async (req, res) => {
     const { worker_id, site_id } = req.body;
     const assigned_by_user_id = req.user.user_id;
@@ -67,21 +68,42 @@ router.post('/', authMiddleware, restrictTo('Admin'), async (req, res) => {
     }
 
     try {
-        // حماية إضافية: التحقق من عدم وجود العامل في نفس الموقع بنفس التاريخ
-        // (هذه نقطة البداية لمنع التكرار التي تحدثنا عنها)
-        const [existing] = await db.query(
-            'SELECT assignment_id FROM workersiteassignments WHERE worker_id = ? AND site_id = ? AND assigned_date = CURDATE()',
-            [worker_id, site_id]
+        // التحقق الشامل: هل العامل معيّن حالياً في أي موقع نشط؟
+        // JOIN مع sites لجلب اسم الموقع الحالي واستخدامه داخل رسالة الخطأ
+        const [activeAssignment] = await db.query(
+            `SELECT wsa.assignment_id, wsa.site_id, s.site_name AS current_site_name
+             FROM workersiteassignments wsa
+             LEFT JOIN sites s ON wsa.site_id = s.site_id
+             WHERE wsa.worker_id = ? AND wsa.unassigned_date IS NULL
+             LIMIT 1`,
+            [worker_id]
         );
-        if (existing.length > 0) {
-            return res.status(400).json({ status: 'fail', message: 'هذا العامل تم تعيينه بالفعل لهذا الموقع اليوم' });
+
+        if (activeAssignment.length > 0) {
+            const current = activeAssignment[0];
+
+            if (current.site_id === Number(site_id)) {
+                return res.status(400).json({
+                    status: 'fail',
+                    message: `هذا العامل معيّن بالفعل في هذا الموقع (${current.current_site_name || 'الموقع الحالي'}).`
+                });
+            }
+
+            return res.status(400).json({
+                status: 'fail',
+                message: `هذا العامل معيّن مسبقاً في موقع "${current.current_site_name || 'غير معروف'}". يجب إنهاء تعيينه من هناك أولاً قبل نقله إلى موقع جديد.`,
+                current_site_id: current.site_id,
+                current_site_name: current.current_site_name
+            });
         }
 
         const [siteData] = await db.query('SELECT contract_id FROM sites WHERE site_id = ? LIMIT 1', [site_id]);
-        if (siteData.length === 0) return res.status(400).json({ status: 'fail', message: 'السايت غير موجود' });
+        if (siteData.length === 0) {
+            return res.status(400).json({ status: 'fail', message: 'الموقع غير موجود' });
+        }
 
         const contract_id = siteData[0].contract_id;
-        
+
         const query = `
             INSERT INTO workersiteassignments 
             (worker_id, site_id, contract_id, assigned_by_user_id, assigned_date, created_at, updated_at) 
@@ -91,7 +113,8 @@ router.post('/', authMiddleware, restrictTo('Admin'), async (req, res) => {
 
         res.status(201).json({ status: 'success', data: { assignment_id: result.insertId } });
     } catch (err) {
-        res.status(500).json({ status: 'error', message: err.message });
+        console.error('CREATE ASSIGNMENT ERROR:', err);
+        res.status(500).json({ status: 'error', message: 'حدث خطأ في السيرفر أثناء حفظ التعيين.' });
     }
 });
 

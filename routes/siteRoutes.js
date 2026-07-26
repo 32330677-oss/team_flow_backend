@@ -6,11 +6,12 @@ const restrictTo = require('../middleware/roleMiddleware');
 
 router.use(authMiddleware);
 
+router.get('/my-sites', restrictTo('Admin', 'Supervisor'), siteController.getMySites);
+router.get('/all-sites', restrictTo('Admin', 'Supervisor'), siteController.getAllSites); // <-- تم إضافة Supervisor هنا
 router.get('/contract/:contractId', restrictTo('Admin', 'Supervisor'), siteController.getSitesByContract);
+
 router.post('/', restrictTo('Admin'), siteController.createSite);
 router.put('/:siteId', restrictTo('Admin'), siteController.updateSite);
 router.patch('/:siteId/status', restrictTo('Admin'), siteController.toggleSiteStatus);
-router.get('/my-sites', restrictTo('Admin', 'Supervisor'), siteController.getMySites);
-router.get('/all-sites', restrictTo('Admin'), siteController.getAllSites);
 
 module.exports = router;

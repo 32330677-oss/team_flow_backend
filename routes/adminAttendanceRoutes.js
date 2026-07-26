@@ -15,5 +15,6 @@ router.post('/review', authMiddleware, restrictTo('Admin'), adminAttendanceContr
 // 3. جلب السجلات ليوم محدد:
 // أيضاً للأدمن والمشرف
 router.get('/records', authMiddleware, restrictTo('Admin', 'Supervisor'), adminAttendanceController.getRecordsByDate);
-
+router.get('/settings/breaks', authMiddleware, restrictTo('Admin'), adminAttendanceController.getBreakSettings);
+router.put('/settings/breaks', authMiddleware, restrictTo('Admin'), adminAttendanceController.updateBreakSettings);
 module.exports = router;

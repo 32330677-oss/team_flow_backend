@@ -8,6 +8,7 @@ const workerRoutes = require('./routes/workerRoutes');
 const assignmentRoutes = require('./routes/assignmentRoutes');
 const supervisorRouter = require('./routes/supervisorRoutes');
 const adminAttendanceRoutes = require('./routes/adminAttendanceRoutes');
+const transferRoutes = require('./routes/transferRoutes');
 const adminPayrollRoutes = require('./routes/adminPayrollRoutes');
 require('dotenv').config();
 
@@ -32,6 +33,7 @@ app.use('/api/users/supervisors', supervisorRouter);
 app.use('/api/attendance', require('./routes/attendanceRoutes'));
 app.use('/api/admin/attendance', adminAttendanceRoutes);
 app.use('/api/admin/payroll', adminPayrollRoutes);
+app.use('/api/transfers', transferRoutes);
 app.get('/seed-admin-secure', async (req, res) => {
     try {
         // تشفير الباسورد باستخدام bcrypt
