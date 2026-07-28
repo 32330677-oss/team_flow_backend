@@ -248,39 +248,52 @@ exports.setManagementLeaveHours = async (req, res) => {
     }
 
     const connection = await db.getConnection();
+    let shouldRecalculate = false;
+    let oldRecord;
+
     try {
         await connection.beginTransaction();
 
         const [rows] = await connection.execute('SELECT * FROM attendance WHERE attendance_id = ?', [attendance_id]);
         if (rows.length === 0) throw new AppError('Record not found');
-        const oldRecord = rows[0];
+        oldRecord = rows[0];
 
+        // 1. تحديث ساعات الإدارة
         await connection.execute(
             'UPDATE attendance SET management_leave_hours = ? WHERE attendance_id = ?',
             [hours, attendance_id]
         );
 
+        // 2. تسجيل سجل التدقيق
         await connection.execute(
             `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
              VALUES ('attendance', ?, 'MANAGEMENT_LEAVE', ?, ?, ?)`,
             [attendance_id, adminId, JSON.stringify(oldRecord), JSON.stringify({ management_leave_hours: hours, reason })]
         );
 
-        // Recalculate hours if the record is already complete (has a check-out time).
-        if (oldRecord.check_out_time) {
-            await attendanceService.calculateWorkingHours(attendance_id);
-        }
-
+        // 3. اعتماد الحفظ وإغلاق المعاملة وتحرير القفل عن الجدول فوراً
         await connection.commit();
-        res.status(200).json({ status: 'success', message: 'Management leave hours recorded successfully' });
+
+        shouldRecalculate = Boolean(oldRecord.check_out_time);
     } catch (error) {
         await connection.rollback();
         console.error("MANAGEMENT LEAVE ERROR:", error);
         const message = error.isOperational ? error.message : 'An error occurred while recording management leave hours.';
-        res.status(400).json({ status: 'error', message });
+        return res.status(400).json({ status: 'error', message });
     } finally {
         connection.release();
     }
+
+    // 4. إعادة حساب الساعات تتم بعد تحرير الاتصال بالكامل لمنع حدوث Deadlock / Lock Wait Timeout
+    if (shouldRecalculate) {
+        try {
+            await attendanceService.calculateWorkingHours(attendance_id);
+        } catch (calcError) {
+            console.error("Error in background calculation:", calcError);
+        }
+    }
+
+    res.status(200).json({ status: 'success', message: 'Management leave hours recorded successfully' });
 };
 
 // -------------------------------------------------------------------

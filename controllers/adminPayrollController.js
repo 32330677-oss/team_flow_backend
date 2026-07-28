@@ -1,116 +1,186 @@
 const pool = require('../config/db');
 
-// توليد دفعة الرواتب
-const generatePayrollBatch = async (req, res) => {
-  const { start_date, end_date } = req.body;
-  const adminId = req.user.user_id;
+async function generatePayrollBatch(req, res) {
+    try {
+        const { start_date, end_date, site_id } = req.body;
+        const userId = req.user?.user_id || 1;
 
-  const connection = await pool.getConnection();
-  try {
-    await connection.beginTransaction();
+        if (!start_date || !end_date) {
+            return res.status(400).json({ success: false, message: 'Start date and end date are required' });
+        }
 
-    // 1. إنشاء دفعة الرواتب الرئيسية
-    const [batchResult] = await connection.query(
-      `INSERT INTO payrollbatches (start_date, end_date, generated_by_user_id, status) VALUES (?, ?, ?, 'Generated')`,
-      [start_date, end_date, adminId]
-    );
-    const payrollBatchId = batchResult.insertId;
+        let workersQuery = `
+            SELECT DISTINCT w.*, wsa.contract_id, wsa.site_id as assigned_site_id
+            FROM workers w 
+            LEFT JOIN workersiteassignments wsa ON w.worker_id = wsa.worker_id 
+            LEFT JOIN contracts c ON wsa.contract_id = c.contract_id AND c.status = 'Active'
+            WHERE w.status = 'Active'
+        `;
+        let queryParams = [];
 
-    // 2. جلب العمال النشطين مع عقودهم ومواقعهم
-    const [workers] = await connection.query(`
-      SELECT 
-        w.worker_id, c.contract_id, c.hourly_rate, c.overtime_hourly_rate, s.site_id
-      FROM workers w
-      JOIN workersiteassignments wsa ON w.worker_id = wsa.worker_id
-      JOIN sites s ON wsa.site_id = s.site_id
-      JOIN contracts c ON s.contract_id = c.contract_id
-      WHERE w.status = 'Active' AND wsa.unassigned_date IS NULL
-    `, []);
+        if (site_id) {
+            workersQuery += ` AND wsa.site_id = ? AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date >= ?)`;
+            queryParams.push(site_id, start_date);
+        }
 
-    let totalWorkers = 0;
-    let totalAmount = 0;
+        const [workers] = await pool.query(workersQuery, queryParams);
 
-    for (const worker of workers) {
-      // 3. جمع ساعات العمل المعتمدة لكل عامل ضمن الفترة
-      const [attendanceSummary] = await connection.query(`
-        SELECT 
-          SUM(total_working_hours) as total_hours,
-          SUM(overtime_hours) as total_overtime
-        FROM attendance
-        WHERE worker_id = ? 
-          AND record_date BETWEEN ? AND ?
-          AND status = 'Approved'
-      `, [worker.worker_id, start_date, end_date]);
+        if (!workers || workers.length === 0) {
+            return res.status(404).json({ success: false, message: 'No active workers found for the specified site or criteria' });
+        }
 
-      const regularHours = attendanceSummary[0]?.total_hours || 0;
-      const overtimeHours = attendanceSummary[0]?.total_overtime || 0;
+        let totalWorkers = 0;
+        let totalAmount = 0;
+        let batchWorkersData = [];
 
-      if (regularHours === 0 && overtimeHours === 0) continue;
+        for (let worker of workers) {
+            if (!worker.contract_id) continue;
 
-      const baseSalary = regularHours * worker.hourly_rate;
-      const overtimePay = overtimeHours * worker.overtime_hourly_rate;
-      const grossSalary = baseSalary + overtimePay;
-      const netSalary = grossSalary;
+            let attQuery = `
+                SELECT 
+                    site_id,
+                    SUM(total_working_hours) as reg_hours, 
+                    SUM(overtime_hours) as ot_hours 
+                FROM attendance 
+                WHERE worker_id = ? AND record_date BETWEEN ? AND ?
+            `;
+            let attParams = [worker.worker_id, start_date, end_date];
 
-      // 4. استخدام INSERT IGNORE لمنع انهيار النظام إذا تكررت الفترة لنفس العامل
-      const [payrollResult] = await connection.query(`
-        INSERT IGNORE INTO payroll (payroll_batch_id, worker_id, start_date, end_date, gross_salary, net_salary, generated_by_user_id, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'Generated')
-      `, [payrollBatchId, worker.worker_id, start_date, end_date, grossSalary, netSalary, adminId]);
+            if (site_id) {
+                attQuery += ` AND site_id = ?`;
+                attParams.push(site_id);
+            }
 
-      if (payrollResult.affectedRows === 0) continue;
+            attQuery += ` GROUP BY site_id`;
 
-      const payrollId = payrollResult.insertId;
+            const [logs] = await pool.query(attQuery, attParams);
 
-      // 5. إدخال عناصر الراتب (Payroll Items)
-      await connection.query(`
-        INSERT INTO payrollitems (payroll_id, contract_id, site_id, hourly_rate_snapshot, overtime_hourly_rate_snapshot, regular_hours_worked, overtime_hours_worked, base_salary, overtime_pay)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `, [payrollId, worker.contract_id, worker.site_id, worker.hourly_rate, worker.overtime_hourly_rate, regularHours, overtimeHours, baseSalary, overtimePay]);
+            if (!logs || logs.length === 0) continue;
 
-      totalWorkers++;
-      totalAmount += netSalary;
+            // معالجة كل موقع عمل سجِل له حضور العامل خلال الفترة
+            for (let log of logs) {
+                const regHours = Number(log.reg_hours || 0);
+                const otHours = Number(log.ot_hours || 0);
+                const logSiteId = log.site_id || worker.assigned_site_id;
+
+                if (regHours === 0 && otHours === 0) continue;
+                if (!logSiteId) continue; // تجنب خطأ إذا لم يوجد موقع مرتبط
+
+                const hourlyRate = Number(worker.hourly_rate || 0);
+                const overtimeRate = Number(worker.overtime_hourly_rate || (hourlyRate * 1.5));
+
+                const baseSalary = regHours * hourlyRate;
+                const overtimePay = otHours * overtimeRate;
+                const grossSalary = baseSalary + overtimePay;
+                const netSalary = grossSalary; 
+
+                totalWorkers++;
+                totalAmount += netSalary;
+
+                batchWorkersData.push({
+                    worker_id: worker.worker_id,
+                    contract_id: worker.contract_id,
+                    site_id: logSiteId, // <-- تحديد موقع العمل بدقة لكل بند
+                    regHours,
+                    otHours,
+                    hourlyRate,
+                    overtimeRate,
+                    baseSalary,
+                    overtimePay,
+                    grossSalary,
+                    netSalary
+                });
+            }
+        }
+
+        if (totalWorkers === 0) {
+            return res.status(400).json({ success: false, message: 'No attendance records or active contracts found for workers in this period' });
+        }
+
+        const [batchResult] = await pool.query(
+            `INSERT INTO payrollbatches (start_date, end_date, total_workers, total_amount, status, generated_by_user_id, generated_at) 
+             VALUES (?, ?, ?, ?, 'Generated', ?, NOW())`,
+            [start_date, end_date, totalWorkers, totalAmount, userId]
+        );
+        const batchId = batchResult.insertId;
+
+        for (let data of batchWorkersData) {
+            const [payrollResult] = await pool.query(
+                `INSERT INTO payroll (payroll_batch_id, worker_id, start_date, end_date, gross_salary, net_salary, status, generated_by_user_id) 
+                 VALUES (?, ?, ?, ?, ?, ?, 'Generated', ?)`,
+                [batchId, data.worker_id, start_date, end_date, data.grossSalary, data.netSalary, userId]
+            );
+            const payrollId = payrollResult.insertId;
+
+            // إدراج البيانات مع تمرير site_id و contract_id معاً لتجنب أي أخطاء قاعدة بيانات إضافية
+            await pool.query(
+                `INSERT INTO payrollitems (payroll_id, contract_id, site_id, regular_hours_worked, overtime_hours_worked, hourly_rate_snapshot, overtime_hourly_rate_snapshot, base_salary, overtime_pay) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                    payrollId, 
+                    data.contract_id, 
+                    data.site_id, // <-- تمرير موقع العمل الإلزامي
+                    data.regHours, 
+                    data.otHours, 
+                    data.hourlyRate, 
+                    data.overtimeRate, 
+                    data.baseSalary, 
+                    data.overtimePay
+                ]
+            );
+        }
+
+        return res.status(200).json({ 
+            success: true, 
+            message: 'Payroll generated successfully', 
+            batch_id: batchId 
+        });
+
+    } catch (error) {
+        console.error(error);
+        return res.status(500).json({ success: false, error: error.message });
     }
+}
 
-    // 6. تحديث إجماليات الدفعة
-    await connection.query(
-      `UPDATE payrollbatches SET total_workers = ?, total_amount = ? WHERE payroll_batch_id = ?`,
-      [totalWorkers, totalAmount, payrollBatchId]
-    );
-
-    await connection.commit();
-    res.status(201).json({ success: true, message: 'Payroll batch generated successfully', payrollBatchId });
-
-  } catch (error) {
-    await connection.rollback();
-    console.error(error);
-    res.status(500).json({ success: false, message: 'Server error while generating payroll' });
-  } finally {
-    connection.release();
-  }
-};
-
-// جلب تقارير الرواتب العامة
-const getPayrollReport = async (req, res) => {
+async function getPayrollReport(req, res) {
   try {
-    const [batches] = await pool.query(`
+    const { site_id } = req.query;
+    
+    let query = `
       SELECT 
         pb.payroll_batch_id, pb.start_date, pb.end_date, pb.total_workers, pb.total_amount, pb.status, pb.generated_at,
         u.full_name as generated_by
       FROM payrollbatches pb
       JOIN users u ON pb.generated_by_user_id = u.user_id
-      ORDER BY pb.generated_at DESC
-    `, []);
+    `;
+    
+    let queryParams = [];
+    
+   if (site_id) {
+      query = `
+        SELECT DISTINCT
+          pb.payroll_batch_id, pb.start_date, pb.end_date, pb.total_workers, pb.total_amount, pb.status, pb.generated_at,
+          u.full_name as generated_by
+        FROM payrollbatches pb
+        JOIN users u ON pb.generated_by_user_id = u.user_id
+        JOIN payroll p ON pb.payroll_batch_id = p.payroll_batch_id
+        JOIN attendance a ON p.worker_id = a.worker_id AND a.site_id = ?
+      `;
+      queryParams.push(site_id);
+    }
+
+    query += ` ORDER BY pb.generated_at DESC`;
+
+    const [batches] = await pool.query(query, queryParams);
 
     res.status(200).json({ success: true, data: batches });
   } catch (error) {
     console.error(error);
     res.status(500).json({ success: false, message: 'Error fetching payroll reports' });
   }
-};
+}
 
-// جلب تفاصيل دفعة رواتب معينة (ساعات العمال، أسعار الساعات، والمجاميع)
-const getPayrollBatchDetails = async (req, res) => {
+async function getPayrollBatchDetails(req, res) {
   const { batchId } = req.params;
   try {
     const [batches] = await pool.query(
@@ -144,10 +214,27 @@ const getPayrollBatchDetails = async (req, res) => {
     console.error(error);
     res.status(500).json({ success: false, message: 'Error fetching payroll details' });
   }
-};
+}
 
-module.exports = {
-  generatePayrollBatch,
-  getPayrollReport,
-  getPayrollBatchDetails
+async function markBatchAsPaid(req, res) {
+  const { batchId } = req.params;
+  try {
+    await pool.query(
+      `UPDATE payrollbatches SET status = 'Paid' WHERE payroll_batch_id = ?`, [batchId]
+    );
+    await pool.query(
+      `UPDATE payroll SET status = 'Paid', paid_date = CURDATE() WHERE payroll_batch_id = ?`, [batchId]
+    );
+    res.status(200).json({ success: true, message: 'Batch marked as paid' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: 'Error updating payment status' });
+  }
+}
+
+module.exports = { 
+  generatePayrollBatch, 
+  getPayrollReport, 
+  getPayrollBatchDetails, 
+  markBatchAsPaid 
 };

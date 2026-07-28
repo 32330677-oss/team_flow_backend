@@ -6,4 +6,6 @@ const authMiddleware = require('../middleware/authMiddleware');
 router.post('/generate', authMiddleware, adminPayrollController.generatePayrollBatch);
 router.get('/report', authMiddleware, adminPayrollController.getPayrollReport);
 router.get('/batch/:batchId', authMiddleware, adminPayrollController.getPayrollBatchDetails);
+router.patch('/batch/:batchId/mark-paid', authMiddleware, adminPayrollController.markBatchAsPaid);
+
 module.exports = router;
