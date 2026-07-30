@@ -108,13 +108,26 @@ exports.getBreakSettings = async (req, res) => {
     }
 };
 
-// 5. Update break & work hours settings with Cache refresh and Audit Log
+// 5. Update break & work hours settings with Cache refresh, Audit Log, and Pending Records validation
 exports.updateBreakSettings = async (req, res) => {
     const { lunch_start_time, lunch_end_time, standard_work_minutes } = req.body;
     const adminId = req.user.user_id;
     const connection = await db.getConnection();
     try {
         await connection.beginTransaction();
+
+        // فحص ما إذا كان هناك أي سجلات معلقة قبل السماح بتعديل الإعدادات
+        const [pending] = await connection.execute(
+            `SELECT COUNT(*) as count FROM attendance WHERE status IN ('Submitted', 'Draft')`
+        );
+
+        if (pending[0].count > 0) {
+            return res.status(400).json({ 
+                status: 'error', 
+                message: 'Please approve or process all pending attendance records before updating break settings.' 
+            });
+        }
+
         const updates = { lunch_start_time, lunch_end_time, standard_work_minutes };
 
         for (const [key, value] of Object.entries(updates)) {

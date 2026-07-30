@@ -327,29 +327,30 @@ exports.resubmitAttendance = async (req, res) => {
             ? new Date(check_out_time).toISOString().slice(0, 19).replace('T', ' ')
             : null;
 
-        // Logical check: check-out time must be after check-in time.
-        if (formattedCheckIn && formattedCheckOut && new Date(check_out_time) <= new Date(check_in_time)) {
+        // Logical check: check-out time must be after check-in time (using formatted variables)
+        if (formattedCheckIn && formattedCheckOut && new Date(formattedCheckOut) <= new Date(formattedCheckIn)) {
             throw new AppError('Check-out time must be after check-in time');
         }
 
+        // 1. تحديث جدول الحضور
         await connection.execute(
             `UPDATE attendance SET check_in_time = ?, check_out_time = ?, remarks = ?, status = 'Submitted', updated_at = NOW() WHERE attendance_id = ?`,
             [formattedCheckIn, formattedCheckOut, remarks, attendance_id]
         );
 
+        // 2. تسجيل سجل التدقيق (Audit Log)
         await connection.execute(
             `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values) VALUES (?, ?, ?, ?, ?, ?)`,
             ['attendance', attendance_id, 'RESUBMIT', supervisor_id, JSON.stringify(oldRecord), JSON.stringify({ check_in_time: formattedCheckIn, check_out_time: formattedCheckOut, remarks, status: 'Submitted' })]
         );
 
+        // 3. تثبيت التعديلات نهائياً (Commit مرة واحدة فقط في النهاية)
         await connection.commit();
+
         res.status(200).json({ status: 'success', message: 'Resubmitted successfully' });
     } catch (error) {
         await connection.rollback();
         console.error("RESUBMIT ERROR:", error);
-        // "Operational" (expected/safe) errors show their own message directly
-        // (e.g. record not found, invalid time order). Any other error (SQL, etc.)
-        // shows a generic message to avoid leaking database details.
         const message = error.isOperational
             ? error.message
             : 'An error occurred while resubmitting, please try again.';
