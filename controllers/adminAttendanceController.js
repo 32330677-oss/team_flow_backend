@@ -18,9 +18,11 @@ exports.getPendingRecords = async (req, res) => {
 };
 
 // 2. Review record (Approve or Reject) with strict validation & audit logging
+// backend/controllers/adminAttendanceController.js
+// Standardized to grab user_id dynamically as defined in JWT claims
 exports.reviewRecord = async (req, res) => {
     const { attendance_id, status, admin_note } = req.body;
-    const adminId = req.user?.id || req.user?.user_id;
+    const adminId = req.user?.user_id; 
     
     if (!adminId) return res.status(401).json({ status: 'error', message: 'Admin identification not found' });
 

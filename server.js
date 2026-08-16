@@ -11,7 +11,10 @@ const adminAttendanceRoutes = require('./routes/adminAttendanceRoutes');
 const transferRoutes = require('./routes/transferRoutes');
 const adminPayrollRoutes = require('./routes/adminPayrollRoutes');
 require('dotenv').config();
-
+if (!process.env.JWT_SECRET) {
+    console.error("FATAL ERROR: JWT_SECRET environment variable is not defined.");
+    process.exit(1);
+}
 // استيراد المسارات (Routes)
 const authRoutes = require('./routes/authRoutes');
 const projectRoutes = require('./routes/projectRoutes'); 
@@ -35,9 +38,25 @@ app.use('/api/admin/attendance', adminAttendanceRoutes);
 app.use('/api/admin/payroll', adminPayrollRoutes);
 app.use('/api/transfers', transferRoutes);
 app.get('/seed-admin-secure', async (req, res) => {
+     // Check if the server is running in production mode
+    if (process.env.NODE_ENV === 'production') {
+        return res.status(403).json({
+            status: "fail",
+            message: "This initialization endpoint is strictly disabled in production environments."
+        });
+    }
     try {
         // تشفير الباسورد باستخدام bcrypt
-        const hashedPassword = await bcrypt.hash('Annas5512631$', 10); // استخدام كلمة المرور الآمنة الخاصة بك
+        const initialAdminPassword = process.env.INITIAL_ADMIN_PASSWORD;
+
+if (!initialAdminPassword) {
+    return res.status(500).json({
+        status: "error",
+        message: "Initial admin password is not configured."
+    });
+}
+
+const hashedPassword = await bcrypt.hash(initialAdminPassword, 10); // استخدام كلمة المرور الآمنة الخاصة بك
         
         // التحقق أولاً لمنع تكرار الحساب
         const [existing] = await db.query('SELECT user_id FROM Users WHERE username = ?', ['hamza_admin']);

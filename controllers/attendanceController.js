@@ -302,6 +302,7 @@ exports.setManagementLeaveHours = async (req, res) => {
 // before the UPDATE, since MySQL rejects the raw ISO format
 // (e.g. 2026-07-16T09:11:29.000Z) with an "Incorrect datetime value" error.
 // -------------------------------------------------------------------
+// backend/controllers/attendanceController.js
 exports.resubmitAttendance = async (req, res) => {
     const { attendance_id } = req.params;
     const { check_in_time, check_out_time, remarks } = req.body;
@@ -319,34 +320,34 @@ exports.resubmitAttendance = async (req, res) => {
 
         const oldRecord = records[0];
 
-        const formattedCheckIn = check_in_time
-            ? new Date(check_in_time).toISOString().slice(0, 19).replace('T', ' ')
-            : null;
+        // Safe helper to convert Flutter ISO 8601 dates to MySQL format
+        const formatToMySqlDateTime = (isoString) => {
+            if (!isoString) return null;
+            try {
+                return new Date(isoString).toISOString().slice(0, 19).replace('T', ' ');
+            } catch (err) {
+                return null;
+            }
+        };
 
-        const formattedCheckOut = check_out_time
-            ? new Date(check_out_time).toISOString().slice(0, 19).replace('T', ' ')
-            : null;
+        const formattedCheckIn = formatToMySqlDateTime(check_in_time);
+        const formattedCheckOut = formatToMySqlDateTime(check_out_time);
 
-        // Logical check: check-out time must be after check-in time (using formatted variables)
         if (formattedCheckIn && formattedCheckOut && new Date(formattedCheckOut) <= new Date(formattedCheckIn)) {
             throw new AppError('Check-out time must be after check-in time');
         }
 
-        // 1. تحديث جدول الحضور
         await connection.execute(
             `UPDATE attendance SET check_in_time = ?, check_out_time = ?, remarks = ?, status = 'Submitted', updated_at = NOW() WHERE attendance_id = ?`,
             [formattedCheckIn, formattedCheckOut, remarks, attendance_id]
         );
 
-        // 2. تسجيل سجل التدقيق (Audit Log)
         await connection.execute(
             `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values) VALUES (?, ?, ?, ?, ?, ?)`,
             ['attendance', attendance_id, 'RESUBMIT', supervisor_id, JSON.stringify(oldRecord), JSON.stringify({ check_in_time: formattedCheckIn, check_out_time: formattedCheckOut, remarks, status: 'Submitted' })]
         );
 
-        // 3. تثبيت التعديلات نهائياً (Commit مرة واحدة فقط في النهاية)
         await connection.commit();
-
         res.status(200).json({ status: 'success', message: 'Resubmitted successfully' });
     } catch (error) {
         await connection.rollback();

@@ -62,7 +62,7 @@ exports.login = async (req, res) => {
         }
 
         // 5. Generate JWT with a fallback secret to prevent server crash
-        const jwtSecret = process.env.JWT_SECRET || 'teamflow_super_secure_fallback_key';
+        const jwtSecret = process.env.JWT_SECRET;
         const token = jwt.sign(
             { user_id: user.user_id, role: user.role },
             jwtSecret,

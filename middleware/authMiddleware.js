@@ -1,13 +1,10 @@
+// backend/middleware/authMiddleware.js
 const jwt = require('jsonwebtoken');
 
 const authMiddleware = (req, res, next) => {
-    // 1. جلب التوكين من الهيدر (Authorization Header)
     const authHeader = req.headers['authorization'];
-    
-    // التوكين عادة يأتي بصيغة: "Bearer TOKEN_HERE"
     const token = authHeader && authHeader.split(' ')[1];
 
-    // 2. التحقق من وجود التوكين
     if (!token) {
         return res.status(401).json({ 
             status: 'error', 
@@ -15,19 +12,17 @@ const authMiddleware = (req, res, next) => {
         });
     }
 
+    // Force absolute crash on launch if secure environment configuration is missing
+    const secretKey = process.env.JWT_SECRET;
+    if (!secretKey) {
+        console.error("FATAL ERROR: JWT_SECRET variable is completely missing from process.env.");
+        process.exit(1);
+    }
+
     try {
-        // 3. فك تشفير التوكين والتحقق من صلاحيته
-        // تأكد من استبدال 'YOUR_JWT_SECRET_KEY' بالمفتاح السري الخاص بـ Login في مشروعك
-        const secretKey = process.env.JWT_SECRET || 'YOUR_JWT_SECRET_KEY'; 
-        
         const decoded = jwt.verify(token, secretKey);
-        
-        // 4. وضع بيانات المستخدم المفكوكة في req.user لكي تقرأها الـ Controllers الأخرى
-        // الـ decoded يحتوي عادة على: { user_id: 3, role: 'Supervisor', ... }
         req.user = decoded; 
-        // داخل الـ middleware قبل الـ next()
-console.log("👤 User from JWT:", req.user);
-        // الانتقال للخطوة التالية (الـ Controller) بسلام
+        console.log("👤 User from JWT:", req.user);
         next(); 
     } catch (error) {
         console.error('JWT Verification Error:', error);
