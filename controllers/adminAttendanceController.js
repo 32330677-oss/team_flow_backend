@@ -1,3 +1,4 @@
+// backend/controllers/adminAttendanceController.js
 const db = require('../config/db');
 const settingsCache = require('../services/settingsCache');
 
@@ -17,63 +18,74 @@ exports.getPendingRecords = async (req, res) => {
     }
 };
 
-// 2. Review record (Approve or Reject) with strict validation & audit logging
-// backend/controllers/adminAttendanceController.js
-// Standardized to grab user_id dynamically as defined in JWT claims
+// 2. Review record (Approve or Reject) with strict pre-validation & audit logging
 exports.reviewRecord = async (req, res) => {
     const { attendance_id, status, admin_note } = req.body;
     const adminId = req.user?.user_id; 
     
-    if (!adminId) return res.status(401).json({ status: 'error', message: 'Admin identification not found' });
+    if (!adminId) {
+        return res.status(401).json({ status: 'error', message: 'Admin identification not found' });
+    }
 
-    const connection = await db.getConnection();
     try {
-        await connection.beginTransaction();
-
-        const [oldRows] = await connection.execute(
-            'SELECT * FROM attendance WHERE attendance_id = ?', 
-            [attendance_id]
-        );
-        
-        if (oldRows.length === 0) throw new Error('Record does not exist');
-        const oldRecord = oldRows[0];
-
-        if (status === 'Approved' && oldRecord.status === 'Rejected') {
-            throw new Error('Cannot approve a rejected record. It must be resubmitted first.');
-        }
-        
-        if (oldRecord.status !== 'Submitted' && oldRecord.status !== 'Rejected') {
-             throw new Error('Record cannot be reviewed as it is not in pending status.');
+        // SAFE PRE-VALIDATION CHECK: Verify the admin exists in the users table to prevent FK crashes
+        const [userExists] = await db.query('SELECT user_id FROM Users WHERE user_id = ? AND role = "Admin"', [adminId]);
+        if (userExists.length === 0) {
+            return res.status(403).json({ status: 'error', message: 'Unauthorized: Invalid admin account or insufficient permissions' });
         }
 
-        await connection.execute(
-            `UPDATE attendance 
-             SET status = ?, admin_rejection_notes = ?, approved_by_user_id = ?, approval_date = NOW() 
-             WHERE attendance_id = ?`,
-            [status, (status === 'Rejected' ? admin_note : null), adminId, attendance_id]
-        );
+        const connection = await db.getConnection();
+        try {
+            await connection.beginTransaction();
 
-        await connection.execute(
-            `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values) 
-             VALUES (?, ?, ?, ?, ?, ?)`,
-            [
-                'attendance', 
-                attendance_id, 
-                status.toUpperCase(), 
-                adminId, 
-                JSON.stringify(oldRecord), 
-                JSON.stringify({ status, admin_note })
-            ]
-        );
+            const [oldRows] = await connection.execute(
+                'SELECT * FROM attendance WHERE attendance_id = ?', 
+                [attendance_id]
+            );
+            
+            if (oldRows.length === 0) throw new Error('Record does not exist');
+            const oldRecord = oldRows[0];
 
-        await connection.commit();
-        res.status(200).json({ status: 'success', message: 'Operation completed successfully' });
-    } catch (error) {
-        await connection.rollback();
-        console.error("Review Error:", error);
-        res.status(400).json({ status: 'error', message: error.message });
-    } finally {
-        connection.release();
+            if (status === 'Approved' && oldRecord.status === 'Rejected') {
+                throw new Error('Cannot approve a rejected record. It must be resubmitted first.');
+            }
+            
+            if (oldRecord.status !== 'Submitted' && oldRecord.status !== 'Rejected') {
+                 throw new Error('Record cannot be reviewed as it is not in pending status.');
+            }
+
+            await connection.execute(
+                `UPDATE attendance 
+                 SET status = ?, admin_rejection_notes = ?, approved_by_user_id = ?, approval_date = NOW() 
+                 WHERE attendance_id = ?`,
+                [status, (status === 'Rejected' ? admin_note : null), adminId, attendance_id]
+            );
+
+            await connection.execute(
+                `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values) 
+                 VALUES (?, ?, ?, ?, ?, ?)`,
+                [
+                    'attendance', 
+                    attendance_id, 
+                    status.toUpperCase(), 
+                    adminId, 
+                    JSON.stringify(oldRecord), 
+                    JSON.stringify({ status, admin_note })
+                ]
+            );
+
+            await connection.commit();
+            res.status(200).json({ status: 'success', message: 'Operation completed successfully' });
+        } catch (error) {
+            await connection.rollback();
+            console.error("Review Transaction Error:", error);
+            res.status(400).json({ status: 'error', message: error.message });
+        } finally {
+            connection.release();
+        }
+    } catch (dbError) {
+        console.error("Pre-validation DB Error:", dbError);
+        res.status(500).json({ status: 'error', message: 'Internal server error during pre-validation checks' });
     }
 };
 
@@ -118,7 +130,6 @@ exports.updateBreakSettings = async (req, res) => {
     try {
         await connection.beginTransaction();
 
-        // فحص ما إذا كان هناك أي سجلات معلقة قبل السماح بتعديل الإعدادات
         const [pending] = await connection.execute(
             `SELECT COUNT(*) as count FROM attendance WHERE status IN ('Submitted', 'Draft')`
         );
@@ -148,8 +159,6 @@ exports.updateBreakSettings = async (req, res) => {
         }
 
         await connection.commit();
-        
-        // Refresh the memory cache immediately so calculations update instantly
         await settingsCache.refresh();
 
         res.status(200).json({ status: 'success', message: 'Settings updated successfully' });

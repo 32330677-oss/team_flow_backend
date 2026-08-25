@@ -10,6 +10,7 @@ const supervisorRouter = require('./routes/supervisorRoutes');
 const adminAttendanceRoutes = require('./routes/adminAttendanceRoutes');
 const transferRoutes = require('./routes/transferRoutes');
 const adminPayrollRoutes = require('./routes/adminPayrollRoutes');
+const path = require('path');
 require('dotenv').config();
 if (!process.env.JWT_SECRET) {
     console.error("FATAL ERROR: JWT_SECRET environment variable is not defined.");
@@ -37,6 +38,7 @@ app.use('/api/attendance', require('./routes/attendanceRoutes'));
 app.use('/api/admin/attendance', adminAttendanceRoutes);
 app.use('/api/admin/payroll', adminPayrollRoutes);
 app.use('/api/transfers', transferRoutes);
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.get('/seed-admin-secure', async (req, res) => {
      // Check if the server is running in production mode
     if (process.env.NODE_ENV === 'production') {
