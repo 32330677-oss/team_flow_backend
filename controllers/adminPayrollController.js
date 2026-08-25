@@ -1,279 +1,385 @@
 const pool = require('../config/db');
 
-async function generatePayrollBatch(req, res) {
-    const { start_date, end_date, site_id } = req.body;
-    const userId = req.user?.user_id;
 
-    // ✅ تحقق من المدخلات أولاً، قبل أي استعلام
-   if (!start_date || !end_date) {
-        console.log("❌ Validation Error: Missing dates");
-        return res.status(400).json({ success: false, message: 'Start date and end date are required' });
-    }
-    if (new Date(end_date) < new Date(start_date)) {
-        console.log("❌ Validation Error: End date before start date");
-        return res.status(400).json({ success: false, message: 'End date must be after start date' });
-    }
-    if (!userId) {
-        console.log("❌ Validation Error: User ID missing from request");
-        return res.status(401).json({ success: false, message: 'Admin identification not found' });
-    }
+const REGULAR_HOURLY_RATE_SYP = 12500;
+const OVERTIME_HOURLY_RATE_SYP = 25000;
 
-    const connection = await pool.getConnection();
-    try {
-        // ✅ فحص تداخل التواريخ بشرط واحد بسيط وصحيح منطقياً، وقبل فتح أي transaction
-        const [overlapping] = await connection.query(
-            `SELECT payroll_batch_id FROM payrollbatches WHERE start_date <= ? AND end_date >= ?`,
-            [end_date, start_date]
-        );
-        if (overlapping.length > 0) {
-            return res.status(400).json({
-                success: false,
-                message: 'A payroll batch for this period or overlapping dates already exists.'
-            });
-        }
-
-        await connection.beginTransaction();
-
-        const isSpecificSite = site_id && site_id !== '' && site_id !== 'null' && site_id !== '0' && site_id !== 'All';
-
-        let workersQuery = `
-            SELECT DISTINCT w.worker_id, w.full_name
-            FROM workers w
-            JOIN workersiteassignments wsa ON w.worker_id = wsa.worker_id AND wsa.unassigned_date IS NULL
-            WHERE w.status = 'Active'
-        `;
-        const queryParams = [];
-        if (isSpecificSite) {
-            workersQuery += ` AND wsa.site_id = ?`;
-            queryParams.push(site_id);
-        }
-
-        const [workers] = await connection.query(workersQuery, queryParams);
-        if (!workers.length) {
-            await connection.rollback();
-            return res.status(404).json({ success: false, message: 'No active assigned workers found' });
-        }
-
-        const [batchResult] = await connection.query(
-            `INSERT INTO payrollbatches (start_date, end_date, generated_by_user_id, status) VALUES (?, ?, ?, 'Generated')`,
-            [start_date, end_date, userId]
-        );
-        const batchId = batchResult.insertId;
-
-        let totalWorkers = 0;
-        let totalAmount = 0;
-
-        for (const worker of workers) {
-            let assignmentsQuery = `
-                SELECT wsa.site_id, wsa.contract_id, c.hourly_rate, c.overtime_hourly_rate
-                FROM workersiteassignments wsa
-                JOIN contracts c ON wsa.contract_id = c.contract_id
-                WHERE wsa.worker_id = ? AND wsa.unassigned_date IS NULL
-            `;
-            const assignParams = [worker.worker_id];
-            if (isSpecificSite) {
-                assignmentsQuery += ` AND wsa.site_id = ?`;
-                assignParams.push(site_id);
-            }
-
-            const [assignments] = await connection.query(assignmentsQuery, assignParams);
-            if (!assignments.length) continue;
-
-            const siteRateMap = new Map();
-            assignments.forEach(a => siteRateMap.set(a.site_id, a));
-
-            let attQuery = `
-                SELECT site_id,
-                       SUM(total_working_hours) AS reg_hours,
-                       SUM(overtime_hours) AS ot_hours
-                FROM attendance
-                WHERE worker_id = ? AND record_date BETWEEN ? AND ? AND status = 'Approved'
-            `;
-            const attParams = [worker.worker_id, start_date, end_date];
-            if (isSpecificSite) {
-                attQuery += ` AND site_id = ?`;
-                attParams.push(site_id);
-            }
-            attQuery += ` GROUP BY site_id`;
-
-            const [logs] = await connection.query(attQuery, attParams);
-            if (!logs.length) continue;
-
-            const siteBreakdown = [];
-            let workerNetSalary = 0;
-
-            for (const log of logs) {
-                const regHours = Number(log.reg_hours || 0);
-                const otHours = Number(log.ot_hours || 0);
-                const logSiteId = log.site_id;
-
-                if ((regHours === 0 && otHours === 0) || !logSiteId) continue;
-
-                const rateInfo = siteRateMap.get(logSiteId);
-                if (!rateInfo) continue;
-
-                const hourlyRate = Number(rateInfo.hourly_rate || 0);
-                const overtimeRate = Number(rateInfo.overtime_hourly_rate || 0);
-                const baseSalary = regHours * hourlyRate;
-                const overtimePay = otHours * overtimeRate;
-
-                siteBreakdown.push({
-                    site_id: logSiteId,
-                    contract_id: rateInfo.contract_id,
-                    regHours, otHours, hourlyRate, overtimeRate,
-                    baseSalary, overtimePay
-                });
-
-                workerNetSalary += (baseSalary + overtimePay);
-            }
-
-            if (!siteBreakdown.length) continue;
-
-            const [payrollResult] = await connection.query(
-                `INSERT INTO payroll (payroll_batch_id, worker_id, start_date, end_date, gross_salary, net_salary, status, generated_by_user_id)
-                 VALUES (?, ?, ?, ?, ?, ?, 'Generated', ?)`,
-                [batchId, worker.worker_id, start_date, end_date, workerNetSalary, workerNetSalary, userId]
-            );
-            const payrollId = payrollResult.insertId;
-
-            for (const item of siteBreakdown) {
-                await connection.query(
-                    `INSERT INTO payrollitems
-                     (payroll_id, contract_id, site_id, regular_hours_worked, overtime_hours_worked, hourly_rate_snapshot, overtime_hourly_rate_snapshot, base_salary, overtime_pay)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                    [payrollId, item.contract_id, item.site_id, item.regHours, item.otHours, item.hourlyRate, item.overtimeRate, item.baseSalary, item.overtimePay]
-                );
-            }
-
-            totalWorkers++;
-            totalAmount += workerNetSalary;
-        }
-
-        if (totalWorkers === 0) {
-            await connection.rollback();
-            return res.status(400).json({ success: false, message: 'No approved attendance found for this period' });
-        }
-
-        await connection.query(
-            `UPDATE payrollbatches SET total_workers = ?, total_amount = ? WHERE payroll_batch_id = ?`,
-            [totalWorkers, totalAmount, batchId]
-        );
-
-        await connection.commit();
-        return res.status(201).json({ success: true, message: 'Payroll generated successfully', batch_id: batchId });
-
-    } catch (error) {
-        await connection.rollback();
-        console.error(error);
-        return res.status(500).json({ success: false, message: error.message });
-    } finally {
-        connection.release();
-    }
+function isValidDate(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(value || '')) && !Number.isNaN(Date.parse(`${value}T00:00:00`));
 }
 
+function isSpecificSite(value) {
+  return value !== undefined && value !== null && !['', 'null', '0', 'All'].includes(String(value));
+}
+
+function money(value) {
+  return Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
+}
+
+async function generatePayrollBatch(req, res) {
+  const { start_date, end_date, site_id } = req.body || {};
+  const userId = req.user?.user_id;
+
+  if (!userId) return res.status(401).json({ success: false, message: 'Admin identification not found.' });
+  if (!isValidDate(start_date) || !isValidDate(end_date)) {
+    return res.status(400).json({ success: false, message: 'Dates must use YYYY-MM-DD.' });
+  }
+  if (end_date < start_date) {
+    return res.status(400).json({ success: false, message: 'End date must be after or equal to start date.' });
+  }
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const scopedSite = isSpecificSite(site_id);
+
+    const [overlap] = await connection.execute(
+      `SELECT payroll_batch_id FROM payrollbatches
+       WHERE start_date <= ? AND end_date >= ?
+       LIMIT 1 FOR UPDATE`,
+      [end_date, start_date]
+    );
+    if (overlap.length) {
+      await connection.rollback();
+      return res.status(409).json({ success: false, message: 'An overlapping payroll batch already exists.' });
+    }
+
+    const siteFilter = scopedSite ? ' AND wsa.site_id = ?' : '';
+    const workerParams = scopedSite ? [site_id] : [];
+    const [workers] = await connection.execute(
+      `SELECT DISTINCT w.worker_id, w.full_name
+       FROM workers w
+       JOIN workersiteassignments wsa ON wsa.worker_id = w.worker_id
+         AND wsa.unassigned_date IS NULL
+       WHERE w.status = 'Active'${siteFilter}
+       ORDER BY w.full_name`,
+      workerParams
+    );
+    if (!workers.length) {
+      await connection.rollback();
+      return res.status(404).json({ success: false, message: 'No active assigned workers found.' });
+    }
+
+    const [batchResult] = await connection.execute(
+      `INSERT INTO payrollbatches (start_date, end_date, generated_by_user_id, status)
+       VALUES (?, ?, ?, 'Generated')`,
+      [start_date, end_date, userId]
+    );
+    const batchId = batchResult.insertId;
+    let totalWorkers = 0;
+    let totalAmount = 0;
+
+    for (const worker of workers) {
+      const assignmentParams = [worker.worker_id];
+      let assignmentSql = `
+        SELECT wsa.site_id, wsa.contract_id, c.hourly_rate, c.overtime_hourly_rate
+        FROM workersiteassignments wsa
+        JOIN contracts c ON c.contract_id = wsa.contract_id
+        WHERE wsa.worker_id = ? AND wsa.unassigned_date IS NULL AND c.status = 'Active'`;
+      if (scopedSite) {
+        assignmentSql += ' AND wsa.site_id = ?';
+        assignmentParams.push(site_id);
+      }
+      const [assignments] = await connection.execute(assignmentSql, assignmentParams);
+      if (!assignments.length) continue;
+
+      const ratesBySite = new Map(assignments.map((row) => [Number(row.site_id), row]));
+      const attendanceParams = [worker.worker_id, start_date, end_date];
+      let attendanceSql = `
+        SELECT site_id,
+               COALESCE(SUM(total_working_hours), 0) AS regular_hours,
+               COALESCE(SUM(overtime_hours), 0) AS overtime_hours
+        FROM attendance
+        WHERE worker_id = ? AND record_date BETWEEN ? AND ? AND status = 'Approved'`;
+      if (scopedSite) {
+        attendanceSql += ' AND site_id = ?';
+        attendanceParams.push(site_id);
+      }
+      attendanceSql += ' GROUP BY site_id';
+      const [logs] = await connection.execute(attendanceSql, attendanceParams);
+      if (!logs.length) continue;
+
+      const breakdown = [];
+      let workerGross = 0;
+      for (const log of logs) {
+        const siteId = Number(log.site_id);
+        const rates = ratesBySite.get(siteId);
+        if (!rates) continue;
+        const regularHours = Math.max(0, Number(log.regular_hours || 0));
+        const overtimeHours = Math.max(0, Number(log.overtime_hours || 0));
+        const hourlyRate = REGULAR_HOURLY_RATE_SYP;
+        const overtimeRate = OVERTIME_HOURLY_RATE_SYP;
+        const baseSalary = money(regularHours * hourlyRate);
+        const overtimePay = money(overtimeHours * overtimeRate);
+        if (regularHours === 0 && overtimeHours === 0) continue;
+        breakdown.push({ siteId, contractId: rates.contract_id, regularHours, overtimeHours, hourlyRate, overtimeRate, baseSalary, overtimePay });
+        workerGross = money(workerGross + baseSalary + overtimePay);
+      }
+      if (!breakdown.length) continue;
+
+      const [payrollResult] = await connection.execute(
+        `INSERT INTO payroll
+          (payroll_batch_id, worker_id, start_date, end_date,
+           bonus_amount, penalty_amount, deductions_amount,
+           gross_salary, net_salary, status, generated_by_user_id)
+         VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?, 'Generated', ?)`,
+        [batchId, worker.worker_id, start_date, end_date, workerGross, workerGross, userId]
+      );
+      const payrollId = payrollResult.insertId;
+
+      for (const item of breakdown) {
+        await connection.execute(
+          `INSERT INTO payrollitems
+            (payroll_id, contract_id, site_id, hourly_rate_snapshot,
+             overtime_hourly_rate_snapshot, regular_hours_worked,
+             overtime_hours_worked, base_salary, overtime_pay)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [payrollId, item.contractId, item.siteId, item.hourlyRate, item.overtimeRate,
+            item.regularHours, item.overtimeHours, item.baseSalary, item.overtimePay]
+        );
+      }
+      totalWorkers += 1;
+      totalAmount = money(totalAmount + workerGross);
+    }
+
+    if (!totalWorkers) {
+      await connection.rollback();
+      return res.status(400).json({ success: false, message: 'No Approved attendance found for this period.' });
+    }
+
+    await connection.execute(
+      `UPDATE payrollbatches SET total_workers = ?, total_amount = ? WHERE payroll_batch_id = ?`,
+      [totalWorkers, totalAmount, batchId]
+    );
+    await connection.commit();
+    return res.status(201).json({ success: true, message: 'Payroll generated successfully.', batch_id: batchId });
+  } catch (error) {
+    await connection.rollback();
+    console.error('generatePayrollBatch:', error);
+    return res.status(500).json({ success: false, message: 'Failed to generate payroll.' });
+  } finally {
+    connection.release();
+  }
+}
 
 async function getPayrollReport(req, res) {
-    try {
-        const { site_id } = req.query;
-
-        let query = `
-            SELECT DISTINCT
-                pb.payroll_batch_id, pb.start_date, pb.end_date, pb.total_workers, pb.total_amount, pb.status, pb.generated_at,
-                u.full_name AS generated_by
-            FROM payrollbatches pb
-            JOIN users u ON pb.generated_by_user_id = u.user_id
-        `;
-        const params = [];
-
-        const isSpecificSite = site_id && site_id !== '' && site_id !== 'null' && site_id !== '0' && site_id !== 'All';
-
-        if (isSpecificSite) {
-            query = `
-                SELECT DISTINCT
-                    pb.payroll_batch_id, pb.start_date, pb.end_date, pb.total_workers, pb.total_amount, pb.status, pb.generated_at,
-                    u.full_name AS generated_by
-                FROM payrollbatches pb
-                JOIN users u ON pb.generated_by_user_id = u.user_id
-                JOIN payroll p ON pb.payroll_batch_id = p.payroll_batch_id
-                JOIN payrollitems pi ON p.payroll_id = pi.payroll_id AND pi.site_id = ?
-            `;
-            params.push(site_id);
-        }
-
-        query += ` ORDER BY pb.generated_at DESC`;
-
-        const [batches] = await pool.query(query, params);
-        res.status(200).json({ success: true, data: batches });
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ success: false, message: 'Error fetching payroll reports' });
+  try {
+    const { site_id } = req.query;
+    const params = [];
+    let sql = `SELECT DISTINCT pb.payroll_batch_id, pb.start_date, pb.end_date,
+      pb.total_workers, pb.total_amount, pb.status, pb.generated_at,
+      u.full_name AS generated_by
+      FROM payrollbatches pb JOIN users u ON u.user_id = pb.generated_by_user_id`;
+    if (isSpecificSite(site_id)) {
+      sql += ` JOIN payroll p ON p.payroll_batch_id = pb.payroll_batch_id
+               JOIN payrollitems pi ON pi.payroll_id = p.payroll_id AND pi.site_id = ?`;
+      params.push(site_id);
     }
+    sql += ' ORDER BY pb.generated_at DESC';
+    const [rows] = await pool.execute(sql, params);
+    return res.json({ success: true, data: rows });
+  } catch (error) {
+    console.error('getPayrollReport:', error);
+    return res.status(500).json({ success: false, message: 'Failed to load payroll reports.' });
+  }
 }
 
 async function getPayrollBatchDetails(req, res) {
-    const { batchId } = req.params;
-    try {
-        const [batches] = await pool.query(`SELECT * FROM payrollbatches WHERE payroll_batch_id = ?`, [batchId]);
-        if (!batches.length) return res.status(404).json({ success: false, message: 'Batch not found' });
-
-        const [items] = await pool.query(`
-            SELECT p.payroll_id, p.gross_salary, p.net_salary,
-                   w.worker_id, w.full_name AS worker_name,
-                   pi.site_id, s.site_name,
-                   pi.regular_hours_worked, pi.overtime_hours_worked,
-                   pi.hourly_rate_snapshot, pi.overtime_hourly_rate_snapshot,
-                   pi.base_salary, pi.overtime_pay
-            FROM payroll p
-            JOIN workers w ON p.worker_id = w.worker_id
-            JOIN payrollitems pi ON p.payroll_id = pi.payroll_id
-            LEFT JOIN sites s ON pi.site_id = s.site_id
-            WHERE p.payroll_batch_id = ?
-        `, [batchId]);
-
-        res.status(200).json({ success: true, batch: batches[0], workers: items });
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ success: `Error fetching payroll details` });
-    }
+  const batchId = Number(req.params.batchId);
+  if (!Number.isInteger(batchId) || batchId <= 0) return res.status(400).json({ success: false, message: 'Invalid batch id.' });
+  try {
+    const [batches] = await pool.execute('SELECT * FROM payrollbatches WHERE payroll_batch_id = ?', [batchId]);
+    if (!batches.length) return res.status(404).json({ success: false, message: 'Batch not found.' });
+    const [items] = await pool.execute(
+      `SELECT p.payroll_id, p.gross_salary, p.net_salary,
+              p.bonus_amount, p.penalty_amount, p.deductions_amount,
+              w.worker_id, w.full_name AS worker_name,
+              pi.site_id, s.site_name, pi.regular_hours_worked,
+              pi.overtime_hours_worked, pi.hourly_rate_snapshot,
+              pi.overtime_hourly_rate_snapshot, pi.base_salary, pi.overtime_pay
+       FROM payroll p JOIN workers w ON w.worker_id = p.worker_id
+       JOIN payrollitems pi ON pi.payroll_id = p.payroll_id
+       LEFT JOIN sites s ON s.site_id = pi.site_id
+       WHERE p.payroll_batch_id = ? ORDER BY w.full_name, pi.site_id`,
+      [batchId]
+    );
+    return res.json({ success: true, batch: batches[0], workers: items });
+  } catch (error) {
+    console.error('getPayrollBatchDetails:', error);
+    return res.status(500).json({ success: false, message: 'Failed to load batch details.' });
+  }
 }
 
 async function markBatchAsPaid(req, res) {
-    const { batchId } = req.params;
-    const connection = await pool.getConnection();
-    try {
-        await connection.beginTransaction();
-        await connection.query(`UPDATE payrollbatches SET status = 'Paid' WHERE payroll_batch_id = ?`, [batchId]);
-        await connection.query(`UPDATE payroll SET status = 'Paid', paid_date = CURDATE() WHERE payroll_batch_id = ?`, [batchId]);
-        await connection.commit();
-        res.status(200).json({ success: true, message: 'Batch marked as paid' });
-    } catch (error) {
-        await connection.rollback();
-        console.error(error);
-        res.status(500).json({ success: false, message: 'Error updating payment status' });
-    } finally {
-        connection.release();
+  const batchId = Number(req.params.batchId);
+  if (!Number.isInteger(batchId) || batchId <= 0) return res.status(400).json({ success: false, message: 'Invalid batch id.' });
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [batches] = await connection.execute('SELECT status FROM payrollbatches WHERE payroll_batch_id = ? FOR UPDATE', [batchId]);
+    if (!batches.length) {
+      await connection.rollback();
+      return res.status(404).json({ success: false, message: 'Batch not found.' });
     }
+    if (batches[0].status === 'Paid') {
+      await connection.rollback();
+      return res.status(409).json({ success: false, message: 'Batch is already paid.' });
+    }
+    await connection.execute(`UPDATE payrollbatches SET status = 'Paid' WHERE payroll_batch_id = ?`, [batchId]);
+    await connection.execute(`UPDATE payroll SET status = 'Paid', paid_date = CURDATE() WHERE payroll_batch_id = ?`, [batchId]);
+    await connection.commit();
+    return res.json({ success: true, message: 'Batch marked as paid.' });
+  } catch (error) {
+    await connection.rollback();
+    console.error('markBatchAsPaid:', error);
+    return res.status(500).json({ success: false, message: 'Failed to mark batch as paid.' });
+  } finally {
+    connection.release();
+  }
 }
 
 async function getLastBatchEndDate(req, res) {
-    try {
-        const [rows] = await pool.query(
-            `SELECT end_date FROM payrollbatches ORDER BY end_date DESC LIMIT 1`
-        );
-        if (rows.length === 0) {
-            return res.status(200).json({ success: true, last_end_date: null });
-        }
-        res.status(200).json({ success: true, last_end_date: rows[0].end_date });
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ success: false, message: 'Error fetching last batch end date' });
-    }
+  try {
+    const [rows] = await pool.execute('SELECT end_date FROM payrollbatches ORDER BY end_date DESC LIMIT 1');
+    return res.json({ success: true, last_end_date: rows[0]?.end_date || null });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: 'Failed to load the last batch date.' });
+  }
 }
 
-module.exports = { 
-    generatePayrollBatch, 
-    getPayrollReport, 
-    getPayrollBatchDetails, 
-    markBatchAsPaid, 
-    getLastBatchEndDate 
+async function exportPayrollExcel(req, res) {
+  const batchId = Number(req.params.batchId);
+  if (!Number.isInteger(batchId) || batchId <= 0) {
+    return res.status(400).json({ success: false, message: 'Invalid batch id.' });
+  }
+
+  try {
+    const ExcelJS = require('exceljs');
+    const [batches] = await pool.execute(
+      `SELECT payroll_batch_id, start_date, end_date,
+              total_workers, total_amount, status
+       FROM payrollbatches
+       WHERE payroll_batch_id = ?`,
+      [batchId]
+    );
+    if (!batches.length) {
+      return res.status(404).json({ success: false, message: 'Batch not found.' });
+    }
+
+    const [rows] = await pool.execute(
+      `SELECT w.full_name AS worker_name,
+              s.site_name,
+              pi.regular_hours_worked,
+              pi.overtime_hours_worked,
+              pi.hourly_rate_snapshot,
+              pi.overtime_hourly_rate_snapshot,
+              pi.base_salary,
+              pi.overtime_pay,
+              p.net_salary
+       FROM payroll p
+       JOIN workers w ON w.worker_id = p.worker_id
+       JOIN payrollitems pi ON pi.payroll_id = p.payroll_id
+       LEFT JOIN sites s ON s.site_id = pi.site_id
+       WHERE p.payroll_batch_id = ?
+       ORDER BY w.full_name, s.site_name`,
+      [batchId]
+    );
+
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet('Payroll');
+    const batch = batches[0];
+    const dateOnly = (value) => {
+      if (value instanceof Date) return value.toISOString().slice(0, 10);
+      return String(value || '').slice(0, 10);
+    };
+
+    sheet.columns = [
+      { header: 'No.', key: 'number', width: 8 },
+      { header: 'Worker Name', key: 'worker_name', width: 28 },
+      { header: 'Site', key: 'site_name', width: 22 },
+      { header: 'Regular Hours', key: 'regular_hours', width: 16 },
+      { header: 'Overtime Hours', key: 'overtime_hours', width: 16 },
+      { header: 'Regular Rate', key: 'regular_rate', width: 16 },
+      { header: 'Overtime Rate', key: 'overtime_rate', width: 16 },
+      { header: 'Regular Pay', key: 'regular_pay', width: 16 },
+      { header: 'Overtime Pay', key: 'overtime_pay', width: 16 },
+      { header: 'Net Salary', key: 'net_salary', width: 16 },
+    ];
+
+    sheet.mergeCells('A1:J1');
+    sheet.getCell('A1').value = `Payroll Batch #${batchId}`;
+    sheet.mergeCells('A2:J2');
+    sheet.getCell('A2').value = `Period: ${dateOnly(batch.start_date)} - ${dateOnly(batch.end_date)}`;
+    sheet.mergeCells('A3:J3');
+    sheet.getCell('A3').value = 'Currency: Syrian Pound (ل.س)';
+    sheet.getRow(5).values = sheet.columns.map((column) => column.header);
+
+    let totalRegularPay = 0;
+    let totalOvertimePay = 0;
+    let totalNetSalary = 0;
+
+    rows.forEach((item, index) => {
+      const regularHours = Number(item.regular_hours_worked || 0);
+      const overtimeHours = Number(item.overtime_hours_worked || 0);
+      const regularRate = Number(item.hourly_rate_snapshot || REGULAR_HOURLY_RATE_SYP);
+      const overtimeRate = Number(item.overtime_hourly_rate_snapshot || OVERTIME_HOURLY_RATE_SYP);
+      const regularPay = Math.round(regularHours * regularRate * 100) / 100;
+      const overtimePay = Math.round(overtimeHours * overtimeRate * 100) / 100;
+      const netSalary = Number(item.net_salary || regularPay + overtimePay);
+
+      totalRegularPay += regularPay;
+      totalOvertimePay += overtimePay;
+      totalNetSalary += netSalary;
+
+      sheet.addRow({
+        number: index + 1,
+        worker_name: item.worker_name,
+        site_name: item.site_name || '',
+        regular_hours: regularHours,
+        overtime_hours: overtimeHours,
+        regular_rate: regularRate,
+        overtime_rate: overtimeRate,
+        regular_pay: regularPay,
+        overtime_pay: overtimePay,
+        net_salary: netSalary,
+      });
+    });
+
+    const totalRow = sheet.addRow({
+      worker_name: 'TOTAL',
+      regular_pay: Math.round(totalRegularPay * 100) / 100,
+      overtime_pay: Math.round(totalOvertimePay * 100) / 100,
+      net_salary: Math.round(totalNetSalary * 100) / 100,
+    });
+
+    sheet.getRow(1).font = { bold: true, size: 16, color: { argb: 'FFFFFFFF' } };
+    sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
+    sheet.getRow(5).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    sheet.getRow(5).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
+    totalRow.font = { bold: true };
+    for (let row = 6; row <= sheet.rowCount; row += 1) {
+      for (const col of [6, 7, 8, 9, 10]) {
+        sheet.getCell(row, col).numFmt = '#,##0 "ل.س"';
+      }
+    }
+
+    const fileName = `payroll_batch_${batchId}.xlsx`;
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    console.error('exportPayrollExcel:', error);
+    if (!res.headersSent) {
+      return res.status(500).json({ success: false, message: 'Failed to export Excel payroll report.' });
+    }
+  }
+}
+module.exports = {
+  generatePayrollBatch,
+  getPayrollReport,
+  getPayrollBatchDetails,
+  markBatchAsPaid,
+  getLastBatchEndDate,
+  exportPayrollExcel,
 };

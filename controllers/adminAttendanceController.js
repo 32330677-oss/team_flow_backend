@@ -6,11 +6,18 @@ const settingsCache = require('../services/settingsCache');
 exports.getPendingRecords = async (req, res) => {
     try {
         const [rows] = await db.execute(
-            `SELECT a.*, DATE_FORMAT(a.record_date, '%Y-%m-%d') as record_date, w.full_name, s.site_name 
+            `SELECT a.attendance_id, a.worker_id, a.site_id,
+                    a.check_in_time, a.check_out_time,
+                    a.total_working_hours, a.overtime_hours,
+                    a.management_leave_hours, a.status, a.attendance_status,
+                    a.remarks, a.admin_rejection_notes,
+                    a.approved_by_user_id, a.approval_date,
+                    DATE_FORMAT(a.record_date, '%Y-%m-%d') AS record_date,
+                    w.full_name, s.site_name 
              FROM attendance a
              JOIN workers w ON a.worker_id = w.worker_id
              JOIN sites s ON a.site_id = s.site_id
-             WHERE a.status = 'Submitted' OR a.status = 'Rejected'`
+             WHERE a.status IN ('Submitted', 'Rejected')`
         );
         res.status(200).json({ status: 'success', data: rows });
     } catch (error) {
@@ -21,7 +28,13 @@ exports.getPendingRecords = async (req, res) => {
 // 2. Review record (Approve or Reject) with strict pre-validation & audit logging
 exports.reviewRecord = async (req, res) => {
     const { attendance_id, status, admin_note } = req.body;
-    const adminId = req.user?.user_id; 
+    const adminId = req.user?.user_id;
+    if (!['Approved', 'Rejected'].includes(status)) {
+        return res.status(400).json({ status: 'error', message: 'Status must be Approved or Rejected.' });
+    }
+    if (status === 'Rejected' && (!admin_note || !String(admin_note).trim())) {
+        return res.status(400).json({ status: 'error', message: 'A rejection reason is required.' });
+    } 
     
     if (!adminId) {
         return res.status(401).json({ status: 'error', message: 'Admin identification not found' });
@@ -46,11 +59,11 @@ exports.reviewRecord = async (req, res) => {
             if (oldRows.length === 0) throw new Error('Record does not exist');
             const oldRecord = oldRows[0];
 
-            if (status === 'Approved' && oldRecord.status === 'Rejected') {
-                throw new Error('Cannot approve a rejected record. It must be resubmitted first.');
+            if (oldRecord.status === 'Rejected') {
+                throw new Error('Rejected records must be resubmitted by the supervisor first.');
             }
-            
-            if (oldRecord.status !== 'Submitted' && oldRecord.status !== 'Rejected') {
+
+            if (oldRecord.status !== 'Submitted') {
                  throw new Error('Record cannot be reviewed as it is not in pending status.');
             }
 
@@ -79,7 +92,7 @@ exports.reviewRecord = async (req, res) => {
         } catch (error) {
             await connection.rollback();
             console.error("Review Transaction Error:", error);
-            res.status(400).json({ status: 'error', message: error.message });
+            res.status(error.message.includes('record') || error.message.includes('Status') || error.message.includes('Rejected') ? 400 : 500).json({ status: 'error', message: error.message });
         } finally {
             connection.release();
         }
@@ -112,7 +125,7 @@ exports.getBreakSettings = async (req, res) => {
     try {
         const [rows] = await db.execute(
             `SELECT setting_key, setting_value FROM system_settings
-             WHERE setting_key IN ('lunch_start_time','lunch_end_time','standard_work_minutes')`
+             WHERE setting_key IN ('is_lunch_paid','standard_work_minutes')`
         );
         const data = {};
         rows.forEach(r => data[r.setting_key] = r.setting_value);
@@ -124,8 +137,15 @@ exports.getBreakSettings = async (req, res) => {
 
 // 5. Update break & work hours settings with Cache refresh, Audit Log, and Pending Records validation
 exports.updateBreakSettings = async (req, res) => {
-    const { lunch_start_time, lunch_end_time, standard_work_minutes } = req.body;
+    const { is_lunch_paid, standard_work_minutes } = req.body;
     const adminId = req.user.user_id;
+    const numericMinutes = Number(standard_work_minutes);
+    if (standard_work_minutes !== undefined && (!Number.isFinite(numericMinutes) || numericMinutes <= 0 || numericMinutes > 1440)) {
+        return res.status(400).json({ status: 'error', message: 'standard_work_minutes must be between 1 and 1440.' });
+    }
+    if (is_lunch_paid !== undefined && !['true', 'false', true, false].includes(is_lunch_paid)) {
+        return res.status(400).json({ status: 'error', message: 'is_lunch_paid must be true or false.' });
+    }
     const connection = await db.getConnection();
     try {
         await connection.beginTransaction();
@@ -135,13 +155,14 @@ exports.updateBreakSettings = async (req, res) => {
         );
 
         if (pending[0].count > 0) {
+            await connection.rollback();
             return res.status(400).json({ 
                 status: 'error', 
                 message: 'Please approve or process all pending attendance records before updating break settings.' 
             });
         }
 
-        const updates = { lunch_start_time, lunch_end_time, standard_work_minutes };
+        const updates = { is_lunch_paid: is_lunch_paid === undefined ? undefined : String(is_lunch_paid), standard_work_minutes: standard_work_minutes === undefined ? undefined : String(numericMinutes) };
 
         for (const [key, value] of Object.entries(updates)) {
             if (value === undefined) continue;
@@ -164,7 +185,7 @@ exports.updateBreakSettings = async (req, res) => {
         res.status(200).json({ status: 'success', message: 'Settings updated successfully' });
     } catch (error) {
         await connection.rollback();
-        res.status(400).json({ status: 'error', message: error.message });
+        res.status(error.isOperational ? 400 : 500).json({ status: 'error', message: error.isOperational ? error.message : 'Internal server error while updating settings.' });
     } finally {
         connection.release();
     }

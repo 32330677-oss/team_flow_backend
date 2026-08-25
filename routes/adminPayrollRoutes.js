@@ -1,12 +1,17 @@
 const express = require('express');
 const router = express.Router();
-const adminPayrollController = require('../controllers/adminPayrollController');
+const controller = require('../controllers/adminPayrollController');
 const authMiddleware = require('../middleware/authMiddleware');
+const restrictTo = require('../middleware/roleMiddleware');
 
-router.post('/generate', authMiddleware, adminPayrollController.generatePayrollBatch);
-router.get('/report', authMiddleware, adminPayrollController.getPayrollReport);
-router.get('/batch/:batchId', authMiddleware, adminPayrollController.getPayrollBatchDetails);
-router.patch('/batch/:batchId/mark-paid', authMiddleware, adminPayrollController.markBatchAsPaid);
-router.get('/last-date', authMiddleware, adminPayrollController.getLastBatchEndDate); // ✅ مسار نسبي صحيح
+router.use(authMiddleware);
+router.use(restrictTo('Admin'));
+
+router.post('/generate', controller.generatePayrollBatch);
+router.get('/report', controller.getPayrollReport);
+router.get('/batch/:batchId', controller.getPayrollBatchDetails);
+router.get('/batch/:batchId/export.xlsx', controller.exportPayrollExcel);
+router.patch('/batch/:batchId/mark-paid', controller.markBatchAsPaid);
+router.get('/last-date', controller.getLastBatchEndDate);
 
 module.exports = router;

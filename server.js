@@ -1,7 +1,5 @@
 const express = require('express');
 const cors = require('cors');
-const bcrypt = require('bcryptjs'); 
-const db = require('./config/db');
 const contractRoutes = require('./routes/contractRoutes');
 const siteRoutes = require('./routes/siteRoutes');
 const workerRoutes = require('./routes/workerRoutes');
@@ -39,62 +37,7 @@ app.use('/api/admin/attendance', adminAttendanceRoutes);
 app.use('/api/admin/payroll', adminPayrollRoutes);
 app.use('/api/transfers', transferRoutes);
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
-app.get('/seed-admin-secure', async (req, res) => {
-     // Check if the server is running in production mode
-    if (process.env.NODE_ENV === 'production') {
-        return res.status(403).json({
-            status: "fail",
-            message: "This initialization endpoint is strictly disabled in production environments."
-        });
-    }
-    try {
-        // تشفير الباسورد باستخدام bcrypt
-        const initialAdminPassword = process.env.INITIAL_ADMIN_PASSWORD;
 
-if (!initialAdminPassword) {
-    return res.status(500).json({
-        status: "error",
-        message: "Initial admin password is not configured."
-    });
-}
-
-const hashedPassword = await bcrypt.hash(initialAdminPassword, 10); // استخدام كلمة المرور الآمنة الخاصة بك
-        
-        // التحقق أولاً لمنع تكرار الحساب
-        const [existing] = await db.query('SELECT user_id FROM Users WHERE username = ?', ['hamza_admin']);
-        if (existing.length > 0) {
-            return res.status(400).json({
-                status: "fail",
-                message: "الأدمن موجود بالفعل في قاعدة البيانات!"
-            });
-        }
-
-        const sql = `
-            INSERT INTO Users (username, password_hash, email, full_name, role, status) 
-            VALUES (?, ?, ?, ?, 'Admin', 'Active')
-        `;
-        
-        const [result] = await db.query(sql, [
-            'hamza_admin', 
-            hashedPassword, 
-            'hamza@teamflow.com', 
-            'Hamza Ahmed Hashma'
-        ]);
-
-        res.json({ 
-            status: "success", 
-            message: "تم زرع الأدمن الرئيسي بنجاح وبشكل آمن تماماً!", 
-            userId: result.insertId 
-        });
-
-    } catch (error) {
-        res.status(500).json({ 
-            status: "error", 
-            message: "فشل زرع الأدمن في قاعدة البيانات", 
-            details: error.message 
-        });
-    }
-});
 
 const PORT = process.env.PORT || 5000;
 

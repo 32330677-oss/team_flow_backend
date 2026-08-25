@@ -12,9 +12,9 @@ router.post('/checkout', attendanceController.checkOut);
 router.post('/submit', attendanceController.submitDay);
 router.post('/leave/start', attendanceController.startLeave);
 router.post('/leave/end', attendanceController.endLeave);
+router.post('/lunch/bulk', attendanceController.saveLunchBulk);
 router.get('/rejected', restrictTo('Admin', 'Supervisor'), attendanceController.getRejectedRecords);
 router.patch('/:attendance_id/management-leave', restrictTo('Admin'), attendanceController.setManagementLeaveHours);
-// المسار المحدث بنوع PATCH
 router.patch('/:attendance_id/resubmit', restrictTo('Supervisor'), attendanceController.resubmitAttendance);
 
 module.exports = router;
