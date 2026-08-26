@@ -101,14 +101,23 @@ async function generatePayrollBatch(req, res) {
 
       const breakdown = [];
       let workerGross = 0;
-      for (const log of logs) {
+    for (const log of logs) {
         const siteId = Number(log.site_id);
         const rates = ratesBySite.get(siteId);
         if (!rates) continue;
         const regularHours = Math.max(0, Number(log.regular_hours || 0));
         const overtimeHours = Math.max(0, Number(log.overtime_hours || 0));
-        const hourlyRate = REGULAR_HOURLY_RATE_SYP;
-        const overtimeRate = OVERTIME_HOURLY_RATE_SYP;
+        
+        // --- التصحيح هنا: قراءة الأجور من العقد مباشرة مع التحقق ---
+        const hourlyRate = Number(rates.hourly_rate);
+        const overtimeRate = Number(rates.overtime_hourly_rate);
+
+        if (!Number.isFinite(hourlyRate) || hourlyRate < 0 ||
+            !Number.isFinite(overtimeRate) || overtimeRate < 0) {
+          throw new Error(`Invalid rates for contract ${rates.contract_id}`);
+        }
+        // --------------------------------------------------------
+
         const baseSalary = money(regularHours * hourlyRate);
         const overtimePay = money(overtimeHours * overtimeRate);
         if (regularHours === 0 && overtimeHours === 0) continue;

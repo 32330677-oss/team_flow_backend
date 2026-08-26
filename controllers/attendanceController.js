@@ -35,7 +35,7 @@ function formatToMySqlDateTime(isoString) {
 async function getAttendanceId(worker_id, site_id) {
     const [rows] = await db.execute(
         `SELECT attendance_id FROM attendance 
-         WHERE worker_id = ? AND site_id = ? AND record_date = CURDATE() AND check_out_time IS NULL AND status = 'Draft'
+         WHERE worker_id = ? AND site_id = ? AND check_in_time IS NOT NULL AND check_out_time IS NULL AND status = 'Draft'
          ORDER BY attendance_id DESC LIMIT 1`,
         [worker_id, site_id]
     );
@@ -100,11 +100,13 @@ exports.getSiteWorkers = async (req, res) => {
             JOIN workersiteassignments wsa ON w.worker_id = wsa.worker_id
             LEFT JOIN attendance a ON w.worker_id = a.worker_id
                 AND a.site_id = ?
-                AND a.record_date = CURDATE()
+                AND (a.record_date = CURDATE()
+                     OR (a.status = 'Draft' AND a.check_in_time IS NOT NULL AND a.check_out_time IS NULL))
             WHERE wsa.site_id = ? 
             AND wsa.unassigned_date IS NULL 
             AND w.status = 'Active'
-            AND (a.attendance_id IS NULL OR a.record_date = CURDATE())
+            AND (a.attendance_id IS NULL OR a.record_date = CURDATE()
+                 OR (a.status = 'Draft' AND a.check_in_time IS NOT NULL AND a.check_out_time IS NULL))
         `;
 
         const [workers] = await db.execute(query, [siteId, siteId]);
@@ -140,16 +142,24 @@ exports.checkIn = async (req, res) => {
         }
 
         const [existingToday] = await db.execute(
-            `SELECT attendance_id, attendance_status, check_in_time, check_out_time
+            `SELECT attendance_id, attendance_status, check_in_time, check_out_time, status
              FROM attendance
              WHERE worker_id = ? AND site_id = ? AND record_date = CURDATE()
-               AND status = 'Draft'
              ORDER BY attendance_id DESC
              LIMIT 1`,
             [worker_id, site_id]
         );
         if (existingToday.length > 0) {
             const existing = existingToday[0];
+            if (existing.status === 'Rejected') {
+                return res.status(409).json({
+                    status: 'error',
+                    message: 'This attendance record was rejected. Open Rejected Records and resubmit it.'
+                });
+            }
+            if (existing.status !== 'Draft') {
+                return res.status(409).json({ status: 'error', message: 'Worker already has a finalized attendance record for today.' });
+            }
             if (existing.attendance_status === 'Absent' && !existing.check_in_time && !existing.check_out_time) {
                 const connection = await db.getConnection();
                 try {
@@ -241,8 +251,8 @@ exports.checkOut = async (req, res) => {
 
         const [rows] = await db.execute(
             `SELECT attendance_id, check_in_time, attendance_status, status FROM attendance
-             WHERE worker_id = ? AND site_id = ? AND record_date = CURDATE()
-               AND check_out_time IS NULL AND status = 'Draft' 
+             WHERE worker_id = ? AND site_id = ?
+               AND check_in_time IS NOT NULL AND check_out_time IS NULL AND status = 'Draft' 
              ORDER BY attendance_id DESC LIMIT 1`,
             [worker_id, site_id]
         );
@@ -253,9 +263,9 @@ exports.checkOut = async (req, res) => {
         const att_id = rows[0].attendance_id;
         const existingCheckIn = rows[0].check_in_time;
 
-        const checkInMinutes = timeToMinutes(existingCheckIn);
-        const checkOutMinutes = timeToMinutes(formattedCheckOut);
-        if (checkInMinutes === null || checkOutMinutes === null || checkOutMinutes <= checkInMinutes) {
+        const checkInDate = parseAttendanceDate(existingCheckIn);
+        const checkOutDate = parseAttendanceDate(formattedCheckOut);
+        if (!checkInDate || !checkOutDate || checkOutDate <= checkInDate) {
             return res.status(400).json({ status: 'error', message: 'Check-out time must be after check-in time.' });
         }
 
@@ -274,7 +284,7 @@ exports.checkOut = async (req, res) => {
             }
 
             await connection.execute(
-                'UPDATE attendance SET check_out_time = ? WHERE attendance_id = ? AND status = \'Draft\' AND record_date = CURDATE()',
+                'UPDATE attendance SET check_out_time = ? WHERE attendance_id = ? AND status = \'Draft\'',
                 [formattedCheckOut, att_id]
             );
 
@@ -315,6 +325,13 @@ function normalizeTimeForDate(value, date) {
         return `${date} ${text.length === 5 ? text + ':00' : text}`;
     }
     return formatToMySqlDateTime(text);
+}
+
+function parseAttendanceDate(value) {
+    if (!value) return null;
+    const normalized = String(value).replace(' ', 'T');
+    const parsed = new Date(normalized);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
 function timeToMinutes(value) {
@@ -479,7 +496,9 @@ exports.submitDay = async (req, res) => {
         const [openRecords] = await db.execute(
             `SELECT attendance_id
              FROM attendance
-             WHERE site_id = ? AND record_date = CURDATE() AND status = 'Draft'
+             WHERE site_id = ? AND status = 'Draft'
+               AND (record_date = CURDATE()
+                    OR record_date = DATE_SUB(CURDATE(), INTERVAL 1 DAY))
                AND check_in_time IS NOT NULL AND check_out_time IS NULL`,
             [siteId]
         );
@@ -491,7 +510,9 @@ exports.submitDay = async (req, res) => {
             `SELECT a.attendance_id
              FROM attendance a
              JOIN attendanceleaveperiods alp ON alp.attendance_id = a.attendance_id
-             WHERE a.site_id = ? AND a.record_date = CURDATE() AND a.status = 'Draft'
+             WHERE a.site_id = ? AND a.status = 'Draft'
+               AND (a.record_date = CURDATE()
+                    OR a.record_date = DATE_SUB(CURDATE(), INTERVAL 1 DAY))
                AND alp.leave_end_time IS NULL
              LIMIT 1`,
             [siteId]
@@ -503,7 +524,10 @@ exports.submitDay = async (req, res) => {
         const [records] = await db.execute(
             `SELECT attendance_id, attendance_status
              FROM attendance
-             WHERE site_id = ? AND record_date = CURDATE() AND status = 'Draft'
+             WHERE site_id = ? AND status = 'Draft'
+               AND (record_date = CURDATE()
+                    OR (record_date = DATE_SUB(CURDATE(), INTERVAL 1 DAY)
+                        AND check_in_time IS NOT NULL AND check_out_time IS NOT NULL))
                AND ((check_in_time IS NOT NULL AND check_out_time IS NOT NULL)
                     OR attendance_status IN ('Absent', 'Sick', 'Vacation', 'Holiday'))`,
             [siteId]
