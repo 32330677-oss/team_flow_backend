@@ -6,7 +6,7 @@ exports.getSitesByContract = async (req, res) => {
     try {
         const query = `
             SELECT s.*, u.full_name AS supervisor_name 
-            FROM Sites s
+            FROM sites s
             LEFT JOIN users u ON s.supervisor_id = u.user_id
             WHERE s.contract_id = ? 
             ORDER BY s.created_at DESC
@@ -29,7 +29,7 @@ exports.createSite = async (req, res) => {
 
     try {
         const query = `
-            INSERT INTO Sites (site_name, location, contract_id, supervisor_id, site_status) 
+            INSERT INTO sites (site_name, location, contract_id, supervisor_id, site_status) 
             VALUES (?, ?, ?, ?, 'Active')
         `;
         const [result] = await db.query(query, [site_name, location || null, contract_id, supervisor_id || null]);
@@ -47,7 +47,7 @@ exports.updateSite = async (req, res) => {
 
     try {
         const query = `
-            UPDATE Sites 
+            UPDATE sites 
             SET site_name = ?, location = ?, supervisor_id = ?
             WHERE site_id = ?
         `;
@@ -75,7 +75,7 @@ exports.toggleSiteStatus = async (req, res) => {
 
     try {
         const [result] = await db.query(
-            'UPDATE Sites SET site_status = ? WHERE site_id = ?',
+            'UPDATE sites SET site_status = ? WHERE site_id = ?',
             [status, siteId]
         );
 
@@ -97,7 +97,7 @@ exports.getAllSites = async (req, res) => {
     try {
         const query = `
             SELECT site_id, site_name 
-            FROM Sites 
+            FROM sites 
             WHERE site_status = 'Active'
             ORDER BY site_name ASC
         `;
@@ -114,9 +114,9 @@ exports.getMySites = async (req, res) => {
     try {
         const query = `
             SELECT s.*, c.contract_name, p.project_name
-            FROM Sites s
-            LEFT JOIN Contracts c ON s.contract_id = c.contract_id
-            LEFT JOIN Projects p ON c.project_id = p.project_id
+            FROM sites s
+            LEFT JOIN contracts c ON s.contract_id = c.contract_id
+            LEFT JOIN projects p ON c.project_id = p.project_id
             WHERE s.supervisor_id = ? AND s.site_status = 'Active'
             ORDER BY s.created_at DESC
         `;

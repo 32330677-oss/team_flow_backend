@@ -1,9 +1,9 @@
 const db = require('../config/db');
 
-// 1. جلب جميع المشاريع من جدول Projects
+// 1. جلب جميع المشاريع من جدول projects
 exports.getAllProjects = async (req, res) => {
     try {
-        const [rows] = await db.query('SELECT * FROM Projects ORDER BY created_at DESC');
+        const [rows] = await db.query('SELECT * FROM projects ORDER BY created_at DESC');
         return res.status(200).json({
             status: 'success',
             results: rows.length,
@@ -26,7 +26,7 @@ exports.createProject = async (req, res) => {
     }
 
     try {
-        const query = 'INSERT INTO Projects (project_name, client_name, location) VALUES (?, ?, ?)';
+        const query = 'INSERT INTO projects (project_name, client_name, location) VALUES (?, ?, ?)';
         const [result] = await db.query(query, [project_name, client_name || null, location || null]);
 
         return res.status(201).json({
@@ -46,22 +46,23 @@ exports.updateProject = async (req, res) => {
     const { project_name, client_name, location } = req.body;
 
     if (!project_name) {
-        return res.status(400).json({ status: 'error', message: 'Project name is required' });
+        return res.status(400).json({ status: 'error', message: 'project name is required' });
     }
 
     try {
         const [result] = await db.query(
-            'UPDATE Projects SET project_name = ?, client_name = ?, location = ? WHERE project_id = ?',
+            'UPDATE projects SET project_name = ?, client_name = ?, location = ? WHERE project_id = ?',
+
             [project_name, client_name || null, location || null, id]
         );
 
         if (result.affectedRows === 0) {
-            return res.status(404).json({ status: 'error', message: 'Project not found' });
+            return res.status(404).json({ status: 'error', message: 'project not found' });
         }
 
         return res.status(200).json({
             status: 'success',
-            message: 'Project updated successfully'
+            message: 'project updated successfully'
         });
     } catch (error) {
         console.error(error);
@@ -81,17 +82,18 @@ exports.toggleProjectStatus = async (req, res) => {
 
     try {
         const [result] = await db.query(
-            'UPDATE Projects SET status = ? WHERE project_id = ?',
+            'UPDATE projects SET status = ? WHERE project_id = ?',
+
             [status, id]
         );
 
         if (result.affectedRows === 0) {
-            return res.status(404).json({ status: 'error', message: 'Project not found' });
+            return res.status(404).json({ status: 'error', message: 'project not found' });
         }
 
         return res.status(200).json({
             status: 'success',
-            message: `Project status updated to ${status}`
+            message: `project status updated to ${status}`
         });
     } catch (error) {
         console.error(error);

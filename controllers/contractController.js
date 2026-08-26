@@ -5,7 +5,7 @@ exports.getContractsByProject = async (req, res) => {
     const { projectId } = req.params;
     try {
         const [rows] = await db.query(
-            'SELECT * FROM Contracts WHERE project_id = ? ORDER BY created_at DESC', 
+            'SELECT * FROM contracts WHERE project_id = ? ORDER BY created_at DESC', 
             [projectId]
         );
         return res.status(200).json({ status: 'success', data: rows });
@@ -30,7 +30,7 @@ exports.createContract = async (req, res) => {
 
     try {
         const query = `
-            INSERT INTO Contracts 
+            INSERT INTO contracts 
             (contract_name, description, start_date, end_date, project_id, hourly_rate, overtime_hourly_rate, admin_id) 
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `;
@@ -57,7 +57,7 @@ exports.updateContract = async (req, res) => {
 
     try {
         const query = `
-            UPDATE Contracts 
+            UPDATE contracts 
             SET contract_name = ?, description = ?, start_date = ?, end_date = ?, hourly_rate = ?, overtime_hourly_rate = ? 
             WHERE contract_id = ?
         `;
@@ -85,7 +85,7 @@ exports.toggleContractStatus = async (req, res) => {
 
     try {
         const [result] = await db.query(
-            'UPDATE Contracts SET status = ? WHERE contract_id = ?',
+            'UPDATE contracts SET status = ? WHERE contract_id = ?',
             [status, contractId]
         );
 
