@@ -104,13 +104,8 @@ exports.createWorker = async (req, res) => {
 // 3. تعديل بيانات عامل (مع دعم تحديث الصور أيضاً)
 exports.updateWorker = async (req, res) => {
     const workerId = req.params.id; // worker_unique_id
-    const { 
-        full_name, phone_number, nationality, job_position, hire_date, notes, status,
-        mothers_name, birth_date, birth_place, location 
-    } = req.body;
-
-    // استخدام الـ middleware الخاص برفع الملفات أثناء التعديل أيضاً إذا أردت، أو استقبالها من الـ body
-    // هنا سنفترض أن التعديل قد يدعم الملفات المرفوعة عبر Multer إذا تم تمريرها
+    // Flutter sends multipart FormData for worker edits, so req.body must be
+    // read only after Multer has parsed the request inside the callback.
     const uploadMiddleware = upload.fields([
         { name: 'personal_photo', maxCount: 1 },
         { name: 'id_photo', maxCount: 1 }
@@ -122,6 +117,11 @@ exports.updateWorker = async (req, res) => {
         }
 
         try {
+            const {
+                full_name, phone_number, nationality, job_position, hire_date, notes, status,
+                mothers_name, birth_date, birth_place, location
+            } = req.body || {};
+
             const [existing] = await db.query('SELECT * FROM workers WHERE worker_unique_id = ?', [workerId]);
             if (existing.length === 0) {
                 return res.status(404).json({ status: 'error', message: 'العامل غير موجود' });
@@ -172,7 +172,7 @@ exports.updateWorker = async (req, res) => {
 
             return res.status(200).json({
                 status: 'success',
-                message: 'تم تحديث بيانات العامل بنجاح'
+                message: 'data changed successfully'
             });
         } catch (error) {
             console.error("🚨 UPDATE WORKER ERROR:", error);
