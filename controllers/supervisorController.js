@@ -6,7 +6,7 @@ exports.getAllSupervisors = async (req, res) => {
     try {
         const query = `
             SELECT user_id, full_name, username, role, status, created_at, last_login 
-            FROM Users 
+            FROM users 
             WHERE role = 'Supervisor'
             ORDER BY created_at DESC
         `;
@@ -39,7 +39,7 @@ exports.createSupervisor = async (req, res) => {
 
     try {
         // التأكد من عدم تكرار اسم المستخدم
-        const [existingUser] = await db.query('SELECT user_id FROM Users WHERE username = ?', [username]);
+        const [existingUser] = await db.query('SELECT user_id FROM users WHERE username = ?', [username]);
         if (existingUser.length > 0) {
             return res.status(400).json({
                 status: 'fail',
@@ -51,7 +51,7 @@ exports.createSupervisor = async (req, res) => {
         const hashedPassword = await bcrypt.hash(password, 10);
 
         const insertQuery = `
-            INSERT INTO Users (full_name, username, password_hash, role, status) 
+            INSERT INTO users (full_name, username, password_hash, role, status) 
             VALUES (?, ?, ?, 'Supervisor', 'Active')
         `;
 
@@ -95,7 +95,7 @@ exports.updateSupervisor = async (req, res) => {
 
     try {
         const [duplicateCheck] = await db.query(
-            'SELECT user_id FROM Users WHERE username = ? AND user_id != ?', 
+            'SELECT user_id FROM users WHERE username = ? AND user_id != ?', 
             [username, id]
         );
         if (duplicateCheck.length > 0) {
@@ -106,7 +106,7 @@ exports.updateSupervisor = async (req, res) => {
         }
 
         const updateQuery = `
-            UPDATE Users 
+            UPDATE users 
             SET full_name = ?, username = ?
             WHERE user_id = ? AND role = 'Supervisor'
         `;
@@ -146,7 +146,7 @@ exports.toggleSupervisorStatus = async (req, res) => {
 
     try {
         const query = `
-            UPDATE Users 
+            UPDATE users 
             SET status = ?
             WHERE user_id = ? AND role = 'Supervisor'
         `;

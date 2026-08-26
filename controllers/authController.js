@@ -18,7 +18,7 @@ exports.login = async (req, res) => {
         // 2. Smart search: matches either username or email
         const query = `
             SELECT user_id, username, password_hash, email, full_name, role, status 
-            FROM Users 
+            FROM users 
             WHERE username = ? OR email = ?
         `;
         const [users] = await db.query(query, [loginIdentifier, loginIdentifier]);
@@ -70,7 +70,7 @@ exports.login = async (req, res) => {
         );
 
         // 6. Update last login time in the database
-        await db.query('UPDATE Users SET last_login = NOW() WHERE user_id = ?', [user.user_id]);
+        await db.query('UPDATE users SET last_login = NOW() WHERE user_id = ?', [user.user_id]);
 
         // 7. Log successful login attempt in loginhistory (success = 1) with device_id
         await db.query(

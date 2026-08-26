@@ -7,7 +7,7 @@ exports.getSitesByContract = async (req, res) => {
         const query = `
             SELECT s.*, u.full_name AS supervisor_name 
             FROM Sites s
-            LEFT JOIN Users u ON s.supervisor_id = u.user_id
+            LEFT JOIN users u ON s.supervisor_id = u.user_id
             WHERE s.contract_id = ? 
             ORDER BY s.created_at DESC
         `;
