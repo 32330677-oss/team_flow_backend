@@ -122,6 +122,10 @@ exports.updateWorker = async (req, res) => {
                 mothers_name, birth_date, birth_place, location
             } = req.body || {};
 
+            const birthDateValue = typeof birth_date === 'string' && birth_date.trim() === ''
+                ? null
+                : birth_date;
+
             const [existing] = await db.query('SELECT * FROM workers WHERE worker_unique_id = ?', [workerId]);
             if (existing.length === 0) {
                 return res.status(404).json({ status: 'error', message: 'العامل غير موجود' });
@@ -162,7 +166,7 @@ exports.updateWorker = async (req, res) => {
                 notes !== undefined ? notes : existing[0].notes,
                 status || null,
                 mothers_name !== undefined ? mothers_name : existing[0].mothers_name,
-                birth_date !== undefined ? birth_date : existing[0].birth_date,
+                birth_date !== undefined ? birthDateValue : existing[0].birth_date,
                 birth_place !== undefined ? birth_place : existing[0].birth_place,
                 location !== undefined ? location : existing[0].location,
                 personalPhotoPath,
@@ -172,7 +176,7 @@ exports.updateWorker = async (req, res) => {
 
             return res.status(200).json({
                 status: 'success',
-                message: 'data changed successfully'
+                message: 'updated data'
             });
         } catch (error) {
             console.error("🚨 UPDATE WORKER ERROR:", error);
