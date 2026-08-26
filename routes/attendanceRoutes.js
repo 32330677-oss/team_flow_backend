@@ -8,6 +8,7 @@ router.use(authMiddleware);
 
 router.get('/sites/:siteId/workers', attendanceController.getSiteWorkers);
 router.post('/checkin', attendanceController.checkIn);
+router.post('/status', attendanceController.setAttendanceStatus);
 router.post('/checkout', attendanceController.checkOut);
 router.post('/submit', attendanceController.submitDay);
 router.post('/leave/start', attendanceController.startLeave);

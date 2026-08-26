@@ -225,6 +225,80 @@ exports.checkIn = async (req, res) => {
     }
 };
 
+exports.setAttendanceStatus = async (req, res) => {
+    const { worker_id, site_id, attendance_status, remarks } = req.body;
+    const allowedStatuses = ['Absent', 'Sick', 'Annual', 'Holiday'];
+    const recordedByUserId = req.user.user_id;
+
+    try {
+        if (!worker_id || !site_id || !attendance_status) {
+            return res.status(400).json({ status: 'error', message: 'Worker, site, and attendance status are required.' });
+        }
+        if (!allowedStatuses.includes(attendance_status)) {
+            return res.status(400).json({ status: 'error', message: 'Invalid attendance status.' });
+        }
+        if (!(await verifySiteAction(req, site_id))) {
+            return res.status(403).json({ status: 'error', message: 'You are not authorized to update this site.' });
+        }
+        if (!(await verifyWorkerAssignedToSite(worker_id, site_id))) {
+            return res.status(400).json({ status: 'error', message: 'Worker is not active or is not assigned to this site.' });
+        }
+
+        const [existingRows] = await db.execute(
+            `SELECT attendance_id, status, attendance_status
+             FROM attendance
+             WHERE worker_id = ? AND site_id = ? AND record_date = CURDATE()
+             ORDER BY attendance_id DESC LIMIT 1`,
+            [worker_id, site_id]
+        );
+
+        if (existingRows.length > 0) {
+            const existing = existingRows[0];
+            if (existing.status !== 'Draft') {
+                return res.status(409).json({ status: 'error', message: 'Attendance cannot be changed after it has been submitted.' });
+            }
+
+            await db.execute(
+                `UPDATE attendance
+                 SET attendance_status = ?, remarks = ?, recorded_by_user_id = ?
+                 WHERE attendance_id = ? AND status = 'Draft'`,
+                [attendance_status, remarks || `${attendance_status} - recorded by supervisor`, recordedByUserId, existing.attendance_id]
+            );
+
+            await db.execute(
+                `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+                 VALUES ('attendance', ?, 'STATUS_UPDATED', ?, ?, ?)`,
+                [
+                    existing.attendance_id,
+                    recordedByUserId,
+                    JSON.stringify({ attendance_status: existing.attendance_status }),
+                    JSON.stringify({ attendance_status, remarks: remarks || null })
+                ]
+            );
+
+            return res.status(200).json({ status: 'success', message: 'Attendance status updated successfully.' });
+        }
+
+        const [inserted] = await db.execute(
+            `INSERT INTO attendance
+                (worker_id, site_id, record_date, attendance_status, status, recorded_by_user_id, remarks)
+             VALUES (?, ?, CURDATE(), ?, 'Draft', ?, ?)`,
+            [worker_id, site_id, attendance_status, recordedByUserId, remarks || `${attendance_status} - recorded by supervisor`]
+        );
+
+        await db.execute(
+            `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+             VALUES ('attendance', ?, 'STATUS_CREATED', ?, NULL, ?)`,
+            [inserted.insertId, recordedByUserId, JSON.stringify({ attendance_status, remarks: remarks || null })]
+        );
+
+        return res.status(201).json({ status: 'success', message: 'Attendance status recorded successfully.' });
+    } catch (error) {
+        console.error('SET ATTENDANCE STATUS ERROR:', error);
+        return res.status(500).json({ status: 'error', message: 'An error occurred while saving attendance status.' });
+    }
+};
+
 exports.checkOut = async (req, res) => {
     try {
         const { worker_id, site_id, check_out_time } = req.body;
@@ -529,7 +603,7 @@ exports.submitDay = async (req, res) => {
                     OR (record_date = DATE_SUB(CURDATE(), INTERVAL 1 DAY)
                         AND check_in_time IS NOT NULL AND check_out_time IS NOT NULL))
                AND ((check_in_time IS NOT NULL AND check_out_time IS NOT NULL)
-                    OR attendance_status IN ('Absent', 'Sick', 'Vacation', 'Holiday'))`,
+                    OR attendance_status IN ('Absent', 'Sick', 'Annual', 'Vacation', 'Holiday'))`,
             [siteId]
         );
         if (records.length === 0) {
@@ -537,7 +611,7 @@ exports.submitDay = async (req, res) => {
         }
 
         for (const record of records) {
-            if (record.attendance_status === 'Absent' || record.attendance_status === 'Sick' || record.attendance_status === 'Vacation' || record.attendance_status === 'Holiday') {
+            if (record.attendance_status === 'Absent' || record.attendance_status === 'Sick' || record.attendance_status === 'Annual' || record.attendance_status === 'Vacation' || record.attendance_status === 'Holiday') {
                 await db.execute(
                     "UPDATE attendance SET status = 'Submitted' WHERE attendance_id = ? AND status = 'Draft'",
                     [record.attendance_id]
