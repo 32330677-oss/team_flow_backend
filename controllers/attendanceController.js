@@ -8,39 +8,57 @@ class AppError extends Error {
     }
 }
 
-const SUPERVISOR_ALLOWED_LEAVE_TYPES = ['Rest', 'Lunch'];
+function isValidDateOnly(value) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))) return false;
+    const [year, month, day] = String(value).split('-').map(Number);
+    const date = new Date(Date.UTC(year, month - 1, day));
+    return date.getUTCFullYear() === year &&
+        date.getUTCMonth() === month - 1 &&
+        date.getUTCDate() === day;
+}
 
-// -------------------------------------------------------------------
-// FIXED: Previously this ran the value through `new Date(...).toISOString()`,
-// which re-interprets/re-emits the datetime using the Node server's own
-// timezone. Since the Flutter side now sends a literal wall-clock string
-// with NO timezone marker (e.g. "2026-08-25T11:00:00.000" for 11 AM Syria
-// time as picked by the Supervisor), running it through Date/toISOString
-// could shift the hour depending on the server's timezone setting — this
-// was the root cause of "picked 11, saved as 8" (a 3-hour UTC shift).
-//
-// The fix: extract the date/time components directly via regex, with NO
-// timezone reinterpretation at all. Whatever wall-clock time the
-// Supervisor picked is exactly what gets stored.
-// -------------------------------------------------------------------
-function formatToMySqlDateTime(isoString) {
-    if (!isoString) return null;
-    const match = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?/.exec(String(isoString));
+function requireRecordDate(value) {
+    if (!isValidDateOnly(value)) throw new AppError('A valid record_date (YYYY-MM-DD) is required.');
+    return String(value);
+}
+
+const SUPERVISOR_ALLOWED_LEAVE_TYPES = ['Rest', 'Lunch'];
+function formatToMySqlDateTime(value) {
+    if (!value) return null;
+    const match = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?$/.exec(String(value));
     if (!match) return null;
-    const [, datePart, hh, mm, ss] = match;
-    return `${datePart} ${hh}:${mm}:${ss || '00'}`;
+
+    const [, yearText, monthText, dayText, hourText, minuteText, secondText = '00'] = match;
+    const year = Number(yearText);
+    const month = Number(monthText);
+    const day = Number(dayText);
+    const hour = Number(hourText);
+    const minute = Number(minuteText);
+    const second = Number(secondText);
+
+    if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) return null;
+
+    const date = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+    if (Number.isNaN(date.getTime())) return null;
+    if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 ||
+        date.getUTCDate() !== day || date.getUTCHours() !== hour ||
+        date.getUTCMinutes() !== minute || date.getUTCSeconds() !== second) return null;
+
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${yearText}-${monthText}-${dayText} ${pad(hour)}:${pad(minute)}:${pad(second)}`;
 }
 
 // Fetch the only actionable open Draft shift, including a shift that started yesterday.
-async function getAttendanceId(worker_id, site_id) {
-    const [rows] = await db.execute(
+async function getAttendanceId(worker_id, site_id, recordDate, executor = db, forUpdate = false) {
+    const lock = forUpdate ? ' FOR UPDATE' : '';
+    const [rows] = await executor.execute(
         `SELECT attendance_id FROM attendance
          WHERE worker_id = ? AND site_id = ?
-           AND record_date >= DATE_SUB(CURDATE(), INTERVAL 1 DAY)
+           AND record_date >= DATE_SUB(?, INTERVAL 1 DAY)
            AND check_in_time IS NOT NULL AND check_out_time IS NULL
            AND status = 'Draft'
-         ORDER BY check_in_time DESC, attendance_id DESC LIMIT 1`,
-        [worker_id, site_id]
+         ORDER BY check_in_time DESC, attendance_id DESC LIMIT 1${lock}`,
+        [worker_id, site_id, recordDate]
     );
     return rows.length > 0 ? rows[0].attendance_id : null;
 }
@@ -76,6 +94,7 @@ async function verifySiteAction(req, siteId) {
 exports.getSiteWorkers = async (req, res) => {
     try {
         const { siteId } = req.params;
+        const recordDate = requireRecordDate(req.query.record_date);
         const supervisor_id = req.user.user_id;
 
         if (req.user.role !== 'Admin') {
@@ -86,7 +105,7 @@ exports.getSiteWorkers = async (req, res) => {
         }
 
         const query = `
-            SELECT w.*,
+            SELECT DISTINCT w.*,
                    a.attendance_id,
                    a.status AS workflow_status,
                    a.attendance_status,
@@ -106,10 +125,10 @@ exports.getSiteWorkers = async (req, res) => {
                 FROM attendance a2
                 WHERE a2.worker_id = w.worker_id
                   AND a2.site_id = ?
-                  AND (a2.record_date = CURDATE()
+                  AND (a2.record_date = ?
                        OR (a2.status = 'Draft' AND a2.check_in_time IS NOT NULL AND a2.check_out_time IS NULL
-                           AND a2.record_date >= DATE_SUB(CURDATE(), INTERVAL 1 DAY)))
-                ORDER BY (a2.record_date = CURDATE()) DESC, a2.attendance_id DESC
+                           AND a2.record_date >= DATE_SUB(?, INTERVAL 1 DAY)))
+                ORDER BY (a2.record_date = ?) DESC, a2.attendance_id DESC
                 LIMIT 1
             )
             WHERE wsa.site_id = ?
@@ -117,7 +136,7 @@ exports.getSiteWorkers = async (req, res) => {
             AND w.status = 'Active'
         `;
 
-        const [workers] = await db.execute(query, [siteId, siteId]);
+        const [workers] = await db.execute(query, [siteId, recordDate, recordDate, recordDate, siteId]);
         res.status(200).json({ status: 'success', data: workers });
     } catch (error) {
         console.error("SQL ERROR:", error);
@@ -173,12 +192,16 @@ exports.checkIn = async (req, res) => {
                 const connection = await db.getConnection();
                 try {
                     await connection.beginTransaction();
-                    await connection.execute(
+                    const [revived] = await connection.execute(
                         `UPDATE attendance
                          SET check_in_time = ?, attendance_status = 'Present', remarks = NULL
-                         WHERE attendance_id = ? AND status = 'Draft'`,
+                         WHERE attendance_id = ? AND status = 'Draft'
+                           AND check_in_time IS NULL AND check_out_time IS NULL`,
                         [formattedCheckIn, existing.attendance_id]
                     );
+                    if (revived.affectedRows !== 1) {
+                        throw new AppError('Attendance was changed by another request.');
+                    }
                     await connection.execute(
                         `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
                          VALUES ('attendance', ?, 'CHECK_IN', ?, ?, ?)`,
@@ -230,178 +253,153 @@ exports.checkIn = async (req, res) => {
         }
     } catch (error) {
         console.error("CHECK-IN ERROR:", error);
-        res.status(500).json({ status: 'error', message: 'An error occurred while recording check-in, please try again.' });
+        if (error.code === 'ER_DUP_ENTRY' || error.errno === 1062) {
+            return res.status(409).json({ status: 'error', message: 'Worker already has an attendance record for this date.' });
+        }
+        const status = error.isOperational ? 400 : 500;
+        return res.status(status).json({
+            status: 'error',
+            message: error.isOperational ? error.message : 'An error occurred while recording check-in, please try again.'
+        });
     }
 };
 
 exports.setAttendanceStatus = async (req, res) => {
-    const { worker_id, site_id, attendance_status, remarks } = req.body;
+    const { worker_id, site_id, attendance_status, remarks, record_date } = req.body;
     const normalizedStatus = attendance_status === 'Annual' ? 'Vacation' : attendance_status;
     const allowedStatuses = ['Absent', 'Sick', 'Vacation', 'Holiday'];
     const recordedByUserId = req.user.user_id;
 
-    try {
-        if (!worker_id || !site_id || !attendance_status) {
-            return res.status(400).json({ status: 'error', message: 'Worker, site, and attendance status are required.' });
-        }
-        if (!allowedStatuses.includes(normalizedStatus)) {
-            return res.status(400).json({ status: 'error', message: 'Invalid attendance status.' });
-        }
-        if (!(await verifySiteAction(req, site_id))) {
-            return res.status(403).json({ status: 'error', message: 'You are not authorized to update this site.' });
-        }
-        if (!(await verifyWorkerAssignedToSite(worker_id, site_id))) {
-            return res.status(400).json({ status: 'error', message: 'Worker is not active or is not assigned to this site.' });
-        }
+    if (!worker_id || !site_id || !attendance_status || !isValidDateOnly(record_date)) {
+        return res.status(400).json({ status: 'error', message: 'Worker, site, and attendance status are required.' });
+    }
+    if (!allowedStatuses.includes(normalizedStatus)) {
+        return res.status(400).json({ status: 'error', message: 'Invalid attendance status.' });
+    }
 
-        const [existingRows] = await db.execute(
-            `SELECT attendance_id, status, attendance_status
+    if (!(await verifySiteAction(req, site_id))) {
+        return res.status(403).json({ status: 'error', message: 'You are not authorized to update this site.' });
+    }
+    if (!(await verifyWorkerAssignedToSite(worker_id, site_id))) {
+        return res.status(400).json({ status: 'error', message: 'Worker is not active or is not assigned to this site.' });
+    }
+
+    const connection = await db.getConnection();
+    try {
+        await connection.beginTransaction();
+        const [existingRows] = await connection.execute(
+            `SELECT attendance_id, status, attendance_status, check_in_time, check_out_time
              FROM attendance
-             WHERE worker_id = ? AND site_id = ? AND record_date = CURDATE()
-             ORDER BY attendance_id DESC LIMIT 1`,
-            [worker_id, site_id]
+             WHERE worker_id = ? AND site_id = ? AND record_date = ?
+             ORDER BY attendance_id DESC LIMIT 1 FOR UPDATE`,
+            [worker_id, site_id, record_date]
         );
+        const message = remarks || `${normalizedStatus} - recorded by supervisor`;
 
         if (existingRows.length > 0) {
             const existing = existingRows[0];
-            if (existing.status !== 'Draft') {
-                return res.status(409).json({ status: 'error', message: 'Attendance cannot be changed after it has been submitted.' });
-            }
+            if (existing.status !== 'Draft') throw new AppError('Attendance cannot be changed after it has been submitted.');
+            if (existing.check_in_time || existing.check_out_time) throw new AppError('Cannot change attendance status after clock activity exists.');
 
-            await db.execute(
+            const [updated] = await connection.execute(
                 `UPDATE attendance
                  SET attendance_status = ?, remarks = ?, recorded_by_user_id = ?
-                 WHERE attendance_id = ? AND status = 'Draft'`,
-                [normalizedStatus, remarks || `${normalizedStatus} - recorded by supervisor`, recordedByUserId, existing.attendance_id]
+                 WHERE attendance_id = ? AND status = 'Draft'
+                   AND check_in_time IS NULL AND check_out_time IS NULL`,
+                [normalizedStatus, message, recordedByUserId, existing.attendance_id]
             );
+            if (updated.affectedRows !== 1) throw new AppError('Attendance was changed by another request.');
 
-            await db.execute(
+            await connection.execute(
                 `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
                  VALUES ('attendance', ?, 'STATUS_UPDATED', ?, ?, ?)`,
-                [
-                    existing.attendance_id,
-                    recordedByUserId,
-                    JSON.stringify({ attendance_status: existing.attendance_status }),
-                    JSON.stringify({ attendance_status: normalizedStatus, remarks: remarks || null })
-                ]
+                [existing.attendance_id, recordedByUserId,
+                 JSON.stringify({ attendance_status: existing.attendance_status, remarks: null }),
+                 JSON.stringify({ attendance_status: normalizedStatus, remarks: message })]
             );
-
+            await connection.commit();
             return res.status(200).json({ status: 'success', message: 'Attendance status updated successfully.' });
         }
 
-        const [inserted] = await db.execute(
+        const [inserted] = await connection.execute(
             `INSERT INTO attendance
                 (worker_id, site_id, record_date, attendance_status, status, recorded_by_user_id, remarks)
-             VALUES (?, ?, CURDATE(), ?, 'Draft', ?, ?)`,
-            [worker_id, site_id, normalizedStatus, recordedByUserId, remarks || `${normalizedStatus} - recorded by supervisor`]
+             VALUES (?, ?, ?, ?, 'Draft', ?, ?)`,
+            [worker_id, site_id, record_date, normalizedStatus, recordedByUserId, message]
         );
-
-        await db.execute(
+        await connection.execute(
             `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
              VALUES ('attendance', ?, 'STATUS_CREATED', ?, NULL, ?)`,
-            [inserted.insertId, recordedByUserId, JSON.stringify({ attendance_status: normalizedStatus, remarks: remarks || null })]
+            [inserted.insertId, recordedByUserId, JSON.stringify({ attendance_status: normalizedStatus, remarks: message })]
         );
-
+        await connection.commit();
         return res.status(201).json({ status: 'success', message: 'Attendance status recorded successfully.' });
     } catch (error) {
+        await connection.rollback();
         console.error('SET ATTENDANCE STATUS ERROR:', error);
-        return res.status(500).json({ status: 'error', message: 'An error occurred while saving attendance status.' });
+        if (error.code === 'ER_DUP_ENTRY' || error.errno === 1062) {
+            return res.status(409).json({ status: 'error', message: 'Worker already has an attendance record for this date.' });
+        }
+        const status = error.isOperational ? 400 : 500;
+        return res.status(status).json({ status: 'error', message: error.isOperational ? error.message : 'An error occurred while saving attendance status.' });
+    } finally {
+        connection.release();
     }
 };
 
 exports.checkOut = async (req, res) => {
+    const { worker_id, site_id, check_out_time, record_date } = req.body;
+    const userId = req.user.user_id;
+    if (!worker_id || !site_id || !isValidDateOnly(record_date)) return res.status(400).json({ status: 'error', message: 'Worker, site, and valid record_date are required.' });
+    if (!check_out_time) return res.status(400).json({ status: 'error', message: 'Check-out time is required.' });
+
+    const formattedCheckOut = formatToMySqlDateTime(check_out_time);
+    if (!formattedCheckOut) return res.status(400).json({ status: 'error', message: 'Invalid check-out time format.' });
+    if (!(await verifySiteAction(req, site_id))) return res.status(403).json({ status: 'error', message: 'You are not authorized to perform this action at the specified site.' });
+    if (!(await verifyWorkerAssignedToSite(worker_id, site_id))) return res.status(400).json({ status: 'error', message: 'Worker is not active or is not assigned to this site.' });
+
+    const connection = await db.getConnection();
     try {
-        const { worker_id, site_id, check_out_time } = req.body;
-        const supervisor_id = req.user.user_id;
+        await connection.beginTransaction();
+        const attId = await getAttendanceId(worker_id, site_id, record_date, connection, true);
+        if (!attId) throw new AppError('Attendance record not found.');
 
-        if (!worker_id || !site_id) {
-            return res.status(400).json({ status: 'error', message: 'Worker and site are required.' });
-        }
-        if (!check_out_time) {
-            return res.status(400).json({ status: 'error', message: 'Check-out time is required.' });
-        }
-
-        const formattedCheckOut = formatToMySqlDateTime(check_out_time);
-        if (!formattedCheckOut) {
-            return res.status(400).json({ status: 'error', message: 'Invalid check-out time format.' });
-        }
-
-        if (!(await verifySiteAction(req, site_id))) {
-            return res.status(403).json({ status: 'error', message: 'You are not authorized to perform this action at the specified site.' });
-        }
-        if (!(await verifyWorkerAssignedToSite(worker_id, site_id))) {
-            return res.status(400).json({ status: 'error', message: 'Worker is not active or is not assigned to this site.' });
-        }
-
-        const [rows] = await db.execute(
-            `SELECT attendance_id, check_in_time, attendance_status, status FROM attendance
-             WHERE worker_id = ? AND site_id = ?
-               AND check_in_time IS NOT NULL AND check_out_time IS NULL AND status = 'Draft' 
-             ORDER BY attendance_id DESC LIMIT 1`,
-            [worker_id, site_id]
+        const [[row]] = await connection.execute(
+            'SELECT check_in_time, check_out_time FROM attendance WHERE attendance_id = ? FOR UPDATE', [attId]
         );
-        if (rows.length === 0) {
-            return res.status(404).json({ status: 'error', message: 'Attendance record not found!' });
-        }
-
-        const att_id = rows[0].attendance_id;
-        const existingCheckIn = rows[0].check_in_time;
-
-        const checkInDate = parseAttendanceDate(existingCheckIn);
+        const checkInDate = parseAttendanceDate(row?.check_in_time);
         const checkOutDate = parseAttendanceDate(formattedCheckOut);
-        if (!checkInDate || !checkOutDate || checkOutDate <= checkInDate) {
-            return res.status(400).json({ status: 'error', message: 'Check-out time must be after check-in time.' });
-        }
+        if (!checkInDate || !checkOutDate || checkOutDate <= checkInDate) throw new AppError('Check-out time must be after check-in time.');
 
-        const connection = await db.getConnection();
-        try {
-            await connection.beginTransaction();
+        const [openLeaves] = await connection.execute(
+            'SELECT leave_id FROM attendanceleaveperiods WHERE attendance_id = ? AND leave_end_time IS NULL LIMIT 1 FOR UPDATE', [attId]
+        );
+        if (openLeaves.length > 0) throw new AppError('End the active break before checking out.');
 
-            const [openLeaves] = await connection.execute(
-                `SELECT leave_id FROM attendanceleaveperiods
-                 WHERE attendance_id = ? AND leave_end_time IS NULL
-                 LIMIT 1`,
-                [att_id]
-            );
-            if (openLeaves.length > 0) {
-                throw new AppError('End the active break before checking out.');
-            }
+        const [updated] = await connection.execute(
+            `UPDATE attendance SET check_out_time = ?
+             WHERE attendance_id = ? AND status = 'Draft' AND check_out_time IS NULL`,
+            [formattedCheckOut, attId]
+        );
+        if (updated.affectedRows !== 1) throw new AppError('Attendance was changed by another request.');
 
-            await connection.execute(
-                'UPDATE attendance SET check_out_time = ? WHERE attendance_id = ? AND status = \'Draft\'',
-                [formattedCheckOut, att_id]
-            );
-
-            await connection.execute(
-                `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
-                 VALUES ('attendance', ?, 'CHECK_OUT', ?, ?, ?)`,
-                [
-                    att_id,
-                    supervisor_id,
-                    JSON.stringify({ check_in_time: existingCheckIn }),
-                    JSON.stringify({ check_out_time: formattedCheckOut })
-                ]
-            );
-
-            await connection.commit();
-            res.status(200).json({
-                status: 'success',
-                message: 'Check-out recorded successfully.',
-                data: { attendance_id: att_id, check_out_time: formattedCheckOut }
-            });
-        } catch (error) {
-            await connection.rollback();
-            throw error;
-        } finally {
-            connection.release();
-        }
+        await attendanceService.calculateWorkingHours(attId, connection);
+        await connection.execute(
+            `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+             VALUES ('attendance', ?, 'CHECK_OUT', ?, ?, ?)`,
+            [attId, userId, JSON.stringify({ check_in_time: row.check_in_time, check_out_time: null }), JSON.stringify({ check_out_time: formattedCheckOut })]
+        );
+        await connection.commit();
+        return res.status(200).json({ status: 'success', message: 'Check-out recorded successfully.', data: { attendance_id: attId, check_out_time: formattedCheckOut } });
     } catch (error) {
-        console.error("CHECK-OUT ERROR:", error);
+        await connection.rollback();
+        console.error('CHECK-OUT ERROR:', error);
         const status = error.isOperational ? 400 : 500;
-        res.status(status).json({ status: 'error', message: error.isOperational ? error.message : 'An error occurred during check-out, please try again.' });
+        return res.status(status).json({ status: 'error', message: error.isOperational ? error.message : 'An error occurred during check-out, please try again.' });
+    } finally {
+        connection.release();
     }
 };
-
 
 function normalizeTimeForDate(value, date) {
     if (!value) return null;
@@ -437,30 +435,47 @@ function normalizeTimeForShift(value, shiftStart, shiftEnd) {
 }
 
 function parseAttendanceDate(value) {
-    if (!value) return null;
-    const match = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/.exec(String(value));
-    if (!match) return null;
-    const [, year, month, day, hour, minute, second = '00'] = match;
-    const parsed = new Date(Date.UTC(
-        Number(year), Number(month) - 1, Number(day),
-        Number(hour), Number(minute), Number(second),
-    ));
-    return Number.isNaN(parsed.getTime()) ? null : parsed;
+    const formatted = formatToMySqlDateTime(value);
+    if (!formatted) return null;
+    const [datePart, timePart] = formatted.split(' ');
+    const [year, month, day] = datePart.split('-').map(Number);
+    const [hour, minute, second] = timePart.split(':').map(Number);
+    return new Date(Date.UTC(year, month - 1, day, hour, minute, second));
 }
 
 function timeToMinutes(value) {
     if (!value) return null;
     if (value instanceof Date && !Number.isNaN(value.getTime())) {
-        return value.getHours() * 60 + value.getMinutes();
+        return value.getUTCHours() * 60 + value.getUTCMinutes();
     }
     const text = String(value);
     const match = /(?:^|T| )((?:[01]\d|2[0-3])):([0-5]\d)(?::[0-5]\d)?/.exec(text);
     if (match) return Number(match[1]) * 60 + Number(match[2]);
     const parsed = new Date(value);
     if (!Number.isNaN(parsed.getTime())) {
-        return parsed.getHours() * 60 + parsed.getMinutes();
+        return parsed.getUTCHours() * 60 + parsed.getUTCMinutes();
     }
     return null;
+}
+
+async function hasOverlappingLeave(executor, attendanceId, start, end, excludeLeaveId = null) {
+    const params = [attendanceId, end, start];
+    let exclusion = '';
+    if (excludeLeaveId !== null) {
+        exclusion = ' AND leave_id <> ?';
+        params.push(excludeLeaveId);
+    }
+    const [rows] = await executor.execute(
+        `SELECT leave_id
+         FROM attendanceleaveperiods
+         WHERE attendance_id = ?
+           AND leave_start_time < ?
+           AND COALESCE(leave_end_time, '9999-12-31 23:59:59') > ?${exclusion}
+         LIMIT 1
+         FOR UPDATE`,
+        params
+    );
+    return rows.length > 0;
 }
 
 exports.saveLunchBulk = async (req, res) => {
@@ -539,13 +554,18 @@ exports.saveLunchBulk = async (req, res) => {
                      ORDER BY leave_id DESC LIMIT 1`,
                     [record.attendance_id]
                 );
+                const currentLunchId = existing.length > 0 ? existing[0].leave_id : null;
+                if (await hasOverlappingLeave(connection, record.attendance_id, start, end, currentLunchId)) {
+                    throw new AppError(`Lunch period overlaps another break for worker ${record.worker_id}.`);
+                }
                 if (existing.length > 0) {
-                    await connection.execute(
+                    const [lunchUpdated] = await connection.execute(
                         `UPDATE attendanceleaveperiods
                          SET leave_start_time = ?, leave_end_time = ?
                          WHERE leave_id = ?`,
                         [start, end, existing[0].leave_id]
                     );
+                    if (lunchUpdated.affectedRows !== 1) throw new AppError('Lunch record was changed by another request.');
                     await connection.execute(
                         `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
                          VALUES ('attendanceleaveperiods', ?, 'LUNCH_BULK_UPDATE', ?, ?, ?)`,
@@ -564,6 +584,7 @@ exports.saveLunchBulk = async (req, res) => {
                         [result.insertId, req.user.user_id, JSON.stringify({ attendance_id: record.attendance_id, leave_start_time: start, leave_end_time: end, leave_type: 'Lunch' })]
                     );
                 }
+                await attendanceService.calculateWorkingHours(record.attendance_id, connection);
             }
             await connection.commit();
         } catch (error) {
@@ -573,9 +594,6 @@ exports.saveLunchBulk = async (req, res) => {
             connection.release();
         }
 
-        for (const record of recordsToUpdate) {
-            await attendanceService.calculateWorkingHours(record.attendance_id);
-        }
         return res.status(200).json({ status: 'success', message: 'Lunch times saved successfully.', updated_records: recordsToUpdate.length });
     } catch (error) {
         console.error('SAVE BULK LUNCH ERROR:', error);
@@ -585,89 +603,125 @@ exports.saveLunchBulk = async (req, res) => {
 };
 
 exports.submitDay = async (req, res) => {
-    const { siteId } = req.body;
-    if (!siteId) return res.status(400).json({ status: 'error', message: 'Site is required.' });
+    const { siteId, record_date } = req.body;
+    if (!siteId || !isValidDateOnly(record_date)) return res.status(400).json({ status: 'error', message: 'Site and valid record_date are required.' });
+
+    // 1. فتح اتصال جديد خاص بهذه المعاملة (Transaction Connection)
+    const connection = await db.getConnection();
 
     try {
         if (!(await verifySiteAction(req, siteId))) {
+            connection.release();
             return res.status(403).json({ status: 'error', message: 'You are not authorized to submit this site.' });
         }
 
-        await db.execute(
+        // بدء المعاملة
+        await connection.beginTransaction();
+
+        // 2. الفحوصات أولاً (قبل أي عملية إدخال أو تعديل) لتجنب ترك بيانات تالفة عند الفشل
+        const [openRecords] = await connection.execute(
+            `SELECT attendance_id
+             FROM attendance
+             WHERE site_id = ? AND status = 'Draft'
+               AND (record_date = ?
+                    OR record_date = DATE_SUB(?, INTERVAL 1 DAY))
+               AND check_in_time IS NOT NULL AND check_out_time IS NULL
+             FOR UPDATE`,
+            [siteId, record_date, record_date]
+        );
+        if (openRecords.length > 0) {
+            await connection.rollback();
+            connection.release();
+            return res.status(400).json({ status: 'error', message: 'All checked-in workers must check out before submitting the day.' });
+        }
+
+        const [openLeaves] = await connection.execute(
+            `SELECT a.attendance_id
+             FROM attendance a
+             JOIN attendanceleaveperiods alp ON alp.attendance_id = a.attendance_id
+             WHERE a.site_id = ? AND a.status = 'Draft'
+               AND (a.record_date = ?
+                    OR a.record_date = DATE_SUB(?, INTERVAL 1 DAY))
+               AND alp.leave_end_time IS NULL
+             LIMIT 1 FOR UPDATE`,
+            [siteId, record_date, record_date]
+        );
+        if (openLeaves.length > 0) {
+            await connection.rollback();
+            connection.release();
+            return res.status(400).json({ status: 'error', message: 'All breaks must be ended before submitting the day.' });
+        }
+
+        // 3. بعد نجاح الفحوصات، نقوم بإدخال سجلات الغياب للذين لم يسجلوا حضوراً
+        await connection.execute(
             `INSERT INTO attendance
                 (worker_id, site_id, record_date, attendance_status, status, recorded_by_user_id, remarks)
-             SELECT w.worker_id, wsa.site_id, CURDATE(), 'Absent', 'Draft', ?, 'Absent - no check-in recorded'
+             SELECT w.worker_id, wsa.site_id, ?, 'Absent', 'Draft', ?, 'Absent - no check-in recorded'
              FROM workers w
              JOIN workersiteassignments wsa ON wsa.worker_id = w.worker_id
              LEFT JOIN attendance a
                ON a.worker_id = w.worker_id
               AND a.site_id = wsa.site_id
-              AND a.record_date = CURDATE()
+              AND a.record_date = ?
              WHERE wsa.site_id = ?
                AND wsa.unassigned_date IS NULL
                AND w.status = 'Active'
                AND a.attendance_id IS NULL`,
-            [req.user.user_id, siteId]
+            [record_date, req.user.user_id, record_date, siteId]
         );
 
-        const [openRecords] = await db.execute(
-            `SELECT attendance_id
-             FROM attendance
-             WHERE site_id = ? AND status = 'Draft'
-               AND (record_date = CURDATE()
-                    OR record_date = DATE_SUB(CURDATE(), INTERVAL 1 DAY))
-               AND check_in_time IS NOT NULL AND check_out_time IS NULL`,
-            [siteId]
-        );
-        if (openRecords.length > 0) {
-            return res.status(400).json({ status: 'error', message: 'All checked-in workers must check out before submitting the day.' });
-        }
-
-        const [openLeaves] = await db.execute(
-            `SELECT a.attendance_id
-             FROM attendance a
-             JOIN attendanceleaveperiods alp ON alp.attendance_id = a.attendance_id
-             WHERE a.site_id = ? AND a.status = 'Draft'
-               AND (a.record_date = CURDATE()
-                    OR a.record_date = DATE_SUB(CURDATE(), INTERVAL 1 DAY))
-               AND alp.leave_end_time IS NULL
-             LIMIT 1`,
-            [siteId]
-        );
-        if (openLeaves.length > 0) {
-            return res.status(400).json({ status: 'error', message: 'All breaks must be ended before submitting the day.' });
-        }
-
-        const [records] = await db.execute(
+        // 4. جلب كل السجلات الجاهزة للإرسال
+        const [records] = await connection.execute(
             `SELECT attendance_id, attendance_status
              FROM attendance
              WHERE site_id = ? AND status = 'Draft'
-               AND (record_date = CURDATE()
-                    OR (record_date = DATE_SUB(CURDATE(), INTERVAL 1 DAY)
+               AND (record_date = ?
+                    OR (record_date = DATE_SUB(?, INTERVAL 1 DAY)
                         AND check_in_time IS NOT NULL AND check_out_time IS NOT NULL))
                AND ((check_in_time IS NOT NULL AND check_out_time IS NOT NULL)
                     OR attendance_status IN ('Absent', 'Sick', 'Vacation', 'Holiday'))`,
-            [siteId]
+            [siteId, record_date, record_date]
         );
+        
         if (records.length === 0) {
+            await connection.rollback();
+            connection.release();
             return res.status(400).json({ status: 'error', message: 'No completed attendance records found for today.' });
         }
 
         for (const record of records) {
-            if (record.attendance_status === 'Absent' || record.attendance_status === 'Sick' || record.attendance_status === 'Vacation' || record.attendance_status === 'Holiday') {
-                await db.execute(
-                    "UPDATE attendance SET status = 'Submitted' WHERE attendance_id = ? AND status = 'Draft'",
-                    [record.attendance_id]
-                );
-            } else {
-                await attendanceService.calculateWorkingHours(record.attendance_id);
-                await db.execute("UPDATE attendance SET status = 'Submitted' WHERE attendance_id = ? AND status = 'Draft'", [record.attendance_id]);
+            if (!['Absent', 'Sick', 'Vacation', 'Holiday'].includes(record.attendance_status)) {
+                await attendanceService.calculateWorkingHours(record.attendance_id, connection);
             }
+            const [submitted] = await connection.execute(
+                `UPDATE attendance
+                 SET status = 'Submitted', updated_at = NOW()
+                 WHERE attendance_id = ? AND status = 'Draft'`,
+                [record.attendance_id]
+            );
+            if (submitted.affectedRows !== 1) {
+                throw new AppError(`Attendance ${record.attendance_id} was changed by another request.`);
+            }
+            await connection.execute(
+                `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+                 VALUES ('attendance', ?, 'SUBMITTED', ?, ?, ?)`,
+                [record.attendance_id, req.user.user_id,
+                 JSON.stringify({ status: 'Draft' }),
+                 JSON.stringify({ status: 'Submitted' })]
+            );
         }
-        res.status(200).json({ status: 'success', message: 'Day submitted for review successfully' });
+
+        await connection.commit();
+        connection.release();
+        
+        return res.status(200).json({ status: 'success', message: 'Day submitted for review successfully' });
+
     } catch (error) {
+        await connection.rollback();
+        connection.release();
+        
         console.error('SUBMIT DAY ERROR:', error);
-        res.status(500).json({ status: 'error', message: 'An error occurred while submitting the day, please try again.' });
+        return res.status(500).json({ status: 'error', message: 'An error occurred while submitting the day, please try again.' });
     }
 };
 
@@ -681,7 +735,7 @@ exports.getRejectedRecords = async (req, res) => {
             JOIN workers w ON a.worker_id = w.worker_id
             JOIN sites s ON a.site_id = s.site_id
             WHERE a.status = 'Rejected'
-              ${isAdmin ? '' : 'AND a.recorded_by_user_id = ?'}
+              ${isAdmin ? '' : 'AND s.supervisor_id = ?'}
             ORDER BY s.site_name, a.record_date DESC, w.full_name`;
         const [rows] = await db.execute(query, isAdmin ? [] : [supervisor_id]);
         res.status(200).json({ status: 'success', data: rows });
@@ -693,7 +747,7 @@ exports.getRejectedRecords = async (req, res) => {
 
 exports.startLeave = async (req, res) => {
     try {
-        const { worker_id, site_id, leave_type, leave_start_time } = req.body;
+        const { worker_id, site_id, leave_type, leave_start_time, record_date } = req.body;
         const recorded_by_user_id = req.user.user_id;
 
         if (!worker_id || !site_id) {
@@ -723,7 +777,7 @@ exports.startLeave = async (req, res) => {
             return res.status(400).json({ status: 'error', message: 'Worker is not active or is not assigned to this site.' });
         }
 
-        const att_id = await getAttendanceId(worker_id, site_id);
+        const att_id = await getAttendanceId(worker_id, site_id, record_date);
         if (!att_id) return res.status(404).json({ status: 'error', message: 'No active attendance record found!' });
 
         const [attendanceRows] = await db.execute(
@@ -748,6 +802,14 @@ exports.startLeave = async (req, res) => {
         const connection = await db.getConnection();
         try {
             await connection.beginTransaction();
+            await connection.execute(
+                'SELECT attendance_id FROM attendance WHERE attendance_id = ? FOR UPDATE',
+                [att_id]
+            );
+            const shiftEndForLeave = checkOutDate ? formatUtcDateAsMySql(checkOutDate) : '9999-12-31 23:59:59';
+            if (await hasOverlappingLeave(connection, att_id, formattedStart, shiftEndForLeave, null)) {
+                throw new AppError('Break overlaps an existing break.');
+            }
 
             const [result] = await connection.execute(
                 'INSERT INTO attendanceleaveperiods (attendance_id, leave_start_time, leave_type) VALUES (?, ?, ?)',
@@ -777,7 +839,7 @@ exports.startLeave = async (req, res) => {
 
 exports.endLeave = async (req, res) => {
     try {
-        const { worker_id, site_id, leave_end_time } = req.body;
+        const { worker_id, site_id, leave_end_time, record_date } = req.body;
         const recorded_by_user_id = req.user.user_id;
 
         if (!leave_end_time) {
@@ -789,7 +851,17 @@ exports.endLeave = async (req, res) => {
             return res.status(400).json({ status: 'error', message: 'Invalid break end time format.' });
         }
 
-        const att_id = await getAttendanceId(worker_id, site_id);
+        if (!worker_id || !site_id || !isValidDateOnly(record_date)) {
+            return res.status(400).json({ status: 'error', message: 'Worker, site, and valid record_date are required.' });
+        }
+        if (!(await verifySiteAction(req, site_id))) {
+            return res.status(403).json({ status: 'error', message: 'You are not authorized to manage leave at this site.' });
+        }
+        if (!(await verifyWorkerAssignedToSite(worker_id, site_id))) {
+            return res.status(400).json({ status: 'error', message: 'Worker is not active or is not assigned to this site.' });
+        }
+
+        const att_id = await getAttendanceId(worker_id, site_id, record_date);
         if (!att_id) return res.status(404).json({ status: 'error', message: 'Attendance record not found!' });
 
         const [openLeaves] = await db.execute(
@@ -817,11 +889,15 @@ exports.endLeave = async (req, res) => {
         const connection = await db.getConnection();
         try {
             await connection.beginTransaction();
+            await connection.execute('SELECT leave_id FROM attendanceleaveperiods WHERE leave_id = ? FOR UPDATE', [leave_id]);
 
-            await connection.execute(
-                'UPDATE attendanceleaveperiods SET leave_end_time = ? WHERE leave_id = ?',
+            const [ended] = await connection.execute(
+                `UPDATE attendanceleaveperiods
+                 SET leave_end_time = ?
+                 WHERE leave_id = ? AND leave_end_time IS NULL`,
                 [formattedEnd, leave_id]
             );
+            if (ended.affectedRows !== 1) throw new AppError('Break was changed by another request.');
 
             await connection.execute(
                 `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
@@ -863,20 +939,20 @@ exports.setManagementLeaveHours = async (req, res) => {
     }
 
     const connection = await db.getConnection();
-    let shouldRecalculate = false;
     let oldRecord;
 
     try {
         await connection.beginTransaction();
 
-        const [rows] = await connection.execute('SELECT * FROM attendance WHERE attendance_id = ?', [attendance_id]);
+        const [rows] = await connection.execute('SELECT * FROM attendance WHERE attendance_id = ? FOR UPDATE', [attendance_id]);
         if (rows.length === 0) throw new AppError('Record not found');
         oldRecord = rows[0];
 
-        await connection.execute(
+        const [updated] = await connection.execute(
             'UPDATE attendance SET management_leave_hours = ? WHERE attendance_id = ?',
             [numericHours, attendance_id]
         );
+        if (updated.affectedRows !== 1) throw new AppError('Attendance was changed by another request.');
 
         await connection.execute(
             `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
@@ -884,23 +960,18 @@ exports.setManagementLeaveHours = async (req, res) => {
             [attendance_id, adminId, JSON.stringify(oldRecord), JSON.stringify({ management_leave_hours: numericHours, reason })]
         );
 
+        if (oldRecord.check_out_time) {
+            await attendanceService.calculateWorkingHours(attendance_id, connection);
+        }
         await connection.commit();
-        shouldRecalculate = Boolean(oldRecord.check_out_time);
     } catch (error) {
         await connection.rollback();
         console.error("MANAGEMENT LEAVE ERROR:", error);
+        const status = error.isOperational ? 400 : 500;
         const message = error.isOperational ? error.message : 'An error occurred while recording management leave hours.';
-        return res.status(400).json({ status: 'error', message });
+        return res.status(status).json({ status: 'error', message });
     } finally {
         connection.release();
-    }
-
-    if (shouldRecalculate) {
-        try {
-            await attendanceService.calculateWorkingHours(attendance_id);
-        } catch (calcError) {
-            console.error("Error in background calculation:", calcError);
-        }
     }
 
     res.status(200).json({ status: 'success', message: 'Management leave hours recorded successfully' });
@@ -915,13 +986,24 @@ exports.resubmitAttendance = async (req, res) => {
     try {
         await connection.beginTransaction();
         const [records] = await connection.execute(
-            "SELECT * FROM attendance WHERE attendance_id = ? AND status = 'Rejected' AND recorded_by_user_id = ?",
+            "SELECT * FROM attendance WHERE attendance_id = ? AND status = 'Rejected' AND recorded_by_user_id = ? FOR UPDATE",
             [attendance_id, supervisor_id]
         );
 
         if (records.length === 0) throw new AppError('Record not found or you are not allowed to edit it');
 
         const oldRecord = records[0];
+        if (!(await verifySiteAction(req, oldRecord.site_id))) {
+            throw new AppError('You are not authorized to resubmit attendance for this site.');
+        }
+        if (!(await verifyWorkerAssignedToSite(oldRecord.worker_id, oldRecord.site_id))) {
+            throw new AppError('Worker is not active or is not assigned to this site.');
+        }
+        const [openLeaves] = await connection.execute(
+            'SELECT leave_id FROM attendanceleaveperiods WHERE attendance_id = ? AND leave_end_time IS NULL LIMIT 1 FOR UPDATE',
+            [attendance_id]
+        );
+        if (openLeaves.length > 0) throw new AppError('End the active break before resubmitting attendance.');
 
         const formattedCheckIn = formatToMySqlDateTime(check_in_time);
         const formattedCheckOut = formatToMySqlDateTime(check_out_time);
@@ -935,26 +1017,26 @@ exports.resubmitAttendance = async (req, res) => {
             throw new AppError('Check-out time must be after check-in time');
         }
 
-        await connection.execute(
-            `UPDATE attendance SET check_in_time = ?, check_out_time = ?, remarks = ?, status = 'Submitted', updated_at = NOW() WHERE attendance_id = ?`,
+        const [resubmitted] = await connection.execute(
+            `UPDATE attendance SET check_in_time = ?, check_out_time = ?, attendance_status = 'Present', remarks = ?, status = 'Submitted', updated_at = NOW() WHERE attendance_id = ? AND status = 'Rejected'`,
             [formattedCheckIn, formattedCheckOut, remarks, attendance_id]
         );
+        if (resubmitted.affectedRows !== 1) throw new AppError('Attendance was changed by another request.');
 
         await connection.execute(
             `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values) VALUES (?, ?, ?, ?, ?, ?)`,
             ['attendance', attendance_id, 'RESUBMIT', supervisor_id, JSON.stringify(oldRecord), JSON.stringify({ check_in_time: formattedCheckIn, check_out_time: formattedCheckOut, remarks, status: 'Submitted' })]
         );
 
+        await attendanceService.calculateWorkingHours(attendance_id, connection);
         await connection.commit();
-        await attendanceService.calculateWorkingHours(attendance_id);
         res.status(200).json({ status: 'success', message: 'Resubmitted successfully' });
     } catch (error) {
         await connection.rollback();
         console.error("RESUBMIT ERROR:", error);
-        const message = error.isOperational
-            ? error.message
-            : 'An error occurred while resubmitting, please try again.';
-        res.status(400).json({ status: 'error', message });
+        const status = error.isOperational ? 400 : 500;
+        const message = error.isOperational ? error.message : 'An error occurred while resubmitting, please try again.';
+        res.status(status).json({ status: 'error', message });
     } finally {
         connection.release();
     }
