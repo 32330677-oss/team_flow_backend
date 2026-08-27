@@ -18,6 +18,10 @@ router.get('/rejected', restrictTo('Admin', 'Supervisor'), attendanceController.
 router.patch('/:attendance_id/management-leave', restrictTo('Admin'), attendanceController.setManagementLeaveHours);
 router.patch('/:attendance_id/resubmit', restrictTo('Supervisor'), attendanceController.resubmitAttendance);
 router.post('/bulk/checkin', attendanceController.bulkCheckIn);
+router.post(
+  '/bulk/checkout',
+  attendanceController.bulkCheckOut
+);
 
 
 module.exports = router;
