@@ -42,7 +42,10 @@ exports.reviewRecord = async (req, res) => {
 
     try {
         // SAFE PRE-VALIDATION CHECK: Verify the admin exists in the users table to prevent FK crashes
-        const [userExists] = await db.query('SELECT user_id FROM users WHERE user_id = ? AND role = "Admin"', [adminId]);
+        const [userExists] = await db.query(
+            'SELECT user_id FROM users WHERE user_id = ? AND role = ?',
+            [adminId, 'Admin']
+        );
         if (userExists.length === 0) {
             return res.status(403).json({ status: 'error', message: 'Unauthorized: Invalid admin account or insufficient permissions' });
         }
