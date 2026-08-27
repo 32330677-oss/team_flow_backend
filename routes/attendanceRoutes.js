@@ -17,5 +17,7 @@ router.post('/lunch/bulk', attendanceController.saveLunchBulk);
 router.get('/rejected', restrictTo('Admin', 'Supervisor'), attendanceController.getRejectedRecords);
 router.patch('/:attendance_id/management-leave', restrictTo('Admin'), attendanceController.setManagementLeaveHours);
 router.patch('/:attendance_id/resubmit', restrictTo('Supervisor'), attendanceController.resubmitAttendance);
+router.post('/bulk/checkin', attendanceController.bulkCheckIn);
+
 
 module.exports = router;

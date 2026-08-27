@@ -264,6 +264,152 @@ exports.checkIn = async (req, res) => {
     }
 };
 
+
+function normalizeWorkerIds(value) {
+    if (!Array.isArray(value) || value.length === 0 || value.length > 500) return null;
+    const ids = [...new Set(value.map(Number))];
+    if (ids.some((id) => !Number.isInteger(id) || id <= 0)) return null;
+    return ids;
+}
+
+async function verifyBulkWorkers(workerIds, siteId, executor) {
+    const valid = new Set();
+    for (const workerId of workerIds) {
+        const [rows] = await executor.execute(
+            `SELECT 1 FROM workersiteassignments wsa
+             JOIN workers w ON w.worker_id = wsa.worker_id
+             WHERE wsa.worker_id = ? AND wsa.site_id = ?
+               AND wsa.unassigned_date IS NULL AND w.status = 'Active'
+             LIMIT 1`,
+            [workerId, siteId]
+        );
+        if (rows.length > 0) valid.add(workerId);
+    }
+    return valid;
+}
+
+async function runBulkAttendance(req, res, mode) {
+    const { site_id, record_date, worker_ids } = req.body;
+    const workerIds = normalizeWorkerIds(worker_ids);
+    const timeField = mode === 'checkin' ? 'check_in_time' : 'check_out_time';
+    const rawTime = req.body[timeField];
+
+    if (!site_id || !isValidDateOnly(record_date) || !workerIds || !rawTime) {
+        return res.status(400).json({
+            status: 'error',
+            message: `site_id, record_date, worker_ids, and ${timeField} are required.`
+        });
+    }
+
+    const formattedTime = formatToMySqlDateTime(rawTime);
+    if (!formattedTime) return res.status(400).json({ status: 'error', message: `Invalid ${timeField} format.` });
+    if (!(await verifySiteAction(req, site_id))) {
+        return res.status(403).json({ status: 'error', message: 'You are not authorized to manage this site.' });
+    }
+
+    const connection = await db.getConnection();
+    const successful = [];
+    const failed = [];
+    try {
+        await connection.beginTransaction();
+        const validWorkers = await verifyBulkWorkers(workerIds, site_id, connection);
+        for (const workerId of workerIds) {
+            if (!validWorkers.has(workerId)) {
+                failed.push({ worker_id: workerId, message: 'Worker is not active or is not assigned to this site.' });
+                continue;
+            }
+
+            try {
+                if (mode === 'checkin') {
+                    const [rows] = await connection.execute(
+                        `SELECT attendance_id, attendance_status, check_in_time, check_out_time, status
+                         FROM attendance
+                         WHERE worker_id = ? AND site_id = ? AND record_date = ?
+                         ORDER BY attendance_id DESC LIMIT 1 FOR UPDATE`,
+                        [workerId, site_id, record_date]
+                    );
+                    if (rows.length > 0) {
+                        const existing = rows[0];
+                        if (existing.status !== 'Draft') throw new AppError('Attendance is already finalized.');
+                        if (existing.check_in_time || existing.check_out_time) throw new AppError('Worker is already checked in or checked out.');
+                        if (!['Absent', 'Sick', 'Vacation', 'Holiday'].includes(existing.attendance_status)) throw new AppError('Worker already has an attendance record.');
+                        const [updated] = await connection.execute(
+                            `UPDATE attendance
+                             SET check_in_time = ?, attendance_status = 'Present', remarks = NULL
+                             WHERE attendance_id = ? AND status = 'Draft'
+                               AND check_in_time IS NULL AND check_out_time IS NULL`,
+                            [formattedTime, existing.attendance_id]
+                        );
+                        if (updated.affectedRows !== 1) throw new AppError('Attendance changed by another request.');
+                        await connection.execute(
+                            `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+                             VALUES ('attendance', ?, 'CHECK_IN', ?, ?, ?)`,
+                            [existing.attendance_id, req.user.user_id, JSON.stringify({ attendance_status: existing.attendance_status }), JSON.stringify({ check_in_time: formattedTime, attendance_status: 'Present', source: 'bulk' })]
+                        );
+                        successful.push(workerId);
+                    } else {
+                        const [inserted] = await connection.execute(
+                            `INSERT INTO attendance (worker_id, site_id, record_date, check_in_time, attendance_status, status, recorded_by_user_id)
+                             VALUES (?, ?, ?, ?, 'Present', 'Draft', ?)`,
+                            [workerId, site_id, record_date, formattedTime, req.user.user_id]
+                        );
+                        await connection.execute(
+                            `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+                             VALUES ('attendance', ?, 'CHECK_IN', ?, NULL, ?)`,
+                            [inserted.insertId, req.user.user_id, JSON.stringify({ check_in_time: formattedTime, source: 'bulk' })]
+                        );
+                        successful.push(workerId);
+                    }
+                } else {
+                    const attendanceId = await getAttendanceId(workerId, site_id, record_date, connection, true);
+                    if (!attendanceId) throw new AppError('No open check-in found for this worker.');
+                    const [[attendance]] = await connection.execute(
+                        `SELECT check_in_time, check_out_time FROM attendance WHERE attendance_id = ? FOR UPDATE`,
+                        [attendanceId]
+                    );
+                    if (!attendance || attendance.check_out_time) throw new AppError('Worker is already checked out.');
+                    const [[openLeave]] = await connection.execute(
+                        `SELECT leave_id FROM attendanceleaveperiods WHERE attendance_id = ? AND leave_end_time IS NULL LIMIT 1 FOR UPDATE`,
+                        [attendanceId]
+                    );
+                    if (openLeave) throw new AppError('Worker has an open break.');
+                    const [updated] = await connection.execute(
+                        `UPDATE attendance SET check_out_time = ?, attendance_status = 'Present'
+                         WHERE attendance_id = ? AND status = 'Draft' AND check_out_time IS NULL`,
+                        [formattedTime, attendanceId]
+                    );
+                    if (updated.affectedRows !== 1) throw new AppError('Attendance changed by another request.');
+                    await attendanceService.calculateWorkingHours(attendanceId, connection);
+                    await connection.execute(
+                        `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+                         VALUES ('attendance', ?, 'CHECK_OUT', ?, ?, ?)`,
+                        [attendanceId, req.user.user_id, JSON.stringify({ check_out_time: null }), JSON.stringify({ check_out_time: formattedTime, source: 'bulk' })]
+                    );
+                    successful.push(workerId);
+                }
+            } catch (error) {
+                if (error.code === 'ER_DUP_ENTRY' || error.errno === 1062) {
+                    failed.push({ worker_id: workerId, message: 'Attendance already exists for this date.' });
+                } else {
+                    failed.push({ worker_id: workerId, message: error.isOperational ? error.message : 'Bulk operation failed.' });
+                }
+            }
+        }
+        await connection.commit();
+        const status = successful.length === workerIds.length ? 'success' : successful.length > 0 ? 'partial_success' : 'error';
+        return res.status(status === 'error' ? 409 : 200).json({ status, successful, failed });
+    } catch (error) {
+        try { await connection.rollback(); } catch (_) {}
+        console.error(`BULK ${mode.toUpperCase()} ERROR:`, error);
+        return res.status(error.isOperational ? 400 : 500).json({ status: 'error', message: error.isOperational ? error.message : `Bulk ${mode} failed.` });
+    } finally {
+        connection.release();
+    }
+}
+
+exports.bulkCheckIn = (req, res) => runBulkAttendance(req, res, 'checkin');
+exports.bulkCheckOut = (req, res) => runBulkAttendance(req, res, 'checkout');
+
 exports.setAttendanceStatus = async (req, res) => {
     const { worker_id, site_id, attendance_status, remarks, record_date } = req.body;
     const normalizedStatus = attendance_status === 'Annual' ? 'Vacation' : attendance_status;
