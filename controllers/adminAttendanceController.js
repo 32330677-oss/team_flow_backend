@@ -127,7 +127,10 @@ exports.getBreakSettings = async (req, res) => {
             `SELECT setting_key, setting_value FROM system_settings
              WHERE setting_key IN ('is_lunch_paid','standard_work_minutes')`
         );
-        const data = {};
+        const data = {
+            is_lunch_paid: 'false',
+            standard_work_minutes: '600',
+        };
         rows.forEach(r => data[r.setting_key] = r.setting_value);
         res.status(200).json({ status: 'success', data });
     } catch (error) {
