@@ -169,6 +169,11 @@ exports.checkIn = async (req, res) => {
         }
 
         const recordDate = formattedCheckIn.slice(0, 10);
+        // قبل إنشاء سجل جديد، تحقق أولاً من عدم وجود أي شيفت مفتوح للعامل (بصرف النظر عن الموقع أو التاريخ الدقيق)
+const openShift = await getAttendanceId(worker_id, site_id, recordDate); // نفس الدالة المستخدمة في checkOut
+if (openShift) {
+    return res.status(409).json({ status: 'error', message: 'There is a previous open shift that hasnt been closed yet. Close it first before logging in again.' });
+}
         const [existingToday] = await db.execute(
             `SELECT attendance_id, attendance_status, check_in_time, check_out_time, status
              FROM attendance

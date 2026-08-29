@@ -25,13 +25,18 @@ function parseWallClockDateTime(value) {
 
 exports.calculateWorkingHours = async (attendance_id, executor = db) => {
     const [rows] = await executor.execute(
-        `SELECT check_in_time, check_out_time, record_date, management_leave_hours
-         FROM attendance WHERE attendance_id = ?`,
+        `SELECT check_in_time,
+                check_out_time,
+                record_date,
+                management_leave_hours,
+                standard_minutes_snapshot
+         FROM attendance
+         WHERE attendance_id = ?`,
         [attendance_id]
     );
     if (rows.length === 0) throw new Error('Attendance record not found.');
 
-    const { check_in_time, check_out_time, record_date, management_leave_hours } = rows[0];
+    const { check_in_time, check_out_time, record_date, management_leave_hours, standard_minutes_snapshot } = rows[0];
     const start = parseWallClockDateTime(check_in_time);
     const end = parseWallClockDateTime(check_out_time);
     if (!start || !end) throw new Error('Cannot calculate hours without valid check-in and check-out times.');
@@ -59,8 +64,26 @@ exports.calculateWorkingHours = async (attendance_id, executor = db) => {
     if (!Number.isFinite(managementHours) || managementHours < 0) throw new Error('Invalid management leave hours.');
     totalMinutes = Math.max(0, totalMinutes + managementHours * 60);
 
-    const configuredStandardMinutes = Number(await settingsCache.getSetting('standard_work_minutes', '600'));
-    const standardMinutes = Number.isFinite(configuredStandardMinutes) && configuredStandardMinutes > 0 ? configuredStandardMinutes : 600;
+    // تحديد الـ standardMinutes باستخدام الـ Snapshot أو جلبها وحفظها إن لم تكن موجودة
+    let standardMinutes;
+    if (standard_minutes_snapshot !== null) {
+        standardMinutes = Number(standard_minutes_snapshot);
+    } else {
+        const configuredStandardMinutes = Number(await settingsCache.getSetting('standard_work_minutes', '600'));
+
+        standardMinutes = Number.isFinite(configuredStandardMinutes) && configuredStandardMinutes > 0
+            ? configuredStandardMinutes
+            : 600;
+
+        await executor.execute(
+            `UPDATE attendance
+             SET standard_minutes_snapshot = ?
+             WHERE attendance_id = ?
+               AND standard_minutes_snapshot IS NULL`,
+            [standardMinutes, attendance_id]
+        );
+    }
+
     const regularHours = Math.min(999.99, Math.min(totalMinutes, standardMinutes) / 60);
     const overtimeHours = Math.min(99.99, Math.max(0, totalMinutes - standardMinutes) / 60);
 
