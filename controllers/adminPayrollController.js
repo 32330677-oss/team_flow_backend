@@ -13,6 +13,7 @@ function money(value) {
   return Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 }
 
+// Replace generatePayrollBatch entirely
 async function generatePayrollBatch(req, res) {
   const { start_date, end_date, site_id } = req.body || {};
   const userId = req.user?.user_id;
@@ -30,32 +31,91 @@ async function generatePayrollBatch(req, res) {
     await connection.beginTransaction();
     const scopedSite = isSpecificSite(site_id);
 
-    const [overlap] = await connection.execute(
-      `SELECT payroll_batch_id FROM payrollbatches
-       WHERE start_date <= ? AND end_date >= ?
-       LIMIT 1 FOR UPDATE`,
-      [end_date, start_date]
-    );
+    // FIX #3: overlap is scoped to the sites this batch would actually pay,
+    // instead of blocking on ANY batch regardless of site.
+    const overlapParams = [end_date, start_date];
+    let overlapSql = `
+      SELECT DISTINCT pb.payroll_batch_id
+      FROM payrollbatches pb
+      JOIN payroll p ON p.payroll_batch_id = pb.payroll_batch_id
+      JOIN payrollitems pi ON pi.payroll_id = p.payroll_id
+      WHERE pb.start_date <= ? AND pb.end_date >= ?`;
+    if (scopedSite) {
+      overlapSql += ' AND pi.site_id = ?';
+      overlapParams.push(site_id);
+    }
+    overlapSql += ' LIMIT 1 FOR UPDATE';
+    const [overlap] = await connection.execute(overlapSql, overlapParams);
     if (overlap.length) {
       await connection.rollback();
-      return res.status(409).json({ success: false, message: 'An overlapping payroll batch already exists.' });
+      return res.status(409).json({ success: false, message: 'An overlapping payroll batch already exists for this scope.' });
     }
 
-    const siteFilter = scopedSite ? ' AND wsa.site_id = ?' : '';
-    const workerParams = scopedSite ? [end_date, start_date, site_id] : [end_date, start_date];
-    const [workers] = await connection.execute(
-      `SELECT DISTINCT w.worker_id, w.full_name
-       FROM workers w
-       JOIN workersiteassignments wsa ON wsa.worker_id = w.worker_id
-         AND wsa.assigned_date <= ?
-         AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date >= ?)
-       WHERE w.status = 'Active'${siteFilter}
-       ORDER BY w.full_name`,
-      workerParams
-    );
-    if (!workers.length) {
+    // FIX #4: attribute every attendance record to the assignment/contract
+    // that was actually active on that record's date, not the worker's
+    // *current* assignment applied blindly across the whole period.
+    const earningsParams = [start_date, end_date];
+    let earningsSql = `
+      SELECT a.worker_id, w.full_name AS worker_name,
+             wsa.site_id, wsa.contract_id,
+             c.hourly_rate, c.overtime_hourly_rate,
+             COALESCE(SUM(a.total_working_hours), 0) AS regular_hours,
+             COALESCE(SUM(a.overtime_hours), 0) AS overtime_hours
+      FROM attendance a
+      JOIN workers w ON w.worker_id = a.worker_id AND w.status = 'Active'
+      JOIN workersiteassignments wsa
+        ON wsa.worker_id = a.worker_id
+       AND wsa.site_id = a.site_id
+       AND wsa.assigned_date <= a.record_date
+       AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date >= a.record_date)
+      JOIN contracts c ON c.contract_id = wsa.contract_id
+      WHERE a.record_date BETWEEN ? AND ?
+        AND a.status = 'Approved'`;
+    if (scopedSite) {
+      earningsSql += ' AND a.site_id = ?';
+      earningsParams.push(site_id);
+    }
+    earningsSql += `
+      GROUP BY a.worker_id, w.full_name, wsa.site_id, wsa.contract_id, c.hourly_rate, c.overtime_hourly_rate
+      ORDER BY w.full_name`;
+
+    const [earningRows] = await connection.execute(earningsSql, earningsParams);
+
+    const byWorker = new Map();
+    for (const row of earningRows) {
+      const regularHours = Math.max(0, Number(row.regular_hours || 0));
+      const overtimeHours = Math.max(0, Number(row.overtime_hours || 0));
+      if (regularHours === 0 && overtimeHours === 0) continue;
+
+      const hourlyRate = Number(row.hourly_rate);
+      const overtimeRate = Number(row.overtime_hourly_rate);
+      if (!Number.isFinite(hourlyRate) || hourlyRate < 0 || !Number.isFinite(overtimeRate) || overtimeRate < 0) {
+        throw new Error(`Invalid rates for contract ${row.contract_id}`);
+      }
+
+      const baseSalary = money(regularHours * hourlyRate);
+      const overtimePay = money(overtimeHours * overtimeRate);
+
+      if (!byWorker.has(row.worker_id)) {
+        byWorker.set(row.worker_id, { worker_id: row.worker_id, breakdown: [], gross: 0 });
+      }
+      const worker = byWorker.get(row.worker_id);
+      worker.breakdown.push({
+        siteId: row.site_id,
+        contractId: row.contract_id,
+        regularHours,
+        overtimeHours,
+        hourlyRate,
+        overtimeRate,
+        baseSalary,
+        overtimePay,
+      });
+      worker.gross = money(worker.gross + baseSalary + overtimePay);
+    }
+
+    if (!byWorker.size) {
       await connection.rollback();
-      return res.status(404).json({ success: false, message: 'No active assigned workers found.' });
+      return res.status(404).json({ success: false, message: 'No Approved attendance found for this period.' });
     }
 
     const [batchResult] = await connection.execute(
@@ -67,70 +127,18 @@ async function generatePayrollBatch(req, res) {
     let totalWorkers = 0;
     let totalAmount = 0;
 
-    for (const worker of workers) {
-      const assignmentParams = [worker.worker_id, end_date, start_date];
-      let assignmentSql = `
-        SELECT wsa.site_id, wsa.contract_id, c.hourly_rate, c.overtime_hourly_rate
-        FROM workersiteassignments wsa
-        JOIN contracts c ON c.contract_id = wsa.contract_id
-        WHERE wsa.worker_id = ?
-          AND wsa.assigned_date <= ?
-          AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date >= ?)`;
-      if (scopedSite) {
-        assignmentSql += ' AND wsa.site_id = ?';
-        assignmentParams.push(site_id);
-      }
-      const [assignments] = await connection.execute(assignmentSql, assignmentParams);
-      if (!assignments.length) continue;
-
-      const ratesBySite = new Map(assignments.map((row) => [Number(row.site_id), row]));
-      const attendanceParams = [worker.worker_id, start_date, end_date];
-      let attendanceSql = `
-        SELECT site_id,
-               COALESCE(SUM(total_working_hours), 0) AS regular_hours,
-               COALESCE(SUM(overtime_hours), 0) AS overtime_hours
-        FROM attendance
-        WHERE worker_id = ? AND record_date BETWEEN ? AND ? AND status = 'Approved'`;
-      if (scopedSite) {
-        attendanceSql += ' AND site_id = ?';
-        attendanceParams.push(site_id);
-      }
-      attendanceSql += ' GROUP BY site_id';
-      const [logs] = await connection.execute(attendanceSql, attendanceParams);
-      if (!logs.length) continue;
-
-      const breakdown = [];
-      let workerGross = 0;
-      for (const log of logs) {
-        const siteId = Number(log.site_id);
-        const rates = ratesBySite.get(siteId);
-        if (!rates) continue;
-        const regularHours = Math.max(0, Number(log.regular_hours || 0));
-        const overtimeHours = Math.max(0, Number(log.overtime_hours || 0));
-        const hourlyRate = Number(rates.hourly_rate);
-        const overtimeRate = Number(rates.overtime_hourly_rate);
-        if (!Number.isFinite(hourlyRate) || hourlyRate < 0 || !Number.isFinite(overtimeRate) || overtimeRate < 0) {
-          throw new Error(`Invalid rates for contract ${rates.contract_id}`);
-        }
-        const baseSalary = money(regularHours * hourlyRate);
-        const overtimePay = money(overtimeHours * overtimeRate);
-        if (regularHours === 0 && overtimeHours === 0) continue;
-        breakdown.push({ siteId, contractId: rates.contract_id, regularHours, overtimeHours, hourlyRate, overtimeRate, baseSalary, overtimePay });
-        workerGross = money(workerGross + baseSalary + overtimePay);
-      }
-      if (!breakdown.length) continue;
-
+    for (const worker of byWorker.values()) {
       const [payrollResult] = await connection.execute(
         `INSERT INTO payroll
           (payroll_batch_id, worker_id, start_date, end_date,
            bonus_amount, penalty_amount, deductions_amount,
            gross_salary, net_salary, status, generated_by_user_id)
          VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?, 'Generated', ?)`,
-        [batchId, worker.worker_id, start_date, end_date, workerGross, workerGross, userId]
+        [batchId, worker.worker_id, start_date, end_date, worker.gross, worker.gross, userId]
       );
       const payrollId = payrollResult.insertId;
 
-      for (const item of breakdown) {
+      for (const item of worker.breakdown) {
         await connection.execute(
           `INSERT INTO payrollitems
             (payroll_id, contract_id, site_id, hourly_rate_snapshot,
@@ -142,12 +150,7 @@ async function generatePayrollBatch(req, res) {
         );
       }
       totalWorkers += 1;
-      totalAmount = money(totalAmount + workerGross);
-    }
-
-    if (!totalWorkers) {
-      await connection.rollback();
-      return res.status(400).json({ success: false, message: 'No Approved attendance found for this period.' });
+      totalAmount = money(totalAmount + worker.gross);
     }
 
     await connection.execute(
@@ -165,20 +168,37 @@ async function generatePayrollBatch(req, res) {
   }
 }
 
+// Replace getPayrollReport (FIX #5)
 async function getPayrollReport(req, res) {
   try {
     const { site_id } = req.query;
+    const scoped = isSpecificSite(site_id);
     const params = [];
-    let sql = `SELECT DISTINCT pb.payroll_batch_id, pb.start_date, pb.end_date,
-      pb.total_workers, pb.total_amount, pb.status, pb.generated_at,
-      u.full_name AS generated_by
-      FROM payrollbatches pb JOIN users u ON u.user_id = pb.generated_by_user_id`;
-    if (isSpecificSite(site_id)) {
-      sql += ` JOIN payroll p ON p.payroll_batch_id = pb.payroll_batch_id
-               JOIN payrollitems pi ON pi.payroll_id = p.payroll_id AND pi.site_id = ?`;
+    let sql;
+
+    if (scoped) {
+      sql = `
+        SELECT pb.payroll_batch_id, pb.start_date, pb.end_date, pb.status, pb.generated_at,
+               u.full_name AS generated_by,
+               COUNT(DISTINCT p.worker_id) AS total_workers,
+               COALESCE(SUM(pi.base_salary + pi.overtime_pay), 0) AS total_amount
+        FROM payrollbatches pb
+        JOIN users u ON u.user_id = pb.generated_by_user_id
+        JOIN payroll p ON p.payroll_batch_id = pb.payroll_batch_id
+        JOIN payrollitems pi ON pi.payroll_id = p.payroll_id AND pi.site_id = ?
+        GROUP BY pb.payroll_batch_id, pb.start_date, pb.end_date, pb.status, pb.generated_at, u.full_name
+        ORDER BY pb.generated_at DESC`;
       params.push(site_id);
+    } else {
+      sql = `
+        SELECT pb.payroll_batch_id, pb.start_date, pb.end_date,
+               pb.total_workers, pb.total_amount, pb.status, pb.generated_at,
+               u.full_name AS generated_by
+        FROM payrollbatches pb
+        JOIN users u ON u.user_id = pb.generated_by_user_id
+        ORDER BY pb.generated_at DESC`;
     }
-    sql += ' ORDER BY pb.generated_at DESC';
+
     const [rows] = await pool.execute(sql, params);
     return res.json({ success: true, data: rows });
   } catch (error) {
@@ -187,26 +207,50 @@ async function getPayrollReport(req, res) {
   }
 }
 
+// Replace getPayrollBatchDetails (FIX #1 for the preview screen)
 async function getPayrollBatchDetails(req, res) {
   const batchId = Number(req.params.batchId);
   if (!Number.isInteger(batchId) || batchId <= 0) return res.status(400).json({ success: false, message: 'Invalid batch id.' });
   try {
     const [batches] = await pool.execute('SELECT * FROM payrollbatches WHERE payroll_batch_id = ?', [batchId]);
     if (!batches.length) return res.status(404).json({ success: false, message: 'Batch not found.' });
-    const [items] = await pool.execute(
+
+    // One row per worker — no fan-out from payrollitems.
+    const [payrolls] = await pool.execute(
       `SELECT p.payroll_id, p.gross_salary, p.net_salary,
               p.bonus_amount, p.penalty_amount, p.deductions_amount,
-              w.worker_id, w.full_name AS worker_name,
-              pi.site_id, s.site_name, pi.regular_hours_worked,
-              pi.overtime_hours_worked, pi.hourly_rate_snapshot,
-              pi.overtime_hourly_rate_snapshot, pi.base_salary, pi.overtime_pay
-       FROM payroll p JOIN workers w ON w.worker_id = p.worker_id
-       JOIN payrollitems pi ON pi.payroll_id = p.payroll_id
-       LEFT JOIN sites s ON s.site_id = pi.site_id
-       WHERE p.payroll_batch_id = ? ORDER BY w.full_name, pi.site_id`,
+              w.worker_id, w.full_name AS worker_name
+       FROM payroll p
+       JOIN workers w ON w.worker_id = p.worker_id
+       WHERE p.payroll_batch_id = ?
+       ORDER BY w.full_name`,
       [batchId]
     );
-    return res.json({ success: true, batch: batches[0], workers: items });
+
+    // Per-site breakdown, attached under each worker instead of duplicating
+    // worker-level totals across rows.
+    const [items] = await pool.execute(
+      `SELECT pi.payroll_id, pi.site_id, s.site_name,
+              pi.regular_hours_worked, pi.overtime_hours_worked,
+              pi.hourly_rate_snapshot, pi.overtime_hourly_rate_snapshot,
+              pi.base_salary, pi.overtime_pay
+       FROM payroll p
+       JOIN payrollitems pi ON pi.payroll_id = p.payroll_id
+       LEFT JOIN sites s ON s.site_id = pi.site_id
+       WHERE p.payroll_batch_id = ?
+       ORDER BY s.site_name`,
+      [batchId]
+    );
+
+    const itemsByPayroll = new Map();
+    for (const item of items) {
+      if (!itemsByPayroll.has(item.payroll_id)) itemsByPayroll.set(item.payroll_id, []);
+      itemsByPayroll.get(item.payroll_id).push(item);
+    }
+
+    const workers = payrolls.map((p) => ({ ...p, sites: itemsByPayroll.get(p.payroll_id) || [] }));
+
+    return res.json({ success: true, batch: batches[0], workers });
   } catch (error) {
     console.error('getPayrollBatchDetails:', error);
     return res.status(500).json({ success: false, message: 'Failed to load batch details.' });
@@ -241,10 +285,21 @@ async function markBatchAsPaid(req, res) {
   }
 }
 
+// Replace getLastBatchEndDate (FIX #3)
 async function getLastBatchEndDate(req, res) {
   try {
-    const [rows] = await pool.execute('SELECT end_date FROM payrollbatches ORDER BY end_date DESC LIMIT 1');
-    return res.json({ success: true, last_end_date: rows[0]?.end_date || null });
+    const { site_id } = req.query || {};
+    const params = [];
+    let sql = `SELECT MAX(pb.end_date) AS last_end_date FROM payrollbatches pb`;
+    if (isSpecificSite(site_id)) {
+      sql += `
+        JOIN payroll p ON p.payroll_batch_id = pb.payroll_batch_id
+        JOIN payrollitems pi ON pi.payroll_id = p.payroll_id
+        WHERE pi.site_id = ?`;
+      params.push(site_id);
+    }
+    const [rows] = await pool.execute(sql, params);
+    return res.json({ success: true, last_end_date: rows[0]?.last_end_date || null });
   } catch (error) {
     return res.status(500).json({ success: false, message: 'Failed to load the last batch date.' });
   }
