@@ -1,5 +1,7 @@
 const fs = require('fs');
 const path = require('path');
+const companyName = 'ASIK ENGINEERING CONSTRUCTION';
+const companyInfo = 'Damascus International Airport Project'; 
 const {
   Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType,
   Table, TableRow, TableCell, WidthType, BorderStyle,
@@ -101,30 +103,33 @@ async function generateTransferRequestDocx(data) {
   }
 
   const doc = new Document({
-    sections: [
-      {
-        children: [
-          new Paragraph({ text: companyName || '[COMPANY NAME]', heading: HeadingLevel.HEADING_2 }),
-          ...(companyInfo ? [new Paragraph({ text: companyInfo })] : []),
-          new Paragraph({ text: `Date: ${requestDate}`, spacing: { after: 300 } }),
-          new Paragraph({
-            alignment: AlignmentType.CENTER,
-            heading: HeadingLevel.HEADING_1,
-            spacing: { after: 300 },
-            children: [new TextRun({ text: 'WORKER TRANSFER REQUEST', bold: true })],
-          }),
-          new Table({
-            width: { size: 100, type: WidthType.PERCENTAGE },
-            rows: infoRows,
-          }),
-          ...bodyParagraphs,
-          new Paragraph({ text: `Request ID: #${requestId}`, spacing: { before: 200, after: 400 } }),
-          ...signatureBlock('Requested By:', requesterName, requesterPosition),
-          ...signatureBlock('Management Approval:'),
-        ],
-      },
-    ],
-  });
+  sections: [
+    {
+      children: [
+        new Paragraph({ 
+          text: companyName, // سيظهر هنا: ASIK ENGINEERING CONSTRUCTION
+          heading: HeadingLevel.HEADING_2 
+        }),
+        ...(companyInfo ? [new Paragraph({ text: companyInfo })] : []),
+        new Paragraph({ text: `Date: ${requestDate}`, spacing: { after: 300 } }),
+        new Paragraph({
+          alignment: AlignmentType.CENTER,
+          heading: HeadingLevel.HEADING_1,
+          spacing: { after: 300 },
+          children: [new TextRun({ text: 'WORKER TRANSFER REQUEST', bold: true })],
+        }),
+        new Table({
+          width: { size: 100, type: WidthType.PERCENTAGE },
+          rows: infoRows,
+        }),
+        ...bodyParagraphs,
+        new Paragraph({ text: `Request ID: #${requestId}`, spacing: { before: 200, after: 400 } }),
+        ...signatureBlock('Requested By:', requesterName, requesterPosition),
+        ...signatureBlock('Management Approval:'),
+      ],
+    },
+  ],
+});
 
   if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
   const fileName = buildFileName(worker.full_name, requestId);
