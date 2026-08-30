@@ -59,14 +59,10 @@ function signatureBlock(title, prefilledName, prefilledPosition) {
  */
 async function generateTransferRequestDocx(data) {
   const {
-    requestId, requestDate,
+    requestId, companyName, companyInfo, requestDate,
     worker = {}, currentSiteName, targetSiteName, contractName,
     requesterName, requesterPosition, transferReason,
   } = data;
-
-  // استخدام الثوابت العامة كقيمة أساسية إذا لم تكن موجودة في البيانات القادمة
-  const docCompanyName = data.companyName || companyName;
-  const docCompanyInfo = data.companyInfo || companyInfo;
 
   const infoRows = [
     infoRow('Worker Name', worker.full_name),
@@ -110,11 +106,8 @@ async function generateTransferRequestDocx(data) {
     sections: [
       {
         children: [
-          new Paragraph({ 
-            text: docCompanyName, 
-            heading: HeadingLevel.HEADING_2 
-          }),
-          ...(docCompanyInfo ? [new Paragraph({ text: docCompanyInfo })] : []),
+          new Paragraph({ text: companyName || '[COMPANY NAME]', heading: HeadingLevel.HEADING_2 }),
+          ...(companyInfo ? [new Paragraph({ text: companyInfo })] : []),
           new Paragraph({ text: `Date: ${requestDate}`, spacing: { after: 300 } }),
           new Paragraph({
             alignment: AlignmentType.CENTER,
@@ -141,6 +134,8 @@ async function generateTransferRequestDocx(data) {
   const buffer = await Packer.toBuffer(doc);
   fs.writeFileSync(absolutePath, buffer);
 
+  // Path stored in DB / served relative to project root, consistent with how
+  // worker photo paths are stored (see workerController.js -> 'uploads/...').
   const relativePath = path.join('uploads', 'transfer_requests', fileName).replace(/\\/g, '/');
   return relativePath;
 }

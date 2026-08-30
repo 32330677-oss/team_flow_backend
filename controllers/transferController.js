@@ -132,27 +132,80 @@ exports.reviewTransferRequest = async (req, res) => {
 };
 
 // 4. Download the official Word document (Admin, or the Supervisor who created it)
+// 4. Download the official Word document (Admin, or the Supervisor who created it)
 exports.downloadTransferDocument = async (req, res) => {
     const { id } = req.params;
     try {
+        // 1. جلب بيانات الطلب كاملة مع تفاصيل العامل والمواقع والمستخدم لتكون جاهزة عند الحاجة للتوليد الفوري
         const [[row]] = await db.query(
-            `SELECT document_path, requested_by_user_id FROM worker_transfer_requests WHERE request_id = ? LIMIT 1`,
+            `SELECT 
+                t.document_path, t.requested_by_user_id, t.created_at, t.admin_notes,
+                w.full_name, w.worker_unique_id, w.job_position, w.nationality, w.phone_number, w.hire_date,
+                cs.site_name AS current_site_name, c.contract_name,
+                ts.site_name AS target_site_name,
+                u.full_name AS requester_name, u.role AS requester_role
+             FROM worker_transfer_requests t
+             JOIN workers w ON t.worker_id = w.worker_id
+             JOIN sites cs ON t.current_site_id = cs.site_id
+             JOIN sites ts ON t.target_site_id = ts.site_id
+             LEFT JOIN contracts c ON c.contract_id = cs.contract_id
+             JOIN users u ON t.requested_by_user_id = u.user_id
+             WHERE t.request_id = ? LIMIT 1`,
             [id]
         );
-        if (!row) return res.status(404).json({ status: 'error', message: 'Transfer request not found.' });
-        if (!row.document_path) return res.status(404).json({ status: 'error', message: 'No document has been generated for this request.' });
 
+        if (!row) {
+            return res.status(404).json({ status: 'error', message: 'Transfer request not found.' });
+        }
+
+        // 2. التحقق من الصلاحيات (Admin أو صاحب الطلب Supervisor)
         const isOwner = req.user.role === 'Supervisor' && req.user.user_id === row.requested_by_user_id;
         if (req.user.role !== 'Admin' && !isOwner) {
             return res.status(403).json({ status: 'error', message: 'You are not authorized to download this document.' });
         }
 
-        const absolutePath = path.join(__dirname, '..', row.document_path);
-        if (!fs.existsSync(absolutePath)) {
-            return res.status(404).json({ status: 'error', message: 'Document file is missing on the server.' });
+        let absolutePath = row.document_path ? path.join(__dirname, '..', row.document_path) : null;
+
+        // 3. التوليد التلقائي الفوري (On-the-Fly) إذا كان مسار الملف فارغاً أو غير موجود على السيرفر
+        if (!absolutePath || !fs.existsSync(absolutePath)) {
+            try {
+                const generatedPath = await generateTransferRequestDocx({
+                    requestId: id,
+                    companyName: process.env.COMPANY_NAME || null,
+                    companyInfo: process.env.COMPANY_INFO || null,
+                    requestDate: row.created_at ? String(row.created_at).slice(0, 10) : new Date().toISOString().slice(0, 10),
+                    worker: {
+                        full_name: row.full_name,
+                        worker_unique_id: row.worker_unique_id,
+                        job_position: row.job_position,
+                        nationality: row.nationality,
+                        phone_number: row.phone_number,
+                        hire_date: row.hire_date,
+                    },
+                    currentSiteName: row.current_site_name,
+                    targetSiteName: row.target_site_name,
+                    contractName: row.contract_name,
+                    requesterName: row.requester_name,
+                    requesterPosition: row.requester_role,
+                    transferReason: row.admin_notes,
+                });
+
+                // تحديث المسار في قاعدة البيانات للمستقبل
+                await db.query(
+                    `UPDATE worker_transfer_requests SET document_path = ? WHERE request_id = ?`,
+                    [generatedPath, id]
+                );
+
+                absolutePath = path.join(__dirname, '..', generatedPath);
+            } catch (genError) {
+                console.error('ON-THE-FLY DOCX GENERATION ERROR:', genError);
+                return res.status(500).json({ status: 'error', message: 'Failed to generate document on the fly.' });
+            }
         }
 
+        // 4. إرسال الملف بنجاح
         return res.download(absolutePath);
+
     } catch (error) {
         console.error('DOWNLOAD TRANSFER DOCUMENT ERROR:', error);
         res.status(500).json({ status: 'error', message: 'An error occurred while downloading the document.' });
