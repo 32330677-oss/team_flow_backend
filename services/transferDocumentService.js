@@ -104,7 +104,7 @@ async function generateTransferRequestDocx(data) {
     sections: [
       {
         children: [
-          new Paragraph({ text: companyName || '[ASIK ENGINEERING CONSTRUCTION]', heading: HeadingLevel.HEADING_2 }),
+          new Paragraph({ text: companyName || '[COMPANY NAME]', heading: HeadingLevel.HEADING_2 }),
           ...(companyInfo ? [new Paragraph({ text: companyInfo })] : []),
           new Paragraph({ text: `Date: ${requestDate}`, spacing: { after: 300 } }),
           new Paragraph({
