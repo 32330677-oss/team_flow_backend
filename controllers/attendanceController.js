@@ -802,7 +802,31 @@ exports.submitDay = async (req, res) => {
             connection.release();
             return res.status(400).json({ status: 'error', message: 'All breaks must be ended before submitting the day.' });
         }
-
+// 2.5. التحقق من أن جميع الشيفتات المكتملة عندها سجل غداء (Lunch) مسجّل
+const [missingLunch] = await connection.execute(
+    `SELECT a.attendance_id, w.full_name
+     FROM attendance a
+     JOIN workers w ON w.worker_id = a.worker_id
+     LEFT JOIN attendanceleaveperiods alp
+            ON alp.attendance_id = a.attendance_id
+           AND alp.leave_type = 'Lunch'
+     WHERE a.site_id = ? AND a.status = 'Draft'
+       AND (a.record_date = ?
+            OR a.record_date = DATE_SUB(?, INTERVAL 1 DAY))
+       AND a.check_in_time IS NOT NULL AND a.check_out_time IS NOT NULL
+       AND alp.leave_id IS NULL
+     FOR UPDATE`,
+    [siteId, record_date, record_date]
+);
+if (missingLunch.length > 0) {
+    await connection.rollback();
+    connection.release();
+    const names = missingLunch.map(r => r.full_name).join(', ');
+    return res.status(400).json({
+        status: 'error',
+        message: `Lunch time must be set for the following workers before submitting the day: ${names}`
+    });
+}
         // 3. بعد نجاح الفحوصات، نقوم بإدخال سجلات الغياب للذين لم يسجلوا حضوراً
         await connection.execute(
             `INSERT INTO attendance
