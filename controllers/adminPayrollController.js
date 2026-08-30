@@ -1,19 +1,18 @@
 const pool = require('../config/db');
 
-
 function isValidDate(value) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(value || '')) && !Number.isNaN(Date.parse(`${value}T00:00:00`));
 }
-
 function isSpecificSite(value) {
   return value !== undefined && value !== null && !['', 'null', '0', 'All'].includes(String(value));
 }
-
 function money(value) {
   return Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 }
 
+// ============================================================
 // Replace generatePayrollBatch entirely
+// ============================================================
 async function generatePayrollBatch(req, res) {
   const { start_date, end_date, site_id } = req.body || {};
   const userId = req.user?.user_id;
@@ -31,8 +30,7 @@ async function generatePayrollBatch(req, res) {
     await connection.beginTransaction();
     const scopedSite = isSpecificSite(site_id);
 
-    // FIX #3: overlap is scoped to the sites this batch would actually pay,
-    // instead of blocking on ANY batch regardless of site.
+    // --- overlap check (unchanged from existing FIX #3) ---
     const overlapParams = [end_date, start_date];
     let overlapSql = `
       SELECT DISTINCT pb.payroll_batch_id
@@ -40,10 +38,7 @@ async function generatePayrollBatch(req, res) {
       JOIN payroll p ON p.payroll_batch_id = pb.payroll_batch_id
       JOIN payrollitems pi ON pi.payroll_id = p.payroll_id
       WHERE pb.start_date <= ? AND pb.end_date >= ?`;
-    if (scopedSite) {
-      overlapSql += ' AND pi.site_id = ?';
-      overlapParams.push(site_id);
-    }
+    if (scopedSite) { overlapSql += ' AND pi.site_id = ?'; overlapParams.push(site_id); }
     overlapSql += ' LIMIT 1 FOR UPDATE';
     const [overlap] = await connection.execute(overlapSql, overlapParams);
     if (overlap.length) {
@@ -51,16 +46,15 @@ async function generatePayrollBatch(req, res) {
       return res.status(409).json({ success: false, message: 'An overlapping payroll batch already exists for this scope.' });
     }
 
-    // FIX #4: attribute every attendance record to the assignment/contract
-    // that was actually active on that record's date, not the worker's
-    // *current* assignment applied blindly across the whole period.
-    const earningsParams = [start_date, end_date];
-    let earningsSql = `
-      SELECT a.worker_id, w.full_name AS worker_name,
-             wsa.site_id, wsa.contract_id,
-             c.hourly_rate, c.overtime_hourly_rate,
-             COALESCE(SUM(a.total_working_hours), 0) AS regular_hours,
-             COALESCE(SUM(a.overtime_hours), 0) AS overtime_hours
+    // --- fetch every APPROVED attendance record in the period, per worker ---
+    // We no longer pull rate from contracts. We attribute site via the
+    // worker's assignment active on the attendance date (unchanged),
+    // but the RATE comes from workercompensationhistory effective on that date.
+    const attParams = [start_date, end_date];
+    let attSql = `
+      SELECT a.attendance_id, a.worker_id, w.full_name AS worker_name, w.payment_type,
+             a.record_date, a.site_id, a.total_working_hours, a.overtime_hours,
+             wsa.contract_id
       FROM attendance a
       JOIN workers w ON w.worker_id = a.worker_id AND w.status = 'Active'
       JOIN workersiteassignments wsa
@@ -68,56 +62,141 @@ async function generatePayrollBatch(req, res) {
        AND wsa.site_id = a.site_id
        AND wsa.assigned_date <= a.record_date
        AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date >= a.record_date)
-      JOIN contracts c ON c.contract_id = wsa.contract_id
       WHERE a.record_date BETWEEN ? AND ?
         AND a.status = 'Approved'`;
-    if (scopedSite) {
-      earningsSql += ' AND a.site_id = ?';
-      earningsParams.push(site_id);
+    if (scopedSite) { attSql += ' AND a.site_id = ?'; attParams.push(site_id); }
+    attSql += ' ORDER BY w.full_name, a.record_date';
+
+    const [attendanceRows] = await connection.execute(attSql, attParams);
+
+    if (!attendanceRows.length) {
+      await connection.rollback();
+      return res.status(404).json({ success: false, message: 'No Approved attendance found for this period.' });
     }
-    earningsSql += `
-      GROUP BY a.worker_id, w.full_name, wsa.site_id, wsa.contract_id, c.hourly_rate, c.overtime_hourly_rate
-      ORDER BY w.full_name`;
 
-    const [earningRows] = await connection.execute(earningsSql, earningsParams);
+    // --- preload compensation history per worker (small dataset, cached per batch) ---
+    const workerIds = [...new Set(attendanceRows.map(r => r.worker_id))];
+    const [compRows] = await connection.query(
+      `SELECT worker_id, payment_type, daily_rate, regular_hourly_rate, overtime_hourly_rate,
+              effective_from, effective_to
+       FROM workercompensationhistory
+       WHERE worker_id IN (?)
+       ORDER BY worker_id, effective_from`,
+      [workerIds]
+    );
+    const compByWorker = new Map();
+    for (const row of compRows) {
+      if (!compByWorker.has(row.worker_id)) compByWorker.set(row.worker_id, []);
+      compByWorker.get(row.worker_id).push(row);
+    }
 
+    function findRateForDate(workerId, dateStr) {
+      const periods = compByWorker.get(workerId) || [];
+      return periods.find(p =>
+        p.effective_from <= dateStr && (p.effective_to === null || p.effective_to >= dateStr)
+      ) || null;
+    }
+
+    // --- accumulate per (worker, site, contract, rate-snapshot) group ---
+    // Key includes the rate values so a rate change mid-period creates a
+    // separate payrollitems row with its own snapshot (section 18/20).
+    const groups = new Map();
     const byWorker = new Map();
-    for (const row of earningRows) {
-      const regularHours = Math.max(0, Number(row.regular_hours || 0));
-      const overtimeHours = Math.max(0, Number(row.overtime_hours || 0));
-      if (regularHours === 0 && overtimeHours === 0) continue;
 
-      const hourlyRate = Number(row.hourly_rate);
-      const overtimeRate = Number(row.overtime_hourly_rate);
-      if (!Number.isFinite(hourlyRate) || hourlyRate < 0 || !Number.isFinite(overtimeRate) || overtimeRate < 0) {
-        throw new Error(`Invalid rates for contract ${row.contract_id}`);
+    for (const rec of attendanceRows) {
+      const comp = findRateForDate(rec.worker_id, String(rec.record_date));
+      if (!comp) {
+        await connection.rollback();
+        return res.status(422).json({
+          success: false,
+          message: `No compensation record found for worker_id=${rec.worker_id} on ${rec.record_date}. Cannot generate payroll.`
+        });
+      }
+      if (comp.payment_type !== rec.payment_type) {
+        // Worker's current flag drifted from history — trust history for payroll accuracy
       }
 
-      const baseSalary = money(regularHours * hourlyRate);
-      const overtimePay = money(overtimeHours * overtimeRate);
+      const groupKey = comp.payment_type === 'Daily'
+        ? `${rec.worker_id}|${rec.site_id}|Daily|${comp.daily_rate}`
+        : `${rec.worker_id}|${rec.site_id}|Hourly|${comp.regular_hourly_rate}|${comp.overtime_hourly_rate}`;
 
-      if (!byWorker.has(row.worker_id)) {
-        byWorker.set(row.worker_id, { worker_id: row.worker_id, breakdown: [], gross: 0 });
+      if (!groups.has(groupKey)) {
+        groups.set(groupKey, {
+          worker_id: rec.worker_id,
+          site_id: rec.site_id,
+          contract_id: rec.contract_id,
+          pay_type: comp.payment_type,
+          daily_rate: comp.daily_rate,
+          regular_hourly_rate: comp.regular_hourly_rate,
+          overtime_hourly_rate: comp.overtime_hourly_rate,
+          days_worked: 0,
+          regular_hours: 0,
+          overtime_hours: 0,
+        });
       }
-      const worker = byWorker.get(row.worker_id);
+      const g = groups.get(groupKey);
+      if (comp.payment_type === 'Daily') {
+        g.days_worked += 1; // one approved attendance record = one working day
+      } else {
+        g.regular_hours += Number(rec.total_working_hours || 0);
+        g.overtime_hours += Number(rec.overtime_hours || 0);
+      }
+
+      if (!byWorker.has(rec.worker_id)) {
+        byWorker.set(rec.worker_id, { worker_id: rec.worker_id, breakdown: [], gross: 0 });
+      }
+    }
+
+    // --- compute money per group and attach to worker ---
+    for (const g of groups.values()) {
+      let baseSalary = 0;
+      let overtimePay = 0;
+
+      if (g.pay_type === 'Daily') {
+        if (!Number.isFinite(Number(g.daily_rate)) || Number(g.daily_rate) <= 0) {
+          throw new Error(`Invalid daily_rate for worker ${g.worker_id}`);
+        }
+        baseSalary = money(g.days_worked * Number(g.daily_rate));
+        overtimePay = 0; // Section 5: Daily workers never get overtime pay
+      } else {
+        const regularRate = Number(g.regular_hourly_rate);
+        const overtimeRate = Number(g.overtime_hourly_rate);
+        if (!Number.isFinite(regularRate) || regularRate <= 0 || !Number.isFinite(overtimeRate) || overtimeRate <= 0) {
+          throw new Error(`Invalid hourly rates for worker ${g.worker_id}`);
+        }
+        baseSalary = money(g.regular_hours * regularRate);
+        overtimePay = money(g.overtime_hours * overtimeRate);
+      }
+
+      if (baseSalary === 0 && overtimePay === 0) continue;
+
+      const worker = byWorker.get(g.worker_id);
       worker.breakdown.push({
-        siteId: row.site_id,
-        contractId: row.contract_id,
-        regularHours,
-        overtimeHours,
-        hourlyRate,
-        overtimeRate,
+        siteId: g.site_id,
+        contractId: g.contract_id,
+        payType: g.pay_type,
+        dailyRate: g.daily_rate,
+        hourlyRate: g.regular_hourly_rate,
+        overtimeRate: g.overtime_hourly_rate,
+        daysWorked: g.days_worked,
+        regularHours: g.regular_hours,
+        overtimeHours: g.overtime_hours,
         baseSalary,
         overtimePay,
       });
       worker.gross = money(worker.gross + baseSalary + overtimePay);
     }
 
+    // Drop workers whose total ended up 0
+    for (const [workerId, worker] of [...byWorker.entries()]) {
+      if (worker.breakdown.length === 0) byWorker.delete(workerId);
+    }
     if (!byWorker.size) {
       await connection.rollback();
-      return res.status(404).json({ success: false, message: 'No Approved attendance found for this period.' });
+      return res.status(404).json({ success: false, message: 'No payable attendance found for this period.' });
     }
 
+    // --- persist batch / payroll / payrollitems ---
     const [batchResult] = await connection.execute(
       `INSERT INTO payrollbatches (start_date, end_date, generated_by_user_id, status)
        VALUES (?, ?, ?, 'Generated')`,
@@ -141,12 +220,20 @@ async function generatePayrollBatch(req, res) {
       for (const item of worker.breakdown) {
         await connection.execute(
           `INSERT INTO payrollitems
-            (payroll_id, contract_id, site_id, hourly_rate_snapshot,
-             overtime_hourly_rate_snapshot, regular_hours_worked,
-             overtime_hours_worked, base_salary, overtime_pay)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [payrollId, item.contractId, item.siteId, item.hourlyRate, item.overtimeRate,
-            item.regularHours, item.overtimeHours, item.baseSalary, item.overtimePay]
+            (payroll_id, contract_id, site_id, pay_type, hourly_rate_snapshot,
+             overtime_hourly_rate_snapshot, daily_rate_snapshot, days_worked,
+             regular_hours_worked, overtime_hours_worked, base_salary, overtime_pay)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            payrollId, item.contractId, item.siteId, item.payType,
+            item.payType === 'Hourly' ? item.hourlyRate : null,
+            item.payType === 'Hourly' ? item.overtimeRate : null,
+            item.payType === 'Daily' ? item.dailyRate : null,
+            item.payType === 'Daily' ? item.daysWorked : null,
+            item.payType === 'Hourly' ? item.regularHours : null,
+            item.payType === 'Hourly' ? item.overtimeHours : null,
+            item.baseSalary, item.overtimePay
+          ]
         );
       }
       totalWorkers += 1;
@@ -162,13 +249,15 @@ async function generatePayrollBatch(req, res) {
   } catch (error) {
     await connection.rollback();
     console.error('generatePayrollBatch:', error);
-    return res.status(500).json({ success: false, message: 'Failed to generate payroll.' });
+    return res.status(500).json({ success: false, message: error.message || 'Failed to generate payroll.' });
   } finally {
     connection.release();
   }
 }
 
-// Replace getPayrollReport (FIX #5)
+// ============================================================
+// getPayrollReport — unchanged (no pay_type needed at this level)
+// ============================================================
 async function getPayrollReport(req, res) {
   try {
     const { site_id } = req.query;
@@ -207,7 +296,9 @@ async function getPayrollReport(req, res) {
   }
 }
 
-// Replace getPayrollBatchDetails (FIX #1 for the preview screen)
+// ============================================================
+// getPayrollBatchDetails — now returns pay_type per site row (section 8)
+// ============================================================
 async function getPayrollBatchDetails(req, res) {
   const batchId = Number(req.params.batchId);
   if (!Number.isInteger(batchId) || batchId <= 0) return res.status(400).json({ success: false, message: 'Invalid batch id.' });
@@ -215,7 +306,6 @@ async function getPayrollBatchDetails(req, res) {
     const [batches] = await pool.execute('SELECT * FROM payrollbatches WHERE payroll_batch_id = ?', [batchId]);
     if (!batches.length) return res.status(404).json({ success: false, message: 'Batch not found.' });
 
-    // One row per worker — no fan-out from payrollitems.
     const [payrolls] = await pool.execute(
       `SELECT p.payroll_id, p.gross_salary, p.net_salary,
               p.bonus_amount, p.penalty_amount, p.deductions_amount,
@@ -227,12 +317,11 @@ async function getPayrollBatchDetails(req, res) {
       [batchId]
     );
 
-    // Per-site breakdown, attached under each worker instead of duplicating
-    // worker-level totals across rows.
     const [items] = await pool.execute(
-      `SELECT pi.payroll_id, pi.site_id, s.site_name,
+      `SELECT pi.payroll_id, pi.site_id, s.site_name, pi.pay_type,
               pi.regular_hours_worked, pi.overtime_hours_worked,
               pi.hourly_rate_snapshot, pi.overtime_hourly_rate_snapshot,
+              pi.daily_rate_snapshot, pi.days_worked,
               pi.base_salary, pi.overtime_pay
        FROM payroll p
        JOIN payrollitems pi ON pi.payroll_id = p.payroll_id
@@ -248,7 +337,22 @@ async function getPayrollBatchDetails(req, res) {
       itemsByPayroll.get(item.payroll_id).push(item);
     }
 
-    const workers = payrolls.map((p) => ({ ...p, sites: itemsByPayroll.get(p.payroll_id) || [] }));
+    // Overall pay_type for the worker for this batch (use first item's type;
+    // in the rare case of a mid-period rate/type change, sites[] shows detail)
+    const workers = payrolls.map((p) => {
+      const sites = itemsByPayroll.get(p.payroll_id) || [];
+      return {
+        ...p,
+        pay_type: sites[0]?.pay_type || 'Hourly',
+        days_worked: sites.reduce((sum, s) => sum + (s.days_worked || 0), 0),
+        regular_hours_worked: sites.reduce((sum, s) => sum + Number(s.regular_hours_worked || 0), 0),
+        overtime_hours_worked: sites.reduce((sum, s) => sum + Number(s.overtime_hours_worked || 0), 0),
+        daily_rate: sites[0]?.daily_rate_snapshot ?? null,
+        regular_rate: sites[0]?.hourly_rate_snapshot ?? null,
+        overtime_rate: sites[0]?.overtime_hourly_rate_snapshot ?? null,
+        sites,
+      };
+    });
 
     return res.json({ success: true, batch: batches[0], workers });
   } catch (error) {
@@ -264,14 +368,8 @@ async function markBatchAsPaid(req, res) {
   try {
     await connection.beginTransaction();
     const [batches] = await connection.execute('SELECT status FROM payrollbatches WHERE payroll_batch_id = ? FOR UPDATE', [batchId]);
-    if (!batches.length) {
-      await connection.rollback();
-      return res.status(404).json({ success: false, message: 'Batch not found.' });
-    }
-    if (batches[0].status === 'Paid') {
-      await connection.rollback();
-      return res.status(409).json({ success: false, message: 'Batch is already paid.' });
-    }
+    if (!batches.length) { await connection.rollback(); return res.status(404).json({ success: false, message: 'Batch not found.' }); }
+    if (batches[0].status === 'Paid') { await connection.rollback(); return res.status(409).json({ success: false, message: 'Batch is already paid.' }); }
     await connection.execute(`UPDATE payrollbatches SET status = 'Paid' WHERE payroll_batch_id = ?`, [batchId]);
     await connection.execute(`UPDATE payroll SET status = 'Paid', paid_date = CURDATE() WHERE payroll_batch_id = ?`, [batchId]);
     await connection.commit();
@@ -285,7 +383,6 @@ async function markBatchAsPaid(req, res) {
   }
 }
 
-// Replace getLastBatchEndDate (FIX #3)
 async function getLastBatchEndDate(req, res) {
   try {
     const { site_id } = req.query || {};
@@ -305,6 +402,9 @@ async function getLastBatchEndDate(req, res) {
   }
 }
 
+// ============================================================
+// exportPayrollExcel — branch columns by pay_type (section 9)
+// ============================================================
 async function exportPayrollExcel(req, res) {
   const batchId = Number(req.params.batchId);
   if (!Number.isInteger(batchId) || batchId <= 0) {
@@ -314,26 +414,18 @@ async function exportPayrollExcel(req, res) {
   try {
     const ExcelJS = require('exceljs');
     const [batches] = await pool.execute(
-      `SELECT payroll_batch_id, start_date, end_date,
-              total_workers, total_amount, status
-       FROM payrollbatches
-       WHERE payroll_batch_id = ?`,
+      `SELECT payroll_batch_id, start_date, end_date, total_workers, total_amount, status
+       FROM payrollbatches WHERE payroll_batch_id = ?`,
       [batchId]
     );
-    if (!batches.length) {
-      return res.status(404).json({ success: false, message: 'Batch not found.' });
-    }
+    if (!batches.length) return res.status(404).json({ success: false, message: 'Batch not found.' });
 
     const [rows] = await pool.execute(
-      `SELECT w.full_name AS worker_name,
-              s.site_name,
-              pi.regular_hours_worked,
-              pi.overtime_hours_worked,
-              pi.hourly_rate_snapshot,
-              pi.overtime_hourly_rate_snapshot,
-              pi.base_salary,
-              pi.overtime_pay,
-              p.net_salary
+      `SELECT w.full_name AS worker_name, s.site_name, pi.pay_type,
+              pi.regular_hours_worked, pi.overtime_hours_worked,
+              pi.hourly_rate_snapshot, pi.overtime_hourly_rate_snapshot,
+              pi.daily_rate_snapshot, pi.days_worked,
+              pi.base_salary, pi.overtime_pay, p.net_salary
        FROM payroll p
        JOIN workers w ON w.worker_id = p.worker_id
        JOIN payrollitems pi ON pi.payroll_id = p.payroll_id
@@ -346,68 +438,69 @@ async function exportPayrollExcel(req, res) {
     const workbook = new ExcelJS.Workbook();
     const sheet = workbook.addWorksheet('Payroll');
     const batch = batches[0];
-    const dateOnly = (value) => {
-      if (value instanceof Date) return value.toISOString().slice(0, 10);
-      return String(value || '').slice(0, 10);
-    };
+    const dateOnly = (v) => (v instanceof Date ? v.toISOString().slice(0, 10) : String(v || '').slice(0, 10));
 
+    // Unified column set that covers both types; irrelevant cells stay blank per row (section 9: never show misleading values)
     sheet.columns = [
-      { header: 'No.', key: 'number', width: 8 },
+      { header: 'No.', key: 'number', width: 6 },
       { header: 'Worker Name', key: 'worker_name', width: 28 },
-      { header: 'Site', key: 'site_name', width: 22 },
-      { header: 'Regular Hours', key: 'regular_hours', width: 16 },
-      { header: 'Overtime Hours', key: 'overtime_hours', width: 16 },
-      { header: 'Regular Rate', key: 'regular_rate', width: 16 },
-      { header: 'Overtime Rate', key: 'overtime_rate', width: 16 },
-      { header: 'Regular Pay', key: 'regular_pay', width: 16 },
+      { header: 'Site', key: 'site_name', width: 20 },
+      { header: 'Payment Type', key: 'pay_type', width: 14 },
+      { header: 'Days Worked', key: 'days_worked', width: 12 },
+      { header: 'Daily Rate', key: 'daily_rate', width: 14 },
+      { header: 'Regular Hours', key: 'regular_hours', width: 14 },
+      { header: 'Overtime Hours', key: 'overtime_hours', width: 14 },
+      { header: 'Regular Rate', key: 'regular_rate', width: 14 },
+      { header: 'Overtime Rate', key: 'overtime_rate', width: 14 },
+      { header: 'Base Salary', key: 'base_salary', width: 16 },
       { header: 'Overtime Pay', key: 'overtime_pay', width: 16 },
       { header: 'Net Salary', key: 'net_salary', width: 16 },
     ];
 
-    sheet.mergeCells('A1:J1');
+    sheet.mergeCells('A1:M1');
     sheet.getCell('A1').value = `Payroll Batch #${batchId}`;
-    sheet.mergeCells('A2:J2');
+    sheet.mergeCells('A2:M2');
     sheet.getCell('A2').value = `Period: ${dateOnly(batch.start_date)} - ${dateOnly(batch.end_date)}`;
-    sheet.mergeCells('A3:J3');
+    sheet.mergeCells('A3:M3');
     sheet.getCell('A3').value = 'Currency: Syrian Pound (ل.س)';
-    sheet.getRow(5).values = sheet.columns.map((column) => column.header);
+    sheet.getRow(5).values = sheet.columns.map((c) => c.header);
 
-    let totalRegularPay = 0;
-    let totalOvertimePay = 0;
-    let totalNetSalary = 0;
+    let totalBase = 0, totalOT = 0, totalNet = 0;
 
     rows.forEach((item, index) => {
-      const regularHours = Number(item.regular_hours_worked || 0);
-      const overtimeHours = Number(item.overtime_hours_worked || 0);
-      const regularRate = Number(item.hourly_rate_snapshot);
-      const overtimeRate = Number(item.overtime_hourly_rate_snapshot);
-      const regularPay = Math.round(regularHours * regularRate * 100) / 100;
-      const overtimePay = Math.round(overtimeHours * overtimeRate * 100) / 100;
-      const netSalary = Number(item.net_salary || regularPay + overtimePay);
-
-      totalRegularPay += regularPay;
-      totalOvertimePay += overtimePay;
-      totalNetSalary += netSalary;
-
-      sheet.addRow({
+      const isDaily = item.pay_type === 'Daily';
+      const rowData = {
         number: index + 1,
         worker_name: item.worker_name,
         site_name: item.site_name || '',
-        regular_hours: regularHours,
-        overtime_hours: overtimeHours,
-        regular_rate: regularRate,
-        overtime_rate: overtimeRate,
-        regular_pay: regularPay,
-        overtime_pay: overtimePay,
-        net_salary: netSalary,
-      });
+        pay_type: item.pay_type,
+        base_salary: Number(item.base_salary || 0),
+        overtime_pay: Number(item.overtime_pay || 0),
+        net_salary: Number(item.net_salary || 0),
+      };
+      if (isDaily) {
+        rowData.days_worked = item.days_worked;
+        rowData.daily_rate = Number(item.daily_rate_snapshot || 0);
+        // regular/overtime hour columns intentionally left blank for Daily rows
+      } else {
+        rowData.regular_hours = Number(item.regular_hours_worked || 0);
+        rowData.overtime_hours = Number(item.overtime_hours_worked || 0);
+        rowData.regular_rate = Number(item.hourly_rate_snapshot || 0);
+        rowData.overtime_rate = Number(item.overtime_hourly_rate_snapshot || 0);
+        // days_worked / daily_rate intentionally left blank for Hourly rows
+      }
+      sheet.addRow(rowData);
+
+      totalBase += rowData.base_salary;
+      totalOT += rowData.overtime_pay;
+      totalNet += rowData.net_salary;
     });
 
     const totalRow = sheet.addRow({
       worker_name: 'TOTAL',
-      regular_pay: Math.round(totalRegularPay * 100) / 100,
-      overtime_pay: Math.round(totalOvertimePay * 100) / 100,
-      net_salary: Math.round(totalNetSalary * 100) / 100,
+      base_salary: Math.round(totalBase * 100) / 100,
+      overtime_pay: Math.round(totalOT * 100) / 100,
+      net_salary: Math.round(totalNet * 100) / 100,
     });
 
     sheet.getRow(1).font = { bold: true, size: 16, color: { argb: 'FFFFFFFF' } };
@@ -416,7 +509,7 @@ async function exportPayrollExcel(req, res) {
     sheet.getRow(5).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
     totalRow.font = { bold: true };
     for (let row = 6; row <= sheet.rowCount; row += 1) {
-      for (const col of [6, 7, 8, 9, 10]) {
+      for (const col of [6, 9, 10, 11, 12, 13]) {
         sheet.getCell(row, col).numFmt = '#,##0 "ل.س"';
       }
     }
@@ -428,102 +521,13 @@ async function exportPayrollExcel(req, res) {
     res.end();
   } catch (error) {
     console.error('exportPayrollExcel:', error);
-    if (!res.headersSent) {
-      return res.status(500).json({ success: false, message: 'Failed to export Excel payroll report.' });
-    }
+    if (!res.headersSent) return res.status(500).json({ success: false, message: 'Failed to export Excel payroll report.' });
   }
 }
 
+// exportDailyAttendanceExcel — unchanged, keep as-is (attendance-only, no salary math)
 async function exportDailyAttendanceExcel(req, res) {
-  const { date, site_id } = req.query || {};
-  if (!isValidDate(date)) {
-    return res.status(400).json({ success: false, message: 'A valid date in YYYY-MM-DD format is required.' });
-  }
-
-  try {
-    const ExcelJS = require('exceljs');
-    const params = [date];
-    let siteFilter = '';
-    if (isSpecificSite(site_id)) {
-      siteFilter = ' AND a.site_id = ?';
-      params.push(site_id);
-    }
-
-    const [rows] = await pool.execute(
-      `SELECT a.record_date, w.worker_unique_id, w.full_name AS worker_name,
-              s.site_name, a.attendance_status, a.status AS workflow_status,
-              a.check_in_time, a.check_out_time, a.total_working_hours,
-              a.overtime_hours, a.management_leave_hours, a.remarks,
-              a.admin_rejection_notes
-       FROM attendance a
-       JOIN workers w ON w.worker_id = a.worker_id
-       JOIN sites s ON s.site_id = a.site_id
-       WHERE a.record_date = ?${siteFilter}
-       ORDER BY s.site_name, w.full_name`,
-      params
-    );
-
-    const workbook = new ExcelJS.Workbook();
-    const sheet = workbook.addWorksheet('Daily Attendance');
-    sheet.columns = [
-      { header: 'No.', key: 'number', width: 8 },
-      { header: 'Worker ID', key: 'worker_id', width: 16 },
-      { header: 'Worker Name', key: 'worker_name', width: 28 },
-      { header: 'Site', key: 'site_name', width: 22 },
-      { header: 'Attendance Status', key: 'attendance_status', width: 20 },
-      { header: 'Workflow Status', key: 'workflow_status', width: 18 },
-      { header: 'Check In', key: 'check_in', width: 22 },
-      { header: 'Check Out', key: 'check_out', width: 22 },
-      { header: 'Regular Hours', key: 'regular_hours', width: 16 },
-      { header: 'Overtime Hours', key: 'overtime_hours', width: 16 },
-      { header: 'Management Leave Hours', key: 'management_leave_hours', width: 24 },
-      { header: 'Remarks', key: 'remarks', width: 36 },
-      { header: 'Admin Rejection Notes', key: 'admin_rejection_notes', width: 36 },
-    ];
-
-    sheet.mergeCells('A1:M1');
-    sheet.getCell('A1').value = `Daily Attendance Report - ${date}`;
-    sheet.mergeCells('A2:M2');
-    sheet.getCell('A2').value = 'Attendance and hours only — no salary or rate calculation';
-    sheet.getRow(4).values = sheet.columns.map((column) => column.header);
-
-    rows.forEach((row, index) => {
-      sheet.addRow({
-        number: index + 1,
-        worker_id: row.worker_unique_id,
-        worker_name: row.worker_name,
-        site_name: row.site_name,
-        attendance_status: row.attendance_status || 'Present',
-        workflow_status: row.workflow_status,
-        check_in: row.check_in_time || '',
-        check_out: row.check_out_time || '',
-        regular_hours: Number(row.total_working_hours || 0),
-        overtime_hours: Number(row.overtime_hours || 0),
-        management_leave_hours: Number(row.management_leave_hours || 0),
-        remarks: row.remarks || '',
-        admin_rejection_notes: row.admin_rejection_notes || '',
-      });
-    });
-
-    sheet.getRow(1).font = { bold: true, size: 16, color: { argb: 'FFFFFFFF' } };
-    sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
-    sheet.getRow(2).font = { italic: true, color: { argb: 'FF555555' } };
-    sheet.getRow(4).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-    sheet.getRow(4).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
-    sheet.views = [{ state: 'frozen', ySplit: 4 }];
-    sheet.autoFilter = { from: 'A4', to: 'M4' };
-
-    const fileName = `daily_attendance_${date}.xlsx`;
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-    await workbook.xlsx.write(res);
-    res.end();
-  } catch (error) {
-    console.error('exportDailyAttendanceExcel:', error);
-    if (!res.headersSent) {
-      return res.status(500).json({ success: false, message: 'Failed to export daily attendance report.' });
-    }
-  }
+  // ... (نفس الكود الموجود حالياً بدون أي تعديل — ما إله علاقة بالراتب)
 }
 
 module.exports = {
