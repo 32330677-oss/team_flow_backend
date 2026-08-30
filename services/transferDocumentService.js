@@ -59,10 +59,14 @@ function signatureBlock(title, prefilledName, prefilledPosition) {
  */
 async function generateTransferRequestDocx(data) {
   const {
-    requestId, companyName, companyInfo, requestDate,
+    requestId, requestDate,
     worker = {}, currentSiteName, targetSiteName, contractName,
     requesterName, requesterPosition, transferReason,
   } = data;
+
+  // استخدام الثوابت العامة كقيمة أساسية إذا لم تكن موجودة في البيانات القادمة
+  const docCompanyName = data.companyName || companyName;
+  const docCompanyInfo = data.companyInfo || companyInfo;
 
   const infoRows = [
     infoRow('Worker Name', worker.full_name),
@@ -103,33 +107,33 @@ async function generateTransferRequestDocx(data) {
   }
 
   const doc = new Document({
-  sections: [
-    {
-      children: [
-        new Paragraph({ 
-          text: companyName, // سيظهر هنا: ASIK ENGINEERING CONSTRUCTION
-          heading: HeadingLevel.HEADING_2 
-        }),
-        ...(companyInfo ? [new Paragraph({ text: companyInfo })] : []),
-        new Paragraph({ text: `Date: ${requestDate}`, spacing: { after: 300 } }),
-        new Paragraph({
-          alignment: AlignmentType.CENTER,
-          heading: HeadingLevel.HEADING_1,
-          spacing: { after: 300 },
-          children: [new TextRun({ text: 'WORKER TRANSFER REQUEST', bold: true })],
-        }),
-        new Table({
-          width: { size: 100, type: WidthType.PERCENTAGE },
-          rows: infoRows,
-        }),
-        ...bodyParagraphs,
-        new Paragraph({ text: `Request ID: #${requestId}`, spacing: { before: 200, after: 400 } }),
-        ...signatureBlock('Requested By:', requesterName, requesterPosition),
-        ...signatureBlock('Management Approval:'),
-      ],
-    },
-  ],
-});
+    sections: [
+      {
+        children: [
+          new Paragraph({ 
+            text: docCompanyName, 
+            heading: HeadingLevel.HEADING_2 
+          }),
+          ...(docCompanyInfo ? [new Paragraph({ text: docCompanyInfo })] : []),
+          new Paragraph({ text: `Date: ${requestDate}`, spacing: { after: 300 } }),
+          new Paragraph({
+            alignment: AlignmentType.CENTER,
+            heading: HeadingLevel.HEADING_1,
+            spacing: { after: 300 },
+            children: [new TextRun({ text: 'WORKER TRANSFER REQUEST', bold: true })],
+          }),
+          new Table({
+            width: { size: 100, type: WidthType.PERCENTAGE },
+            rows: infoRows,
+          }),
+          ...bodyParagraphs,
+          new Paragraph({ text: `Request ID: #${requestId}`, spacing: { before: 200, after: 400 } }),
+          ...signatureBlock('Requested By:', requesterName, requesterPosition),
+          ...signatureBlock('Management Approval:'),
+        ],
+      },
+    ],
+  });
 
   if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
   const fileName = buildFileName(worker.full_name, requestId);
@@ -137,8 +141,6 @@ async function generateTransferRequestDocx(data) {
   const buffer = await Packer.toBuffer(doc);
   fs.writeFileSync(absolutePath, buffer);
 
-  // Path stored in DB / served relative to project root, consistent with how
-  // worker photo paths are stored (see workerController.js -> 'uploads/...').
   const relativePath = path.join('uploads', 'transfer_requests', fileName).replace(/\\/g, '/');
   return relativePath;
 }
