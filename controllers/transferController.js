@@ -126,9 +126,77 @@ exports.getPendingTransfers = async (req, res) => {
     }
 };
 
-// 3. Review request (Accept / Reject) - Admin only — UNCHANGED
+// 3. Review request (Accept / Reject) - Admin only
 exports.reviewTransferRequest = async (req, res) => {
-    // ...existing implementation, no changes...
+    const { id } = req.params;
+    const { status, admin_notes } = req.body; // status: 'Approved' | 'Rejected'
+    const adminId = req.user.user_id;
+
+    if (!['Approved', 'Rejected'].includes(status)) {
+        return res.status(400).json({ status: 'error', message: 'Invalid status provided.' });
+    }
+
+    const connection = await db.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const [rows] = await connection.execute(
+            `SELECT * FROM worker_transfer_requests WHERE request_id = ? FOR UPDATE`,
+            [id]
+        );
+        if (rows.length === 0) throw new Error('Transfer request not found.');
+
+        const request = rows[0];
+        if (request.status !== 'Pending') {
+            throw new Error('This request cannot be reviewed because it has already been processed.');
+        }
+
+        if (status === 'Approved') {
+            // A. End current assignment at the old site
+            await connection.execute(
+                `UPDATE workersiteassignments 
+                 SET unassigned_date = NOW(), updated_at = NOW() 
+                 WHERE worker_id = ? AND site_id = ? AND unassigned_date IS NULL`,
+                [request.worker_id, request.current_site_id]
+            );
+
+            // B. Fetch contract_id for the target site
+            const [targetSite] = await connection.execute(
+                `SELECT contract_id FROM sites WHERE site_id = ? LIMIT 1`,
+                [request.target_site_id]
+            );
+            if (targetSite.length === 0) throw new Error('Target site does not exist.');
+            const contract_id = targetSite[0].contract_id;
+
+            // C. Create new assignment at the target site
+            await connection.execute(
+                `INSERT INTO workersiteassignments 
+                 (worker_id, site_id, contract_id, assigned_by_user_id, assigned_date, created_at, updated_at) 
+                 VALUES (?, ?, ?, ?, CURDATE(), NOW(), NOW())`,
+                [request.worker_id, request.target_site_id, contract_id, adminId]
+            );
+        }
+
+        // D. Update transfer request status
+        await connection.execute(
+            `UPDATE worker_transfer_requests 
+             SET status = ?, admin_notes = ?, updated_at = NOW() 
+             WHERE request_id = ?`,
+            [status, admin_notes || null, id]
+        );
+
+        await connection.commit();
+        res.status(200).json({
+            status: 'success',
+            message: status === 'Approved' ? 'Request approved and worker transferred successfully.' : 'Transfer request rejected.'
+        });
+    } catch (error) {
+        await connection.rollback();
+        console.error('REVIEW TRANSFER ERROR:', error);
+        res.status(400).json({ status: 'error', message: error.message || 'An error occurred while processing the request.' });
+    } finally {
+        connection.release();
+    }
 };
 
 // 4. Download the official Word document (Admin, or the Supervisor who created it)
