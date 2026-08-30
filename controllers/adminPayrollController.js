@@ -526,8 +526,99 @@ async function exportPayrollExcel(req, res) {
 }
 
 // exportDailyAttendanceExcel — unchanged, keep as-is (attendance-only, no salary math)
+// ضع هذه الدالة كاملة بدل الدالة الفارغة exportDailyAttendanceExcel
+// في ملف controllers/adminPayrollController.js
+
 async function exportDailyAttendanceExcel(req, res) {
-  // ... (نفس الكود الموجود حالياً بدون أي تعديل — ما إله علاقة بالراتب)
+  const { date, site_id } = req.query || {};
+  if (!isValidDate(date)) {
+    return res.status(400).json({ success: false, message: 'A valid date in YYYY-MM-DD format is required.' });
+  }
+
+  try {
+    const ExcelJS = require('exceljs');
+    const params = [date];
+    let siteFilter = '';
+    if (isSpecificSite(site_id)) {
+      siteFilter = ' AND a.site_id = ?';
+      params.push(site_id);
+    }
+
+    const [rows] = await pool.execute(
+      `SELECT a.record_date, w.worker_unique_id, w.full_name AS worker_name,
+              s.site_name, a.attendance_status, a.status AS workflow_status,
+              a.check_in_time, a.check_out_time, a.total_working_hours,
+              a.overtime_hours, a.management_leave_hours, a.remarks,
+              a.admin_rejection_notes
+       FROM attendance a
+       JOIN workers w ON w.worker_id = a.worker_id
+       JOIN sites s ON s.site_id = a.site_id
+       WHERE a.record_date = ?${siteFilter}
+       ORDER BY s.site_name, w.full_name`,
+      params
+    );
+
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet('Daily Attendance');
+    sheet.columns = [
+      { header: 'No.', key: 'number', width: 8 },
+      { header: 'Worker ID', key: 'worker_id', width: 16 },
+      { header: 'Worker Name', key: 'worker_name', width: 28 },
+      { header: 'Site', key: 'site_name', width: 22 },
+      { header: 'Attendance Status', key: 'attendance_status', width: 20 },
+      { header: 'Workflow Status', key: 'workflow_status', width: 18 },
+      { header: 'Check In', key: 'check_in', width: 22 },
+      { header: 'Check Out', key: 'check_out', width: 22 },
+      { header: 'Regular Hours', key: 'regular_hours', width: 16 },
+      { header: 'Overtime Hours', key: 'overtime_hours', width: 16 },
+      { header: 'Management Leave Hours', key: 'management_leave_hours', width: 24 },
+      { header: 'Remarks', key: 'remarks', width: 36 },
+      { header: 'Admin Rejection Notes', key: 'admin_rejection_notes', width: 36 },
+    ];
+
+    sheet.mergeCells('A1:M1');
+    sheet.getCell('A1').value = `Daily Attendance Report - ${date}`;
+    sheet.mergeCells('A2:M2');
+    sheet.getCell('A2').value = 'Attendance and hours only — no salary or rate calculation';
+    sheet.getRow(4).values = sheet.columns.map((column) => column.header);
+
+    rows.forEach((row, index) => {
+      sheet.addRow({
+        number: index + 1,
+        worker_id: row.worker_unique_id,
+        worker_name: row.worker_name,
+        site_name: row.site_name,
+        attendance_status: row.attendance_status || 'Present',
+        workflow_status: row.workflow_status,
+        check_in: row.check_in_time || '',
+        check_out: row.check_out_time || '',
+        regular_hours: Number(row.total_working_hours || 0),
+        overtime_hours: Number(row.overtime_hours || 0),
+        management_leave_hours: Number(row.management_leave_hours || 0),
+        remarks: row.remarks || '',
+        admin_rejection_notes: row.admin_rejection_notes || '',
+      });
+    });
+
+    sheet.getRow(1).font = { bold: true, size: 16, color: { argb: 'FFFFFFFF' } };
+    sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
+    sheet.getRow(2).font = { italic: true, color: { argb: 'FF555555' } };
+    sheet.getRow(4).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    sheet.getRow(4).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
+    sheet.views = [{ state: 'frozen', ySplit: 4 }];
+    sheet.autoFilter = { from: 'A4', to: 'M4' };
+
+    const fileName = `daily_attendance_${date}.xlsx`;
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    console.error('exportDailyAttendanceExcel:', error);
+    if (!res.headersSent) {
+      return res.status(500).json({ success: false, message: 'Failed to export daily attendance report.' });
+    }
+  }
 }
 
 module.exports = {
