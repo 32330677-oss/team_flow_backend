@@ -6,13 +6,17 @@ const restrictTo = require('../middleware/roleMiddleware');
 
 router.use(authMiddleware);
 
-// الموظف الإداري يسجّل ويجلب حضوره الشخصي فقط
+// ==================== Workers Bulk Attendance (Admin / Manager) ====================
+router.post('/workers/bulk-checkin', restrictTo('Admin', 'SuperAdmin'), staffAttendanceController.bulkCheckIn);
+router.post('/workers/bulk-checkout', restrictTo('Admin', 'SuperAdmin'), staffAttendanceController.bulkCheckOut);
+
+// ==================== Staff Self-Service ====================
 router.post('/self', restrictTo('Staff'), staffAttendanceController.selfMarkAttendance);
 router.get('/self', restrictTo('Staff'), staffAttendanceController.getMyAttendance);
 
-// مراجعة الأدمن لسجلات كل الموظفين الإداريين
-router.get('/pending', restrictTo('Admin'), staffAttendanceController.getPendingStaffAttendance);
-router.post('/review', restrictTo('Admin'), staffAttendanceController.reviewStaffAttendance);
-router.get('/by-date', restrictTo('Admin'), staffAttendanceController.getStaffAttendanceByDate);
+// ==================== Admin Review (Staff Attendance) ====================
+router.get('/pending', restrictTo('Admin', 'SuperAdmin'), staffAttendanceController.getPendingStaffAttendance);
+router.post('/review', restrictTo('Admin', 'SuperAdmin'), staffAttendanceController.reviewStaffAttendance);
+router.get('/by-date', restrictTo('Admin', 'SuperAdmin'), staffAttendanceController.getStaffAttendanceByDate);
 
 module.exports = router;
