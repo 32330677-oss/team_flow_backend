@@ -8,6 +8,7 @@ const supervisorRouter = require('./routes/supervisorRoutes');
 const adminAttendanceRoutes = require('./routes/adminAttendanceRoutes');
 const transferRoutes = require('./routes/transferRoutes');
 const adminPayrollRoutes = require('./routes/adminPayrollRoutes');
+const dashboardRoutes = require('./routes/dashboardRoutes');
 const path = require('path');
 require('dotenv').config();
 if (!process.env.JWT_SECRET) {
@@ -37,7 +38,7 @@ app.use('/api/admin/attendance', adminAttendanceRoutes);
 app.use('/api/admin/payroll', adminPayrollRoutes);
 app.use('/api/transfers', transferRoutes);
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
-
+app.use('/api/dashboard', dashboardRoutes);
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });
 });
