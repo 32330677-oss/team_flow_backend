@@ -5,6 +5,8 @@ const authMiddleware = require('../middleware/authMiddleware');
 const restrictTo = require('../middleware/roleMiddleware');
 
 router.use(authMiddleware);
+
+// السماح فقط للأدمن والسوبرفايرز بالوصول إلى كشوفات الرواتب
 router.use(restrictTo('Admin'));
 
 router.post('/generate', controller.generateStaffPayrollBatch);

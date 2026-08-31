@@ -8,7 +8,7 @@ function money(value) {
     return Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 }
 
-// كل أيام الأسبوع تُعتبر أيام عمل ما عدا الجمعة (5 = Friday حسب getUTCDay)
+// All days of the week are considered working days except Friday (5 = Friday according to getUTCDay)
 function countWorkingDays(startDate, endDate) {
     let count = 0;
     const cursor = new Date(`${startDate}T00:00:00Z`);
@@ -35,12 +35,12 @@ async function generateStaffPayrollBatch(req, res) {
     const { start_date, end_date } = req.body || {};
     const userId = req.user?.user_id;
 
-    if (!userId) return res.status(401).json({ status: 'error', message: 'تعذر تحديد هوية الأدمن' });
+    if (!userId) return res.status(401).json({ status: 'error', message: 'Unable to determine user identity' });
     if (!isValidDate(start_date) || !isValidDate(end_date)) {
-        return res.status(400).json({ status: 'error', message: 'يرجى إدخال تواريخ صحيحة بصيغة YYYY-MM-DD' });
+        return res.status(400).json({ status: 'error', message: 'Please enter valid dates in YYYY-MM-DD format' });
     }
     if (end_date < start_date) {
-        return res.status(400).json({ status: 'error', message: 'تاريخ النهاية يجب أن يكون بعد أو يساوي تاريخ البداية' });
+        return res.status(400).json({ status: 'error', message: 'End date must be after or equal to start date' });
     }
 
     const connection = await pool.getConnection();
@@ -54,7 +54,7 @@ async function generateStaffPayrollBatch(req, res) {
         );
         if (overlap.length) {
             await connection.rollback();
-            return res.status(409).json({ status: 'error', message: 'يوجد كشف رواتب متداخل مع هذه الفترة بالفعل' });
+            return res.status(409).json({ status: 'error', message: 'A payroll batch overlapping with this period already exists' });
         }
 
         const [staffList] = await connection.execute(
@@ -63,13 +63,13 @@ async function generateStaffPayrollBatch(req, res) {
         );
         if (!staffList.length) {
             await connection.rollback();
-            return res.status(404).json({ status: 'error', message: 'لا يوجد موظفون إداريون نشطون' });
+            return res.status(404).json({ status: 'error', message: 'No active staff members found' });
         }
 
         const workingDays = countWorkingDays(start_date, end_date);
         if (workingDays <= 0) {
             await connection.rollback();
-            return res.status(400).json({ status: 'error', message: 'الفترة المحددة لا تحتوي على أيام عمل' });
+            return res.status(400).json({ status: 'error', message: 'The selected period contains no working days' });
         }
 
         const [batchResult] = await connection.execute(
@@ -84,7 +84,7 @@ async function generateStaffPayrollBatch(req, res) {
         for (const staff of staffList) {
             const paidLeaveTypes = getPaidLeaveTypes(staff);
 
-            // فقط السجلات المعتمدة (Approved) من قبل الأدمن تدخل في احتساب الراتب
+            // Only Approved records enter into salary calculation
             const [records] = await connection.execute(
                 `SELECT attendance_status, is_paid FROM staff_attendance
                  WHERE staff_id = ? AND record_date BETWEEN ? AND ? AND status = 'Approved'`,
@@ -127,7 +127,7 @@ async function generateStaffPayrollBatch(req, res) {
 
         if (!totalStaff) {
             await connection.rollback();
-            return res.status(400).json({ status: 'error', message: 'تعذر احتساب أي راتب لهذه الفترة' });
+            return res.status(400).json({ status: 'error', message: 'Could not calculate any salary for this period' });
         }
 
         await connection.execute(
@@ -136,11 +136,11 @@ async function generateStaffPayrollBatch(req, res) {
         );
 
         await connection.commit();
-        return res.status(201).json({ status: 'success', message: 'تم إنشاء كشف رواتب الموظفين الإداريين بنجاح', batch_id: batchId });
+        return res.status(201).json({ status: 'success', message: 'Staff payroll batch generated successfully', batch_id: batchId });
     } catch (error) {
         await connection.rollback();
         console.error('generateStaffPayrollBatch:', error);
-        return res.status(500).json({ status: 'error', message: 'فشل إنشاء كشف الرواتب' });
+        return res.status(500).json({ status: 'error', message: 'Failed to generate payroll batch' });
     } finally {
         connection.release();
     }
@@ -159,16 +159,16 @@ async function getStaffPayrollReport(req, res) {
         return res.json({ status: 'success', data: rows });
     } catch (error) {
         console.error('getStaffPayrollReport:', error);
-        return res.status(500).json({ status: 'error', message: 'فشل تحميل تقارير الرواتب' });
+        return res.status(500).json({ status: 'error', message: 'Failed to load payroll reports' });
     }
 }
 
 async function getStaffPayrollBatchDetails(req, res) {
     const batchId = Number(req.params.batchId);
-    if (!Number.isInteger(batchId) || batchId <= 0) return res.status(400).json({ status: 'error', message: 'رقم الكشف غير صالح' });
+    if (!Number.isInteger(batchId) || batchId <= 0) return res.status(400).json({ status: 'error', message: 'Invalid batch ID' });
     try {
         const [batches] = await pool.execute('SELECT * FROM staff_payroll_batches WHERE staff_payroll_batch_id = ?', [batchId]);
-        if (!batches.length) return res.status(404).json({ status: 'error', message: 'الكشف غير موجود' });
+        if (!batches.length) return res.status(404).json({ status: 'error', message: 'Payroll batch not found' });
 
         const [items] = await pool.execute(
             `SELECT sp.*, sm.full_name, sm.staff_unique_id
@@ -181,13 +181,13 @@ async function getStaffPayrollBatchDetails(req, res) {
         return res.json({ status: 'success', batch: batches[0], staff: items });
     } catch (error) {
         console.error('getStaffPayrollBatchDetails:', error);
-        return res.status(500).json({ status: 'error', message: 'فشل تحميل تفاصيل الكشف' });
+        return res.status(500).json({ status: 'error', message: 'Failed to load batch details' });
     }
 }
 
 async function markStaffBatchAsPaid(req, res) {
     const batchId = Number(req.params.batchId);
-    if (!Number.isInteger(batchId) || batchId <= 0) return res.status(400).json({ status: 'error', message: 'رقم الكشف غير صالح' });
+    if (!Number.isInteger(batchId) || batchId <= 0) return res.status(400).json({ status: 'error', message: 'Invalid batch ID' });
 
     const connection = await pool.getConnection();
     try {
@@ -198,19 +198,19 @@ async function markStaffBatchAsPaid(req, res) {
         );
         if (!batches.length) {
             await connection.rollback();
-            return res.status(404).json({ status: 'error', message: 'الكشف غير موجود' });
+            return res.status(404).json({ status: 'error', message: 'Payroll batch not found' });
         }
         if (batches[0].status === 'Paid') {
             await connection.rollback();
-            return res.status(409).json({ status: 'error', message: 'الكشف مدفوع بالفعل' });
+            return res.status(409).json({ status: 'error', message: 'Payroll batch is already paid' });
         }
         await connection.execute(`UPDATE staff_payroll_batches SET status = 'Paid' WHERE staff_payroll_batch_id = ?`, [batchId]);
         await connection.commit();
-        return res.json({ status: 'success', message: 'تم تعليم الكشف كمدفوع' });
+        return res.json({ status: 'success', message: 'Payroll batch marked as paid successfully' });
     } catch (error) {
         await connection.rollback();
         console.error('markStaffBatchAsPaid:', error);
-        return res.status(500).json({ status: 'error', message: 'فشل تحديث حالة الدفع' });
+        return res.status(500).json({ status: 'error', message: 'Failed to update payment status' });
     } finally {
         connection.release();
     }
