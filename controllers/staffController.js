@@ -1,5 +1,4 @@
 const db = require('../config/db');
-const bcrypt = require('bcryptjs');
 
 const DEFAULT_DAILY_HOURS = 8.00;
 
@@ -17,82 +16,65 @@ function parsePaidLeaveTypes(value) {
     return null;
 }
 
-// 1. جلب جميع الموظفين الإداريين
+// 1. Get all staff members
 exports.getAllStaff = async (req, res) => {
     try {
         const [rows] = await db.query(
             `SELECT sm.staff_id, sm.staff_unique_id, sm.full_name, sm.phone_number, sm.position,
                     sm.site_id, s.site_name, sm.hire_date, sm.monthly_salary, sm.standard_daily_hours,
-                    sm.paid_leave_types, sm.status, sm.created_at,
-                    u.user_id, u.username, u.status AS account_status
+                    sm.paid_leave_types, sm.status, sm.created_at
              FROM staff_members sm
-             JOIN users u ON u.user_id = sm.user_id
              LEFT JOIN sites s ON s.site_id = sm.site_id
              ORDER BY sm.created_at DESC`
         );
         return res.status(200).json({ status: 'success', results: rows.length, data: rows });
     } catch (error) {
         console.error('GET ALL STAFF ERROR:', error);
-        return res.status(500).json({ status: 'error', message: 'حدث خطأ أثناء جلب بيانات الموظفين الإداريين' });
+        return res.status(500).json({ status: 'error', message: 'An error occurred while fetching staff data' });
     }
 };
 
-// 2. إنشاء موظف إداري جديد (ينشئ حساب دخول بدور Staff + سجل staff_members في معاملة واحدة)
+// 2. Create a new staff member
 exports.createStaff = async (req, res) => {
     const {
-        username, password, full_name, phone_number, position,
+        full_name, phone_number, position,
         site_id, hire_date, monthly_salary, standard_daily_hours, paid_leave_types
     } = req.body;
 
-    if (!username || !password || !full_name || monthly_salary === undefined || monthly_salary === null) {
-        return res.status(400).json({ status: 'error', message: 'يرجى تعبئة اسم المستخدم وكلمة المرور والاسم الكامل والراتب الشهري' });
+    if (!full_name || monthly_salary === undefined || monthly_salary === null) {
+        return res.status(400).json({ status: 'error', message: 'Please provide the full name and monthly salary' });
     }
 
     const numericSalary = Number(monthly_salary);
     if (!Number.isFinite(numericSalary) || numericSalary < 0) {
-        return res.status(400).json({ status: 'error', message: 'الراتب الشهري غير صالح' });
+        return res.status(400).json({ status: 'error', message: 'Invalid monthly salary' });
     }
 
     const numericDailyHours = (standard_daily_hours !== undefined && standard_daily_hours !== null && standard_daily_hours !== '')
         ? Number(standard_daily_hours)
         : DEFAULT_DAILY_HOURS;
     if (!Number.isFinite(numericDailyHours) || numericDailyHours <= 0 || numericDailyHours > 24) {
-        return res.status(400).json({ status: 'error', message: 'عدد الساعات اليومية غير صالح' });
+        return res.status(400).json({ status: 'error', message: 'Invalid daily hours' });
     }
 
     const connection = await db.getConnection();
     try {
         await connection.beginTransaction();
 
-        const [existingUsername] = await connection.query('SELECT user_id FROM users WHERE username = ?', [username]);
-        if (existingUsername.length > 0) {
-            throw Object.assign(new Error('اسم المستخدم هذا مستخدم بالفعل'), { isOperational: true });
-        }
-
         if (site_id) {
             const [siteRows] = await connection.query('SELECT site_id FROM sites WHERE site_id = ? LIMIT 1', [site_id]);
             if (siteRows.length === 0) {
-                throw Object.assign(new Error('الموقع المحدد غير موجود'), { isOperational: true });
+                throw Object.assign(new Error('The specified site does not exist'), { isOperational: true });
             }
         }
 
-        const passwordHash = await bcrypt.hash(password, 10);
-
-        // ملاحظة: role = 'Staff' يتطلب توسيع ENUM حقل users.role (موجود ضمن ملف الـ SQL المرفق)
-        const [userResult] = await connection.query(
-            `INSERT INTO users (username, password_hash, full_name, role, status)
-             VALUES (?, ?, ?, 'Staff', 'Active')`,
-            [username, passwordHash, full_name]
-        );
-        const newUserId = userResult.insertId;
-
         const [staffResult] = await connection.query(
             `INSERT INTO staff_members
-                (user_id, staff_unique_id, full_name, phone_number, position, site_id,
+                (staff_unique_id, full_name, phone_number, position, site_id,
                  hire_date, monthly_salary, standard_daily_hours, paid_leave_types, status)
-             VALUES (?, 'TEMP', ?, ?, ?, ?, ?, ?, ?, ?, 'Active')`,
+             VALUES ('TEMP', ?, ?, ?, ?, ?, ?, ?, ?, 'Active')`,
             [
-                newUserId, full_name, phone_number || null, position || null, site_id || null,
+                full_name, phone_number || null, position || null, site_id || null,
                 hire_date || null, numericSalary, numericDailyHours, parsePaidLeaveTypes(paid_leave_types)
             ]
         );
@@ -104,8 +86,8 @@ exports.createStaff = async (req, res) => {
 
         return res.status(201).json({
             status: 'success',
-            message: 'تم إنشاء الموظف الإداري بنجاح',
-            data: { staff_id: newStaffId, staff_unique_id: staffUniqueId, user_id: newUserId }
+            message: 'Staff member created successfully',
+            data: { staff_id: newStaffId, staff_unique_id: staffUniqueId }
         });
     } catch (error) {
         await connection.rollback();
@@ -113,19 +95,19 @@ exports.createStaff = async (req, res) => {
         const status = error.isOperational ? 400 : 500;
         return res.status(status).json({
             status: 'error',
-            message: error.isOperational ? error.message : 'حدث خطأ في السيرفر أثناء إضافة الموظف الإداري'
+            message: error.isOperational ? error.message : 'Server error while adding the staff member'
         });
     } finally {
         connection.release();
     }
 };
 
-// 3. تعديل بيانات موظف إداري (وتعديل اسم المستخدم/الاسم الكامل المرتبط بحساب الدخول عند الحاجة)
+// 3. Update staff member data
 exports.updateStaff = async (req, res) => {
     const { id } = req.params; // staff_id
     const {
         full_name, phone_number, position, site_id, hire_date,
-        monthly_salary, standard_daily_hours, paid_leave_types, username
+        monthly_salary, standard_daily_hours, paid_leave_types
     } = req.body;
 
     const connection = await db.getConnection();
@@ -134,14 +116,14 @@ exports.updateStaff = async (req, res) => {
 
         const [existing] = await connection.query('SELECT * FROM staff_members WHERE staff_id = ? LIMIT 1', [id]);
         if (existing.length === 0) {
-            throw Object.assign(new Error('الموظف الإداري غير موجود'), { isOperational: true });
+            throw Object.assign(new Error('Staff member not found'), { isOperational: true });
         }
         const current = existing[0];
 
         if (site_id !== undefined && site_id !== null && site_id !== '') {
             const [siteRows] = await connection.query('SELECT site_id FROM sites WHERE site_id = ? LIMIT 1', [site_id]);
             if (siteRows.length === 0) {
-                throw Object.assign(new Error('الموقع المحدد غير موجود'), { isOperational: true });
+                throw Object.assign(new Error('The specified site does not exist'), { isOperational: true });
             }
         }
 
@@ -149,7 +131,7 @@ exports.updateStaff = async (req, res) => {
         if (monthly_salary !== undefined && monthly_salary !== null && monthly_salary !== '') {
             numericSalary = Number(monthly_salary);
             if (!Number.isFinite(numericSalary) || numericSalary < 0) {
-                throw Object.assign(new Error('الراتب الشهري غير صالح'), { isOperational: true });
+                throw Object.assign(new Error('Invalid monthly salary'), { isOperational: true });
             }
         }
 
@@ -157,7 +139,7 @@ exports.updateStaff = async (req, res) => {
         if (standard_daily_hours !== undefined && standard_daily_hours !== null && standard_daily_hours !== '') {
             numericDailyHours = Number(standard_daily_hours);
             if (!Number.isFinite(numericDailyHours) || numericDailyHours <= 0 || numericDailyHours > 24) {
-                throw Object.assign(new Error('عدد الساعات اليومية غير صالح'), { isOperational: true });
+                throw Object.assign(new Error('Invalid daily hours'), { isOperational: true });
             }
         }
 
@@ -179,69 +161,41 @@ exports.updateStaff = async (req, res) => {
             ]
         );
 
-        if (username && username.trim() !== '') {
-            const [dupe] = await connection.query(
-                'SELECT user_id FROM users WHERE username = ? AND user_id != ?',
-                [username.trim(), current.user_id]
-            );
-            if (dupe.length > 0) {
-                throw Object.assign(new Error('اسم المستخدم الجديد مستخدم من قبل حساب آخر'), { isOperational: true });
-            }
-            await connection.query(
-                'UPDATE users SET username = ?, full_name = ? WHERE user_id = ?',
-                [username.trim(), full_name || current.full_name, current.user_id]
-            );
-        } else if (full_name) {
-            await connection.query('UPDATE users SET full_name = ? WHERE user_id = ?', [full_name, current.user_id]);
-        }
-
         await connection.commit();
-        return res.status(200).json({ status: 'success', message: 'تم تحديث بيانات الموظف الإداري بنجاح' });
+        return res.status(200).json({ status: 'success', message: 'Staff member updated successfully' });
     } catch (error) {
         await connection.rollback();
         console.error('UPDATE STAFF ERROR:', error);
         const status = error.isOperational ? 400 : 500;
         return res.status(status).json({
             status: 'error',
-            message: error.isOperational ? error.message : 'حدث خطأ أثناء تعديل بيانات الموظف الإداري'
+            message: error.isOperational ? error.message : 'An error occurred while updating the staff member'
         });
     } finally {
         connection.release();
     }
 };
 
-// 4. تفعيل/تعطيل الموظف الإداري (يعطّل حساب الدخول أيضاً بنفس الوقت)
+// 4. Toggle staff member status (Active/Inactive)
 exports.toggleStaffStatus = async (req, res) => {
     const { id } = req.params;
     const { status } = req.body;
 
     if (!status || !['Active', 'Inactive'].includes(status)) {
-        return res.status(400).json({ status: 'error', message: 'الحالة يجب أن تكون Active أو Inactive' });
+        return res.status(400).json({ status: 'error', message: 'Status must be either Active or Inactive' });
     }
 
-    const connection = await db.getConnection();
     try {
-        await connection.beginTransaction();
-
-        const [existing] = await connection.query('SELECT user_id FROM staff_members WHERE staff_id = ? LIMIT 1', [id]);
+        const [existing] = await db.query('SELECT staff_id FROM staff_members WHERE staff_id = ? LIMIT 1', [id]);
         if (existing.length === 0) {
-            throw Object.assign(new Error('الموظف الإداري غير موجود'), { isOperational: true });
+            return res.status(404).json({ status: 'error', message: 'Staff member not found' });
         }
 
-        await connection.query('UPDATE staff_members SET status = ? WHERE staff_id = ?', [status, id]);
-        await connection.query('UPDATE users SET status = ? WHERE user_id = ?', [status, existing[0].user_id]);
+        await db.query('UPDATE staff_members SET status = ? WHERE staff_id = ?', [status, id]);
 
-        await connection.commit();
-        return res.status(200).json({ status: 'success', message: `تم تغيير حالة الموظف الإداري إلى ${status}` });
+        return res.status(200).json({ status: 'success', message: `Staff member status changed to ${status}` });
     } catch (error) {
-        await connection.rollback();
         console.error('TOGGLE STAFF STATUS ERROR:', error);
-        const httpStatus = error.isOperational ? 400 : 500;
-        return res.status(httpStatus).json({
-            status: 'error',
-            message: error.isOperational ? error.message : 'حدث خطأ أثناء تعديل حالة الموظف الإداري'
-        });
-    } finally {
-        connection.release();
+        return res.status(500).json({ status: 'error', message: 'An error occurred while updating staff member status' });
     }
 };
