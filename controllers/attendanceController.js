@@ -819,12 +819,14 @@ const [missingLunch] = await connection.execute(
     [siteId, record_date, record_date]
 );
 if (missingLunch.length > 0) {
-    await connection.rollback();
-    connection.release();
     const names = missingLunch.map(r => r.full_name).join(', ');
-    return res.status(400).json({
-        status: 'error',
-        message: `Lunch time must be set for the following workers before submitting the day: ${names}`
+    
+    // نرجع حالة تحذير (warning) بدل خطأ 400، ونسمح للمستخدم يكمل إذا بدو
+    return res.status(200).json({
+        status: 'warning',
+        requires_confirmation: true,
+        message: `Warning: Lunch time is missing for: ${names}. Do you still want to submit?`,
+        missing_workers: missingLunch.map(r => r.full_name)
     });
 }
         // 3. بعد نجاح الفحوصات، نقوم بإدخال سجلات الغياب للذين لم يسجلوا حضوراً

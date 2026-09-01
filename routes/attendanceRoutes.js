@@ -17,11 +17,9 @@ router.post('/lunch/bulk', attendanceController.saveLunchBulk);
 router.get('/rejected', restrictTo('Admin', 'Supervisor'), attendanceController.getRejectedRecords);
 router.patch('/:attendance_id/management-leave', restrictTo('Admin'), attendanceController.setManagementLeaveHours);
 router.patch('/:attendance_id/resubmit', restrictTo('Supervisor'), attendanceController.resubmitAttendance);
-router.post('/bulk/checkin', attendanceController.bulkCheckIn);
-router.post(
-  '/bulk/checkout',
-  attendanceController.bulkCheckOut
-);
+// attendanceRoutes.js
+router.post('/bulk/checkin', restrictTo('Admin', 'Supervisor'), attendanceController.bulkCheckIn);
+router.post('/bulk/checkout', restrictTo('Admin', 'Supervisor'), attendanceController.bulkCheckOut);
 
 
 module.exports = router;
