@@ -218,21 +218,27 @@ async function generatePayrollBatch(req, res) {
       const payrollId = payrollResult.insertId;
 
       for (const item of worker.breakdown) {
+        const isDaily = item.payType === 'Daily';
         await connection.execute(
           `INSERT INTO payrollitems
             (payroll_id, contract_id, site_id, pay_type, hourly_rate_snapshot,
              overtime_hourly_rate_snapshot, daily_rate_snapshot, days_worked,
              regular_hours_worked, overtime_hours_worked, base_salary, overtime_pay)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
-            payrollId, item.contractId, item.siteId, item.payType,
-            item.payType === 'Hourly' ? item.hourlyRate : null,
-            item.payType === 'Hourly' ? item.overtimeRate : null,
-            item.payType === 'Daily' ? item.dailyRate : null,
-            item.payType === 'Daily' ? item.daysWorked : null,
-            item.payType === 'Hourly' ? item.regularHours : null,
-            item.payType === 'Hourly' ? item.overtimeHours : null,
-            item.baseSalary, item.overtimePay
+            payrollId, 
+            item.contractId, 
+            item.siteId, 
+            item.payType,
+            // إذا كان يومي، ضع الحقول الخاصة بالساعة null والعكس صحيح
+            !isDaily ? item.hourlyRate : null,
+            !isDaily ? item.overtimeRate : null,
+            isDaily ? item.dailyRate : null,
+            isDaily ? item.daysWorked : null,
+            !isDaily ? item.regularHours : null,
+            !isDaily ? item.overtimeHours : null,
+            item.baseSalary, 
+            item.overtimePay
           ]
         );
       }
