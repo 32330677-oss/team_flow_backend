@@ -1,3 +1,6 @@
+const express = require('express');
+const router = express.Router();
+
 const staffController = require('../controllers/staffController');
 const staffLifecycleController = require('../controllers/staffLifecycleController');
 const staffAssignmentController = require('../controllers/staffAssignmentController');
