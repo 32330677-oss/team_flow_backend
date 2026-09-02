@@ -797,8 +797,7 @@ exports.submitDay = async (req, res) => {
                     OR record_date = DATE_SUB(?, INTERVAL 1 DAY)
                )
                AND check_in_time IS NOT NULL
-               AND check_out_time IS NULL
-             FOR UPDATE`,
+               AND check_out_time IS NULL`,
             [siteId, record_date, record_date]
         );
 
