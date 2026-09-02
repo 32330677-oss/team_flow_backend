@@ -13,7 +13,7 @@ function money(value) {
 // ============================================================
 // Replace generatePayrollBatch entirely
 // ============================================================
-const pool = require('../config/db');
+
 const settingsCache = require('../services/settingsCache'); // NEW: needed for the standard-hours fallback
 
 const DEFAULT_STANDARD_MINUTES = 600; // fallback: 10 hours, matches system default
@@ -288,9 +288,6 @@ async function generatePayrollBatch(req, res) {
   }
 }
 
-// ============================================================
-// getPayrollReport — unchanged (no pay_type needed at this level)
-// ============================================================
 async function getPayrollReport(req, res) {
   try {
     const { site_id } = req.query;
