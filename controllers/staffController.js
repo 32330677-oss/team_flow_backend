@@ -78,9 +78,9 @@ exports.createStaff = async (req, res) => {
                 hire_date || null, numericSalary, numericDailyHours, parsePaidLeaveTypes(paid_leave_types)
             ]
         );
-        const newStaffId = staffResult.insertId;
-        const staffUniqueId = `STF-${newStaffId}`;
-        await connection.query('UPDATE staff_members SET staff_unique_id = ? WHERE staff_id = ?', [staffUniqueId, newStaffId]);
+const newStaffId = staffResult.insertId;
+const staffUniqueId = `STF-${10000 + newStaffId}`;
+await connection.query('UPDATE staff_members SET staff_unique_id = ? WHERE staff_id = ?', [staffUniqueId, newStaffId]);
 
         await connection.commit();
 
