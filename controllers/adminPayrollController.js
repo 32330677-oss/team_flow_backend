@@ -13,6 +13,21 @@ function money(value) {
 // ============================================================
 // Replace generatePayrollBatch entirely
 // ============================================================
+const pool = require('../config/db');
+const settingsCache = require('../services/settingsCache'); // NEW: needed for the standard-hours fallback
+
+const DEFAULT_STANDARD_MINUTES = 600; // fallback: 10 hours, matches system default
+
+function isValidDate(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(value || '')) && !Number.isNaN(Date.parse(`${value}T00:00:00`));
+}
+function isSpecificSite(value) {
+  return value !== undefined && value !== null && !['', 'null', '0', 'All'].includes(String(value));
+}
+function money(value) {
+  return Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
+}
+
 async function generatePayrollBatch(req, res) {
   const { start_date, end_date, site_id } = req.body || {};
   const userId = req.user?.user_id;
@@ -30,7 +45,7 @@ async function generatePayrollBatch(req, res) {
     await connection.beginTransaction();
     const scopedSite = isSpecificSite(site_id);
 
-    // --- overlap check (unchanged from existing FIX #3) ---
+    // --- overlap check (unchanged) ---
     const overlapParams = [end_date, start_date];
     let overlapSql = `
       SELECT DISTINCT pb.payroll_batch_id
@@ -46,14 +61,14 @@ async function generatePayrollBatch(req, res) {
       return res.status(409).json({ success: false, message: 'An overlapping payroll batch already exists for this scope.' });
     }
 
-    // --- fetch every APPROVED attendance record in the period, per worker ---
-    // We no longer pull rate from contracts. We attribute site via the
-    // worker's assignment active on the attendance date (unchanged),
-    // but the RATE comes from workercompensationhistory effective on that date.
+    // NOTE: added a.attendance_status + a.standard_minutes_snapshot.
+    // We need these two to correctly prorate Daily-rate workers by actual
+    // hours worked instead of paying a full day for any approved record.
     const attParams = [start_date, end_date];
     let attSql = `
       SELECT a.attendance_id, a.worker_id, w.full_name AS worker_name, w.payment_type,
              a.record_date, a.site_id, a.total_working_hours, a.overtime_hours,
+             a.attendance_status, a.standard_minutes_snapshot,
              wsa.contract_id
       FROM attendance a
       JOIN workers w ON w.worker_id = a.worker_id AND w.status = 'Active'
@@ -74,7 +89,6 @@ async function generatePayrollBatch(req, res) {
       return res.status(404).json({ success: false, message: 'No Approved attendance found for this period.' });
     }
 
-    // --- preload compensation history per worker (small dataset, cached per batch) ---
     const workerIds = [...new Set(attendanceRows.map(r => r.worker_id))];
     const [compRows] = await connection.query(
       `SELECT worker_id, payment_type, daily_rate, regular_hourly_rate, overtime_hourly_rate,
@@ -97,9 +111,12 @@ async function generatePayrollBatch(req, res) {
       ) || null;
     }
 
-    // --- accumulate per (worker, site, contract, rate-snapshot) group ---
-    // Key includes the rate values so a rate change mid-period creates a
-    // separate payrollitems row with its own snapshot (section 18/20).
+    // Fallback standard minutes used only when a record has no snapshot
+    // (very old records created before this tracking existed).
+    const fallbackStandardMinutes =
+      Number(await settingsCache.getSetting('standard_work_minutes', String(DEFAULT_STANDARD_MINUTES))) ||
+      DEFAULT_STANDARD_MINUTES;
+
     const groups = new Map();
     const byWorker = new Map();
 
@@ -111,9 +128,6 @@ async function generatePayrollBatch(req, res) {
           success: false,
           message: `No compensation record found for worker_id=${rec.worker_id} on ${rec.record_date}. Cannot generate payroll.`
         });
-      }
-      if (comp.payment_type !== rec.payment_type) {
-        // Worker's current flag drifted from history — trust history for payroll accuracy
       }
 
       const groupKey = comp.payment_type === 'Daily'
@@ -129,14 +143,31 @@ async function generatePayrollBatch(req, res) {
           daily_rate: comp.daily_rate,
           regular_hourly_rate: comp.regular_hourly_rate,
           overtime_hourly_rate: comp.overtime_hourly_rate,
-          days_worked: 0,
+          days_worked: 0,     // now stores PAID day-equivalents (can be fractional, e.g. 0.5)
           regular_hours: 0,
           overtime_hours: 0,
         });
       }
       const g = groups.get(groupKey);
+
       if (comp.payment_type === 'Daily') {
-        g.days_worked += 1; // one approved attendance record = one working day
+        // ============ THE ACTUAL FIX ============
+        let dayFraction;
+        if (rec.attendance_status === 'Absent') {
+          dayFraction = 0; // غياب معتمد = بدون أجر
+        } else if (['Sick', 'Vacation', 'Holiday'].includes(rec.attendance_status)) {
+          dayFraction = 1; // إجازة معتمدة = يوم كامل (عدّل هون إذا سياستكم مختلفة)
+        } else {
+          // حضور فعلي (Present) -> النسبة = الساعات المشتغولة ÷ الساعات القياسية لليوم
+          const standardMinutes = Number(rec.standard_minutes_snapshot) > 0
+            ? Number(rec.standard_minutes_snapshot)
+            : fallbackStandardMinutes;
+          const standardHours = standardMinutes / 60;
+          const workedHours = Number(rec.total_working_hours || 0);
+          dayFraction = standardHours > 0 ? Math.min(1, workedHours / standardHours) : 0;
+        }
+        g.days_worked += dayFraction;
+        // =========================================
       } else {
         g.regular_hours += Number(rec.total_working_hours || 0);
         g.overtime_hours += Number(rec.overtime_hours || 0);
@@ -147,7 +178,6 @@ async function generatePayrollBatch(req, res) {
       }
     }
 
-    // --- compute money per group and attach to worker ---
     for (const g of groups.values()) {
       let baseSalary = 0;
       let overtimePay = 0;
@@ -157,7 +187,7 @@ async function generatePayrollBatch(req, res) {
           throw new Error(`Invalid daily_rate for worker ${g.worker_id}`);
         }
         baseSalary = money(g.days_worked * Number(g.daily_rate));
-        overtimePay = 0; // Section 5: Daily workers never get overtime pay
+        overtimePay = 0; // Daily workers never get overtime pay
       } else {
         const regularRate = Number(g.regular_hourly_rate);
         const overtimeRate = Number(g.overtime_hourly_rate);
@@ -178,7 +208,7 @@ async function generatePayrollBatch(req, res) {
         dailyRate: g.daily_rate,
         hourlyRate: g.regular_hourly_rate,
         overtimeRate: g.overtime_hourly_rate,
-        daysWorked: g.days_worked,
+        daysWorked: Number(g.days_worked.toFixed(2)),
         regularHours: g.regular_hours,
         overtimeHours: g.overtime_hours,
         baseSalary,
@@ -187,7 +217,6 @@ async function generatePayrollBatch(req, res) {
       worker.gross = money(worker.gross + baseSalary + overtimePay);
     }
 
-    // Drop workers whose total ended up 0
     for (const [workerId, worker] of [...byWorker.entries()]) {
       if (worker.breakdown.length === 0) byWorker.delete(workerId);
     }
@@ -196,7 +225,6 @@ async function generatePayrollBatch(req, res) {
       return res.status(404).json({ success: false, message: 'No payable attendance found for this period.' });
     }
 
-    // --- persist batch / payroll / payrollitems ---
     const [batchResult] = await connection.execute(
       `INSERT INTO payrollbatches (start_date, end_date, generated_by_user_id, status)
        VALUES (?, ?, ?, 'Generated')`,
@@ -226,18 +254,17 @@ async function generatePayrollBatch(req, res) {
              regular_hours_worked, overtime_hours_worked, base_salary, overtime_pay)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
-            payrollId, 
-            item.contractId, 
-            item.siteId, 
+            payrollId,
+            item.contractId,
+            item.siteId,
             item.payType,
-            // إذا كان يومي، ضع الحقول الخاصة بالساعة null والعكس صحيح
             !isDaily ? item.hourlyRate : null,
             !isDaily ? item.overtimeRate : null,
             isDaily ? item.dailyRate : null,
-            isDaily ? item.daysWorked : null,
+            isDaily ? item.daysWorked : null, // الآن رقم عشري ممكن (0.5 مثلاً)
             !isDaily ? item.regularHours : null,
             !isDaily ? item.overtimeHours : null,
-            item.baseSalary, 
+            item.baseSalary,
             item.overtimePay
           ]
         );
@@ -530,11 +557,6 @@ async function exportPayrollExcel(req, res) {
     if (!res.headersSent) return res.status(500).json({ success: false, message: 'Failed to export Excel payroll report.' });
   }
 }
-
-// exportDailyAttendanceExcel — unchanged, keep as-is (attendance-only, no salary math)
-// ضع هذه الدالة كاملة بدل الدالة الفارغة exportDailyAttendanceExcel
-// في ملف controllers/adminPayrollController.js
-
 async function exportDailyAttendanceExcel(req, res) {
   const { date, site_id } = req.query || {};
   if (!isValidDate(date)) {
