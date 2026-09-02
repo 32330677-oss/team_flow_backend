@@ -752,158 +752,321 @@ exports.saveLunchBulk = async (req, res) => {
         return res.status(status).json({ status: 'error', message: error.isOperational ? error.message : 'An error occurred while saving lunch times.' });
     }
 };
-
 exports.submitDay = async (req, res) => {
     const { siteId, record_date } = req.body;
-    if (!siteId || !isValidDateOnly(record_date)) return res.status(400).json({ status: 'error', message: 'Site and valid record_date are required.' });
 
-    // 1. فتح اتصال جديد خاص بهذه المعاملة (Transaction Connection)
+    if (!siteId || !isValidDateOnly(record_date)) {
+        return res.status(400).json({
+            status: 'error',
+            message: 'Site and valid record_date are required.'
+        });
+    }
+
+    // فتح اتصال خاص بهذه الـ Transaction
     const connection = await db.getConnection();
 
+    let transactionStarted = false;
+
     try {
+        // 1. التحقق من صلاحية المستخدم قبل بدء الـ Transaction
         if (!(await verifySiteAction(req, siteId))) {
             connection.release();
-            return res.status(403).json({ status: 'error', message: 'You are not authorized to submit this site.' });
+
+            return res.status(403).json({
+                status: 'error',
+                message: 'You are not authorized to submit this site.'
+            });
         }
 
-        // بدء المعاملة
+        // 2. بدء الـ Transaction
         await connection.beginTransaction();
+        transactionStarted = true;
 
-        // 2. الفحوصات أولاً (قبل أي عملية إدخال أو تعديل) لتجنب ترك بيانات تالفة عند الفشل
+        // =========================================================
+        // 3. التحقق من وجود Shifts مفتوحة
+        // =========================================================
+        // FOR UPDATE يبقى هنا لأن هذا هو فحص الـ concurrency المهم:
+        // نريد منع Transaction أخرى من تغيير هذه السجلات أثناء عملية Submit.
         const [openRecords] = await connection.execute(
             `SELECT attendance_id
              FROM attendance
-             WHERE site_id = ? AND status = 'Draft'
-               AND (record_date = ?
-                    OR record_date = DATE_SUB(?, INTERVAL 1 DAY))
-               AND check_in_time IS NOT NULL AND check_out_time IS NULL
+             WHERE site_id = ?
+               AND status = 'Draft'
+               AND (
+                    record_date = ?
+                    OR record_date = DATE_SUB(?, INTERVAL 1 DAY)
+               )
+               AND check_in_time IS NOT NULL
+               AND check_out_time IS NULL
              FOR UPDATE`,
             [siteId, record_date, record_date]
         );
+
         if (openRecords.length > 0) {
             await connection.rollback();
-            connection.release();
-            return res.status(400).json({ status: 'error', message: 'All checked-in workers must check out before submitting the day.' });
+            transactionStarted = false;
+
+            return res.status(400).json({
+                status: 'error',
+                message: 'All checked-in workers must check out before submitting the day.'
+            });
         }
 
+        // =========================================================
+        // 4. التحقق من وجود Break مفتوح
+        // =========================================================
+        // لا نحتاج FOR UPDATE هنا لأننا فقط نتحقق من وجود سجل.
         const [openLeaves] = await connection.execute(
             `SELECT a.attendance_id
              FROM attendance a
-             JOIN attendanceleaveperiods alp ON alp.attendance_id = a.attendance_id
-             WHERE a.site_id = ? AND a.status = 'Draft'
-               AND (a.record_date = ?
-                    OR a.record_date = DATE_SUB(?, INTERVAL 1 DAY))
+             JOIN attendanceleaveperiods alp
+                  ON alp.attendance_id = a.attendance_id
+             WHERE a.site_id = ?
+               AND a.status = 'Draft'
+               AND (
+                    a.record_date = ?
+                    OR a.record_date = DATE_SUB(?, INTERVAL 1 DAY)
+               )
                AND alp.leave_end_time IS NULL
-             LIMIT 1 FOR UPDATE`,
+             LIMIT 1`,
             [siteId, record_date, record_date]
         );
+
         if (openLeaves.length > 0) {
             await connection.rollback();
-            connection.release();
-            return res.status(400).json({ status: 'error', message: 'All breaks must be ended before submitting the day.' });
-        }
-// 2.5. التحقق من أن جميع الشيفتات المكتملة عندها سجل غداء (Lunch) مسجّل
-// 2.5. التحقق من أن جميع الشيفتات المكتملة عندها سجل غداء (Lunch) مسجّل
-const [missingLunch] = await connection.execute(
-    `SELECT a.attendance_id, w.full_name
-     FROM attendance a
-     JOIN workers w ON w.worker_id = a.worker_id
-     LEFT JOIN attendanceleaveperiods alp
-          ON alp.attendance_id = a.attendance_id
-         AND alp.leave_type = 'Lunch'
-     WHERE a.site_id = ? AND a.status = 'Draft'
-       AND (a.record_date = ?
-            OR a.record_date = DATE_SUB(?, INTERVAL 1 DAY))
-       AND a.check_in_time IS NOT NULL AND a.check_out_time IS NOT NULL
-       AND alp.leave_id IS NULL
-     FOR UPDATE`,
-    [siteId, record_date, record_date]
-);
+            transactionStarted = false;
 
-if (missingLunch.length > 0) {
-    // ضعهم هنا تماماً قبل إرجاع الـ Response
-    await connection.rollback();
-    connection.release();
-    
-    const names = missingLunch.map(r => r.full_name).join(', ');
-    
-    return res.status(200).json({
-        status: 'warning',
-        requires_confirmation: true,
-        message: `Warning: Lunch time is missing for: ${names}. Do you still want to submit?`,
-        missing_workers: missingLunch.map(r => r.full_name)
-    });
-}
-        // 3. بعد نجاح الفحوصات، نقوم بإدخال سجلات الغياب للذين لم يسجلوا حضوراً
+            return res.status(400).json({
+                status: 'error',
+                message: 'All breaks must be ended before submitting the day.'
+            });
+        }
+
+        // =========================================================
+        // 5. التحقق من Missing Lunch
+        // =========================================================
+        // هذا مجرد Validation، لذلك لا نستخدم FOR UPDATE.
+        const [missingLunch] = await connection.execute(
+            `SELECT a.attendance_id, w.full_name
+             FROM attendance a
+             JOIN workers w
+                  ON w.worker_id = a.worker_id
+             LEFT JOIN attendanceleaveperiods alp
+                  ON alp.attendance_id = a.attendance_id
+                 AND alp.leave_type = 'Lunch'
+             WHERE a.site_id = ?
+               AND a.status = 'Draft'
+               AND (
+                    a.record_date = ?
+                    OR a.record_date = DATE_SUB(?, INTERVAL 1 DAY)
+               )
+               AND a.check_in_time IS NOT NULL
+               AND a.check_out_time IS NOT NULL
+               AND alp.leave_id IS NULL`,
+            [siteId, record_date, record_date]
+        );
+
+        if (missingLunch.length > 0) {
+            await connection.rollback();
+            transactionStarted = false;
+
+            const names = missingLunch
+                .map(row => row.full_name)
+                .join(', ');
+
+            return res.status(200).json({
+                status: 'warning',
+                requires_confirmation: true,
+                message: `Warning: Lunch time is missing for: ${names}. Do you still want to submit?`,
+                missing_workers: missingLunch.map(row => row.full_name)
+            });
+        }
+
+        // =========================================================
+        // 6. إنشاء سجلات الغياب للعمال الذين لم يسجلوا حضوراً
+        // =========================================================
         await connection.execute(
             `INSERT INTO attendance
-                (worker_id, site_id, record_date, attendance_status, status, recorded_by_user_id, remarks)
-             SELECT w.worker_id, wsa.site_id, ?, 'Absent', 'Draft', ?, 'Absent - no check-in recorded'
+                (
+                    worker_id,
+                    site_id,
+                    record_date,
+                    attendance_status,
+                    status,
+                    recorded_by_user_id,
+                    remarks
+                )
+             SELECT
+                    w.worker_id,
+                    wsa.site_id,
+                    ?,
+                    'Absent',
+                    'Draft',
+                    ?,
+                    'Absent - no check-in recorded'
              FROM workers w
-             JOIN workersiteassignments wsa ON wsa.worker_id = w.worker_id
+             JOIN workersiteassignments wsa
+                  ON wsa.worker_id = w.worker_id
              LEFT JOIN attendance a
-               ON a.worker_id = w.worker_id
-              AND a.site_id = wsa.site_id
-              AND a.record_date = ?
+                  ON a.worker_id = w.worker_id
+                 AND a.site_id = wsa.site_id
+                 AND a.record_date = ?
              WHERE wsa.site_id = ?
                AND wsa.unassigned_date IS NULL
                AND w.status = 'Active'
                AND a.attendance_id IS NULL`,
-            [record_date, req.user.user_id, record_date, siteId]
+            [
+                record_date,
+                req.user.user_id,
+                record_date,
+                siteId
+            ]
         );
 
-        // 4. جلب كل السجلات الجاهزة للإرسال
+        // =========================================================
+        // 7. جلب كل سجلات اليوم الجاهزة للإرسال
+        // =========================================================
         const [records] = await connection.execute(
-            `SELECT attendance_id, attendance_status
+            `SELECT
+                    attendance_id,
+                    attendance_status
              FROM attendance
-             WHERE site_id = ? AND status = 'Draft'
-               AND (record_date = ?
-                    OR (record_date = DATE_SUB(?, INTERVAL 1 DAY)
-                        AND check_in_time IS NOT NULL AND check_out_time IS NOT NULL))
-               AND ((check_in_time IS NOT NULL AND check_out_time IS NOT NULL)
-                    OR attendance_status IN ('Absent', 'Sick', 'Vacation', 'Holiday'))`,
+             WHERE site_id = ?
+               AND status = 'Draft'
+               AND (
+                    record_date = ?
+                    OR (
+                        record_date = DATE_SUB(?, INTERVAL 1 DAY)
+                        AND check_in_time IS NOT NULL
+                        AND check_out_time IS NOT NULL
+                    )
+               )
+               AND (
+                    (
+                        check_in_time IS NOT NULL
+                        AND check_out_time IS NOT NULL
+                    )
+                    OR attendance_status IN (
+                        'Absent',
+                        'Sick',
+                        'Vacation',
+                        'Holiday'
+                    )
+               )`,
             [siteId, record_date, record_date]
         );
-        
+
         if (records.length === 0) {
             await connection.rollback();
-            connection.release();
-            return res.status(400).json({ status: 'error', message: 'No completed attendance records found for today.' });
+            transactionStarted = false;
+
+            return res.status(400).json({
+                status: 'error',
+                message: 'No completed attendance records found for today.'
+            });
         }
 
+        // =========================================================
+        // 8. حساب الساعات + تحويل Draft إلى Submitted
+        // =========================================================
         for (const record of records) {
-            if (!['Absent', 'Sick', 'Vacation', 'Holiday'].includes(record.attendance_status)) {
-                await attendanceService.calculateWorkingHours(record.attendance_id, connection);
+
+            // الحالات التي لا تحتاج حساب ساعات
+            if (
+                ![
+                    'Absent',
+                    'Sick',
+                    'Vacation',
+                    'Holiday'
+                ].includes(record.attendance_status)
+            ) {
+                await attendanceService.calculateWorkingHours(
+                    record.attendance_id,
+                    connection
+                );
             }
+
+            // تحويل السجل إلى Submitted
             const [submitted] = await connection.execute(
                 `UPDATE attendance
-                 SET status = 'Submitted', updated_at = NOW()
-                 WHERE attendance_id = ? AND status = 'Draft'`,
+                 SET status = 'Submitted',
+                     updated_at = NOW()
+                 WHERE attendance_id = ?
+                   AND status = 'Draft'`,
                 [record.attendance_id]
             );
+
             if (submitted.affectedRows !== 1) {
-                throw new AppError(`Attendance ${record.attendance_id} was changed by another request.`);
+                throw new AppError(
+                    `Attendance ${record.attendance_id} was changed by another request.`
+                );
             }
+
+            // تسجيل العملية في Audit Log
             await connection.execute(
-                `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
-                 VALUES ('attendance', ?, 'SUBMITTED', ?, ?, ?)`,
-                [record.attendance_id, req.user.user_id,
-                 JSON.stringify({ status: 'Draft' }),
-                 JSON.stringify({ status: 'Submitted' })]
+                `INSERT INTO auditlogs
+                    (
+                        table_name,
+                        record_id,
+                        action_type,
+                        user_id,
+                        old_values,
+                        new_values
+                    )
+                 VALUES
+                    (
+                        'attendance',
+                        ?,
+                        'SUBMITTED',
+                        ?,
+                        ?,
+                        ?
+                    )`,
+                [
+                    record.attendance_id,
+                    req.user.user_id,
+                    JSON.stringify({
+                        status: 'Draft'
+                    }),
+                    JSON.stringify({
+                        status: 'Submitted'
+                    })
+                ]
             );
         }
 
+        // =========================================================
+        // 9. Commit
+        // =========================================================
         await connection.commit();
-        connection.release();
-        
-        return res.status(200).json({ status: 'success', message: 'Day submitted for review successfully' });
+        transactionStarted = false;
+
+        return res.status(200).json({
+            status: 'success',
+            message: 'Day submitted for review successfully'
+        });
 
     } catch (error) {
-        await connection.rollback();
-        connection.release();
-        
+
+        // Rollback فقط إذا كنا فعلاً داخل Transaction
+        if (transactionStarted) {
+            try {
+                await connection.rollback();
+            } catch (rollbackError) {
+                console.error('ROLLBACK ERROR:', rollbackError);
+            }
+        }
+
         console.error('SUBMIT DAY ERROR:', error);
-        return res.status(500).json({ status: 'error', message: 'An error occurred while submitting the day, please try again.' });
+
+        return res.status(500).json({
+            status: 'error',
+            message: 'An error occurred while submitting the day, please try again.'
+        });
+
+    } finally {
+        // تحرير الاتصال دائماً، ومرة واحدة فقط
+        connection.release();
     }
 };
 
