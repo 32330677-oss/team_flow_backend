@@ -803,13 +803,14 @@ exports.submitDay = async (req, res) => {
             return res.status(400).json({ status: 'error', message: 'All breaks must be ended before submitting the day.' });
         }
 // 2.5. التحقق من أن جميع الشيفتات المكتملة عندها سجل غداء (Lunch) مسجّل
+// 2.5. التحقق من أن جميع الشيفتات المكتملة عندها سجل غداء (Lunch) مسجّل
 const [missingLunch] = await connection.execute(
     `SELECT a.attendance_id, w.full_name
      FROM attendance a
      JOIN workers w ON w.worker_id = a.worker_id
      LEFT JOIN attendanceleaveperiods alp
-            ON alp.attendance_id = a.attendance_id
-           AND alp.leave_type = 'Lunch'
+          ON alp.attendance_id = a.attendance_id
+         AND alp.leave_type = 'Lunch'
      WHERE a.site_id = ? AND a.status = 'Draft'
        AND (a.record_date = ?
             OR a.record_date = DATE_SUB(?, INTERVAL 1 DAY))
@@ -818,10 +819,14 @@ const [missingLunch] = await connection.execute(
      FOR UPDATE`,
     [siteId, record_date, record_date]
 );
+
 if (missingLunch.length > 0) {
+    // ضعهم هنا تماماً قبل إرجاع الـ Response
+    await connection.rollback();
+    connection.release();
+    
     const names = missingLunch.map(r => r.full_name).join(', ');
     
-    // نرجع حالة تحذير (warning) بدل خطأ 400، ونسمح للمستخدم يكمل إذا بدو
     return res.status(200).json({
         status: 'warning',
         requires_confirmation: true,
