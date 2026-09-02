@@ -81,6 +81,138 @@ exports.getAllWorkers = async (req, res) => {
     }
 };
 
+
+
+// 5. تحديث جماعي لطريقة الدفع والراتب لكل العمال (أو مجموعة محددة) دفعة واحدة
+// بيحافظ على نفس منطق التوثيق: reason إلزامي + إغلاق compensation القديم + سجل جديد + audit log لكل عامل
+exports.bulkUpdateCompensation = async (req, res) => {
+    const {
+        payment_type,          // 'Daily' أو 'Hourly'
+        daily_rate,
+        regular_hourly_rate,
+        overtime_hourly_rate,
+        reason,
+        effective_from,
+        worker_ids             // اختياري: إذا ما انبعتت، بينطبق على كل العمال Active
+    } = req.body;
+
+    if (!reason || !String(reason).trim()) {
+        return res.status(400).json({ status: 'error', message: 'A reason is required for a bulk compensation change.' });
+    }
+
+    const validationError = validateCompensationInput({ payment_type, daily_rate, regular_hourly_rate, overtime_hourly_rate });
+    if (validationError) {
+        return res.status(400).json({ status: 'error', message: validationError });
+    }
+
+    const comp = normalizedCompensationValues(payment_type, daily_rate, regular_hourly_rate, overtime_hourly_rate);
+    const effectiveDate = effective_from || new Date().toISOString().split('T')[0];
+
+    const connection = await db.getConnection();
+    const results = { updated: [], skipped: [] };
+
+    try {
+        await connection.beginTransaction();
+
+        // حدد العمال المستهدفين (Active فقط افتراضياً، أو قائمة IDs محددة)
+        let targetQuery = `SELECT worker_id, worker_unique_id, job_position, payment_type,
+                                   daily_rate, regular_hourly_rate, overtime_hourly_rate
+                            FROM workers WHERE status = 'Active'`;
+        const params = [];
+        if (Array.isArray(worker_ids) && worker_ids.length > 0) {
+            targetQuery += ` AND worker_id IN (${worker_ids.map(() => '?').join(',')})`;
+            params.push(...worker_ids);
+        }
+        targetQuery += ' FOR UPDATE';
+
+        const [workers] = await connection.execute(targetQuery, params);
+
+        for (const worker of workers) {
+            // إذا نفس القيم أصلاً، تجاهله لتجنب سجلات تاريخية بلا فائدة
+            const sameAlready =
+                worker.payment_type === payment_type &&
+                Number(worker.daily_rate) === Number(comp.daily_rate) &&
+                Number(worker.regular_hourly_rate) === Number(comp.regular_hourly_rate) &&
+                Number(worker.overtime_hourly_rate) === Number(comp.overtime_hourly_rate);
+
+            if (sameAlready) {
+                results.skipped.push(worker.worker_unique_id);
+                continue;
+            }
+
+            // أغلق سجل التعويض النشط الحالي إذا موجود
+            const [activeCompRows] = await connection.execute(
+                `SELECT compensation_id, effective_from FROM workercompensationhistory
+                 WHERE worker_id = ? AND effective_to IS NULL
+                 ORDER BY compensation_id DESC LIMIT 1 FOR UPDATE`,
+                [worker.worker_id]
+            );
+
+            if (activeCompRows.length > 0) {
+                const activeComp = activeCompRows[0];
+                if (effectiveDate <= activeComp.effective_from) {
+                    // تخطي هذا العامل بدل ما توقف كل العملية
+                    results.skipped.push(worker.worker_unique_id);
+                    continue;
+                }
+                const closeDate = new Date(effectiveDate);
+                closeDate.setDate(closeDate.getDate() - 1);
+                await connection.execute(
+                    `UPDATE workercompensationhistory SET effective_to = ? WHERE compensation_id = ?`,
+                    [closeDate.toISOString().split('T')[0], activeComp.compensation_id]
+                );
+            }
+
+            await connection.execute(
+                `INSERT INTO workercompensationhistory
+                    (worker_id, payment_type, daily_rate, regular_hourly_rate, overtime_hourly_rate,
+                     job_position, effective_from, effective_to, reason, changed_by_user_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+                [worker.worker_id, payment_type, comp.daily_rate, comp.regular_hourly_rate,
+                 comp.overtime_hourly_rate, worker.job_position, effectiveDate, reason, req.user.user_id]
+            );
+
+            await connection.execute(
+                `UPDATE workers
+                 SET payment_type = ?, daily_rate = ?, regular_hourly_rate = ?, overtime_hourly_rate = ?
+                 WHERE worker_id = ?`,
+                [payment_type, comp.daily_rate, comp.regular_hourly_rate, comp.overtime_hourly_rate, worker.worker_id]
+            );
+
+            await connection.execute(
+                `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+                 VALUES ('workers', ?, 'COMPENSATION_CHANGED', ?, ?, ?)`,
+                [
+                    worker.worker_id, req.user.user_id,
+                    JSON.stringify({
+                        payment_type: worker.payment_type, daily_rate: worker.daily_rate,
+                        regular_hourly_rate: worker.regular_hourly_rate, overtime_hourly_rate: worker.overtime_hourly_rate
+                    }),
+                    JSON.stringify({ payment_type, ...comp, reason, bulk: true })
+                ]
+            );
+
+            results.updated.push(worker.worker_unique_id);
+        }
+
+        await connection.commit();
+        return res.status(200).json({
+            status: 'success',
+            message: `Compensation updated for ${results.updated.length} workers.`,
+            data: results
+        });
+    } catch (error) {
+        await connection.rollback();
+        console.error('🚨 BULK COMPENSATION UPDATE ERROR:', error);
+        return res.status(500).json({ status: 'error', message: 'Server error while applying bulk compensation update' });
+    } finally {
+        connection.release();
+    }
+};
+
+
+
+
 // 2. إضافة عامل جديد (مع الراتب من أول يوم)
 exports.createWorker = async (req, res) => {
     const {
