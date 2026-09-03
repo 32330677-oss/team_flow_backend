@@ -717,10 +717,16 @@ async function hasOverlappingLeave(executor, attendanceId, start, end, excludeLe
 }
 
 exports.saveLunchBulk = async (req, res) => {
-    const { siteId, date, default_start_time, default_end_time, overrides = {} } = req.body;
+    const { siteId, date, default_start_time, default_end_time, overrides = {}, excluded_worker_ids = [] } = req.body;
     const selectedDate = /^\d{4}-\d{2}-\d{2}$/.test(String(date || '')) ? date : null;
     const safeOverrides = overrides && typeof overrides === 'object' ? overrides : {};
     const hasOverrides = Object.keys(safeOverrides).length > 0;
+    const excludedSet = new Set(
+        Array.isArray(excluded_worker_ids)
+            ? excluded_worker_ids.map(Number).filter((id) => Number.isInteger(id) && id > 0)
+            : []
+    );
+
     if (!siteId || !selectedDate) {
         return res.status(400).json({ status: 'error', message: 'siteId and date are required.' });
     }
@@ -756,12 +762,15 @@ exports.saveLunchBulk = async (req, res) => {
             return res.status(400).json({ status: 'error', message: 'No completed attendance records found for this date.' });
         }
 
+        // استبعاد العمال غير المعلَّم عليهم (Unchecked) إلا إذا كان عندهم وقت خاص محدد (override)
         const recordsToUpdate = records.filter((record) => {
             const override = safeOverrides[String(record.worker_id)] || safeOverrides[record.worker_id] || {};
+            const hasOwnTime = Boolean(override.start_time && override.end_time);
+            if (excludedSet.has(Number(record.worker_id)) && !hasOwnTime) return false;
             return Boolean((override.start_time || default_start_time) && (override.end_time || default_end_time));
         });
         if (recordsToUpdate.length === 0) {
-            return res.status(400).json({ status: 'error', message: 'Set lunch time for at least one worker or provide a default lunch time.' });
+            return res.status(400).json({ status: 'error', message: 'No workers selected to receive a lunch time.' });
         }
 
         const connection = await db.getConnection();
