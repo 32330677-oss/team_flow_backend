@@ -154,18 +154,22 @@ async function generatePayrollBatch(req, res) {
         // ============ THE ACTUAL FIX ============
         let dayFraction;
         if (rec.attendance_status === 'Absent') {
-          dayFraction = 0; // غياب معتمد = بدون أجر
-        } else if (['Sick', 'Vacation', 'Holiday'].includes(rec.attendance_status)) {
-          dayFraction = 1; // إجازة معتمدة = يوم كامل (عدّل هون إذا سياستكم مختلفة)
-        } else {
-          // حضور فعلي (Present) -> النسبة = الساعات المشتغولة ÷ الساعات القياسية لليوم
-          const standardMinutes = Number(rec.standard_minutes_snapshot) > 0
-            ? Number(rec.standard_minutes_snapshot)
-            : fallbackStandardMinutes;
-          const standardHours = standardMinutes / 60;
-          const workedHours = Number(rec.total_working_hours || 0);
-          dayFraction = standardHours > 0 ? Math.min(1, workedHours / standardHours) : 0;
-        }
+  dayFraction = 0;
+} else if (['Sick', 'Vacation', 'Holiday'].includes(rec.attendance_status)) {
+  dayFraction = 0;
+} else {
+  const standardMinutes = Number(rec.standard_minutes_snapshot) > 0
+    ? Number(rec.standard_minutes_snapshot)
+    : fallbackStandardMinutes;
+
+  const standardHours = standardMinutes / 60;
+  const workedHours = Number(rec.total_working_hours || 0);
+
+  dayFraction = standardHours > 0
+    ? Math.min(1, workedHours / standardHours)
+    : 0;
+}
+        
         g.days_worked += dayFraction;
         // =========================================
       } else {

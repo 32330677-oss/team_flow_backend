@@ -841,9 +841,44 @@ exports.saveLunchBulk = async (req, res) => {
 //    وقت من ساعات شغله. بس بيطلب سبب تأكيد لأن الشيفت طويل و/أو بيتقاطع مع وقت غدا الموقع.
 // 2) عامل طلّع Check-out قبل ما يبلش وقت الغدا -> شرط التقاطع ما بيتحقق أصلاً،
 //    فما بينطلب منه تأكيد وما بينخصم منه شي.
+// ==================== Submit Day ====================
+
+/*
+ * Lunch policy:
+ *
+ * If a completed shift has no Lunch record:
+ *
+ * worked_through_lunch = true
+ *   -> Do NOT create Lunch
+ *   -> Lunch time remains working time
+ *   -> If total exceeds standard hours, the excess becomes overtime
+ *
+ * worked_through_lunch = false
+ *   -> Create a Lunch leave using the site's configured lunch period
+ *   -> Lunch time is deducted from working hours
+ *
+ * Frontend payload:
+ *
+ * lunch_decisions: [
+ *   {
+ *     attendance_id: 123,
+ *     worked_through_lunch: true,
+ *     reason: "Worked during lunch"
+ *   },
+ *   {
+ *     attendance_id: 124,
+ *     worked_through_lunch: false
+ *   }
+ * ]
+ */
+
 exports.submitDay = async (req, res) => {
-    const { siteId, record_date, confirmed_lunch_skips } = req.body;
-    // confirmed_lunch_skips: [{ attendance_id, reason }, ...]
+    const {
+        siteId,
+        record_date,
+        lunch_decisions = [],
+        confirmed_lunch_skips = []
+    } = req.body;
 
     if (!siteId || !isValidDateOnly(record_date)) {
         return res.status(400).json({
@@ -852,194 +887,657 @@ exports.submitDay = async (req, res) => {
         });
     }
 
+    /*
+     * Backward compatibility:
+     *
+     * Old frontend can still send:
+     *
+     * confirmed_lunch_skips: [
+     *   { attendance_id, reason }
+     * ]
+     *
+     * These are treated as:
+     * worked_through_lunch = true
+     */
+    const decisions = new Map();
+
+    if (Array.isArray(confirmed_lunch_skips)) {
+        for (const item of confirmed_lunch_skips) {
+            const attendanceId = Number(item?.attendance_id);
+            const reason = String(item?.reason || '').trim();
+
+            if (
+                Number.isInteger(attendanceId) &&
+                attendanceId > 0 &&
+                reason
+            ) {
+                decisions.set(attendanceId, {
+                    worked_through_lunch: true,
+                    reason
+                });
+            }
+        }
+    }
+
+    if (Array.isArray(lunch_decisions)) {
+        for (const item of lunch_decisions) {
+            const attendanceId = Number(item?.attendance_id);
+
+            if (!Number.isInteger(attendanceId) || attendanceId <= 0) {
+                continue;
+            }
+
+            const workedThroughLunch =
+                item?.worked_through_lunch === true;
+
+            const reason = String(item?.reason || '').trim();
+
+            decisions.set(attendanceId, {
+                worked_through_lunch: workedThroughLunch,
+                reason
+            });
+        }
+    }
+
     const connection = await db.getConnection();
     let transactionStarted = false;
 
     try {
         if (!(await verifySiteAction(req, siteId))) {
             connection.release();
-            return res.status(403).json({ status: 'error', message: 'You are not authorized to submit this site.' });
+
+            return res.status(403).json({
+                status: 'error',
+                message: 'You are not authorized to submit this site.'
+            });
         }
 
         await connection.beginTransaction();
         transactionStarted = true;
 
-        // 1) امنع الـ Submit إذا في شيفت مفتوح (Check-in بدون Check-out)
+        // ========================================================
+        // 1) Prevent Submit if there are open shifts
+        // ========================================================
+
         const [openShifts] = await connection.execute(
             `SELECT a.attendance_id, w.full_name
              FROM attendance a
              JOIN workers w ON w.worker_id = a.worker_id
              WHERE a.site_id = ?
-               AND (a.record_date = ? OR a.record_date = DATE_SUB(?, INTERVAL 1 DAY))
+               AND (
+                    a.record_date = ?
+                    OR a.record_date = DATE_SUB(?, INTERVAL 1 DAY)
+               )
                AND a.status = 'Draft'
-               AND a.check_in_time IS NOT NULL AND a.check_out_time IS NULL`,
+               AND a.check_in_time IS NOT NULL
+               AND a.check_out_time IS NULL`,
             [siteId, record_date, record_date]
         );
+
         if (openShifts.length > 0) {
             await connection.rollback();
             transactionStarted = false;
+
             return res.status(400).json({
                 status: 'error',
                 message: 'Some workers are still checked in and have not checked out yet.',
-                open_workers: openShifts.map(r => ({ attendance_id: r.attendance_id, full_name: r.full_name }))
+                open_workers: openShifts.map(row => ({
+                    attendance_id: row.attendance_id,
+                    full_name: row.full_name
+                }))
             });
         }
 
-        // 2) امنع الـ Submit إذا في استراحة/غدا مفتوح لسا ما انسكر
+        // ========================================================
+        // 2) Prevent Submit if an open break/lunch still exists
+        // ========================================================
+
         const [openLeaves] = await connection.execute(
             `SELECT alp.leave_id, w.full_name
              FROM attendanceleaveperiods alp
-             JOIN attendance a ON a.attendance_id = alp.attendance_id
-             JOIN workers w ON w.worker_id = a.worker_id
+             JOIN attendance a
+               ON a.attendance_id = alp.attendance_id
+             JOIN workers w
+               ON w.worker_id = a.worker_id
              WHERE a.site_id = ?
-               AND (a.record_date = ? OR a.record_date = DATE_SUB(?, INTERVAL 1 DAY))
+               AND (
+                    a.record_date = ?
+                    OR a.record_date = DATE_SUB(?, INTERVAL 1 DAY)
+               )
                AND a.status = 'Draft'
                AND alp.leave_end_time IS NULL`,
             [siteId, record_date, record_date]
         );
+
         if (openLeaves.length > 0) {
             await connection.rollback();
             transactionStarted = false;
+
             return res.status(400).json({
                 status: 'error',
                 message: 'Some workers still have an active break that has not ended.',
-                open_workers: openLeaves.map(r => ({ leave_id: r.leave_id, full_name: r.full_name }))
+                open_workers: openLeaves.map(row => ({
+                    leave_id: row.leave_id,
+                    full_name: row.full_name
+                }))
             });
         }
 
-        // 3) فحص Missing Lunch — بس للي فعلاً شيفتهم بيتقاطع مع وقت الغدا (أو طويل بدون غدا مسجّل بالموقع)
+        // ========================================================
+        // 3) Find completed workers who have NO Lunch
+        // ========================================================
+
         const [missingLunch] = await connection.execute(
-            `SELECT a.attendance_id, w.full_name
+            `SELECT
+                 a.attendance_id,
+                 a.worker_id,
+                 a.check_in_time,
+                 a.check_out_time,
+                 w.full_name
              FROM attendance a
-             JOIN workers w ON w.worker_id = a.worker_id
+             JOIN workers w
+               ON w.worker_id = a.worker_id
              LEFT JOIN attendanceleaveperiods alp
-                    ON alp.attendance_id = a.attendance_id
-                   AND alp.leave_type = 'Lunch'
-             LEFT JOIN (
-                    SELECT MIN(alp2.leave_start_time) AS site_lunch_start,
-                           MAX(alp2.leave_end_time)   AS site_lunch_end
-                    FROM attendanceleaveperiods alp2
-                    JOIN attendance a2 ON a2.attendance_id = alp2.attendance_id
-                    WHERE a2.site_id = ?
-                      AND alp2.leave_type = 'Lunch'
-                      AND (a2.record_date = ? OR a2.record_date = DATE_SUB(?, INTERVAL 1 DAY))
-             ) ref ON 1 = 1
+               ON alp.attendance_id = a.attendance_id
+              AND alp.leave_type = 'Lunch'
              WHERE a.site_id = ?
                AND a.status = 'Draft'
-               AND (a.record_date = ? OR a.record_date = DATE_SUB(?, INTERVAL 1 DAY))
+               AND (
+                    a.record_date = ?
+                    OR a.record_date = DATE_SUB(?, INTERVAL 1 DAY)
+               )
                AND a.check_in_time IS NOT NULL
                AND a.check_out_time IS NOT NULL
-               AND alp.leave_id IS NULL
-               AND (
-                    (ref.site_lunch_start IS NULL
-                        AND TIMESTAMPDIFF(MINUTE, a.check_in_time, a.check_out_time) >= 300)
-                    OR
-                    (ref.site_lunch_start IS NOT NULL
-                        AND a.check_in_time < ref.site_lunch_end
-                        AND a.check_out_time > ref.site_lunch_start)
-               )`,
-            [siteId, record_date, record_date, siteId, record_date, record_date]
+               AND alp.leave_id IS NULL`,
+            [siteId, record_date, record_date]
         );
 
+        // ========================================================
+        // 4) Get the site's lunch period
+        //
+        // We use an already recorded Lunch period at this site
+        // as the site's default lunch period.
+        // ========================================================
+
+        let siteLunchStart = null;
+        let siteLunchEnd = null;
+
         if (missingLunch.length > 0) {
-            const confirmedMap = new Map(
-                (Array.isArray(confirmed_lunch_skips) ? confirmed_lunch_skips : [])
-                    .filter(c => c.reason && String(c.reason).trim())
-                    .map(c => [Number(c.attendance_id), String(c.reason).trim()])
+            const [[siteLunch]] = await connection.execute(
+                `SELECT
+                     MIN(alp.leave_start_time) AS lunch_start,
+                     MAX(alp.leave_end_time) AS lunch_end
+                 FROM attendanceleaveperiods alp
+                 JOIN attendance a
+                   ON a.attendance_id = alp.attendance_id
+                 WHERE a.site_id = ?
+                   AND alp.leave_type = 'Lunch'
+                   AND alp.leave_end_time IS NOT NULL
+                   AND (
+                        a.record_date = ?
+                        OR a.record_date = DATE_SUB(?, INTERVAL 1 DAY)
+                   )`,
+                [siteId, record_date, record_date]
             );
 
+            siteLunchStart = siteLunch?.lunch_start || null;
+            siteLunchEnd = siteLunch?.lunch_end || null;
+        }
+
+        // ========================================================
+        // 5) If there are workers without Lunch, require a decision
+        // ========================================================
+
+        if (missingLunch.length > 0) {
             const stillUnconfirmed = missingLunch.filter(
-                row => !confirmedMap.has(Number(row.attendance_id))
+                row => !decisions.has(Number(row.attendance_id))
             );
 
             if (stillUnconfirmed.length > 0) {
                 await connection.rollback();
                 transactionStarted = false;
+
                 return res.status(200).json({
                     status: 'warning',
                     requires_confirmation: true,
-                    message: 'These workers have no recorded lunch break. Please confirm with a reason for each.',
+
+                    message:
+                        'The following workers have no recorded lunch. Please confirm whether each worker worked during lunch.',
+
+                    lunch_period: {
+                        start: siteLunchStart,
+                        end: siteLunchEnd
+                    },
+
                     missing_workers: stillUnconfirmed.map(row => ({
                         attendance_id: row.attendance_id,
+                        worker_id: row.worker_id,
                         full_name: row.full_name
                     }))
                 });
             }
+        }
 
-            // كل العمال الناقصين معهم سبب مؤكد -> وثّق كل واحد بالـ remarks + audit log
-            // ملاحظة مهمة: ما منضيف أي سجل إجازة "Lunch" هون، فبالتالي ما في أي خصم
-            // من ساعات شغلهم — تماماً متل المطلوب (اشتغل عالساعة و ما اخد غدا).
-            for (const row of missingLunch) {
-                const reason = confirmedMap.get(Number(row.attendance_id));
-                await connection.execute(
-                    `UPDATE attendance
-                     SET remarks = CONCAT(COALESCE(remarks, ''), CASE WHEN remarks IS NULL OR remarks = '' THEN '' ELSE ' | ' END, ?)
-                     WHERE attendance_id = ?`,
-                    [`Worked through lunch: ${reason}`, row.attendance_id]
-                );
-                await connection.execute(
-                    `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
-                     VALUES ('attendance', ?, 'LUNCH_SKIPPED_CONFIRMED', ?, NULL, ?)`,
-                    [row.attendance_id, req.user.user_id, JSON.stringify({ reason })]
+        // ========================================================
+        // 6) Apply Lunch decisions
+        // ========================================================
+
+        for (const row of missingLunch) {
+            const attendanceId = Number(row.attendance_id);
+            const decision = decisions.get(attendanceId);
+
+            if (!decision) {
+                throw new AppError(
+                    `Missing lunch decision for worker ${row.full_name}.`
                 );
             }
+
+            // ====================================================
+            // YES -> Worker worked during lunch
+            //
+            // Do NOT create Lunch.
+            // Therefore calculateWorkingHours() will NOT deduct
+            // the lunch period.
+            // ====================================================
+
+            if (decision.worked_through_lunch === true) {
+                const reason = decision.reason;
+
+                if (!reason) {
+                    throw new AppError(
+                        `A reason is required when ${row.full_name} worked through lunch.`
+                    );
+                }
+
+                await connection.execute(
+                    `UPDATE attendance
+                     SET remarks =
+                         CONCAT(
+                             COALESCE(remarks, ''),
+                             CASE
+                                 WHEN remarks IS NULL OR remarks = ''
+                                 THEN ''
+                                 ELSE ' | '
+                             END,
+                             ?
+                         )
+                     WHERE attendance_id = ?`,
+                    [
+                        `Worked through lunch: ${reason}`,
+                        attendanceId
+                    ]
+                );
+
+                await connection.execute(
+                    `INSERT INTO auditlogs
+                     (
+                         table_name,
+                         record_id,
+                         action_type,
+                         user_id,
+                         old_values,
+                         new_values
+                     )
+                     VALUES
+                     (
+                         'attendance',
+                         ?,
+                         'LUNCH_SKIPPED_CONFIRMED',
+                         ?,
+                         NULL,
+                         ?
+                     )`,
+                    [
+                        attendanceId,
+                        req.user.user_id,
+                        JSON.stringify({
+                            worked_through_lunch: true,
+                            reason
+                        })
+                    ]
+                );
+
+                continue;
+            }
+
+            // ====================================================
+            // NO -> Worker did NOT work during lunch
+            //
+            // We MUST create a Lunch record so that
+            // calculateWorkingHours() deducts it.
+            // ====================================================
+
+            if (!siteLunchStart || !siteLunchEnd) {
+                throw new AppError(
+                    `No site lunch period is configured. Record the site's lunch time before submitting the day for worker ${row.full_name}.`
+                );
+            }
+
+            const checkInDate = parseAttendanceDate(row.check_in_time);
+            const checkOutDate = parseAttendanceDate(row.check_out_time);
+
+            if (!checkInDate || !checkOutDate) {
+                throw new AppError(
+                    `Invalid attendance times for worker ${row.full_name}.`
+                );
+            }
+
+            /*
+             * Convert the site's lunch time into the actual occurrence
+             * inside this worker's shift.
+             *
+             * This also handles overnight shifts.
+             */
+            const lunchStart = normalizeTimeForShift(
+                siteLunchStart,
+                checkInDate,
+                checkOutDate
+            );
+
+            const lunchEnd = normalizeTimeForShift(
+                siteLunchEnd,
+                checkInDate,
+                checkOutDate
+            );
+
+            const lunchStartDate = parseAttendanceDate(lunchStart);
+            const lunchEndDate = parseAttendanceDate(lunchEnd);
+
+            if (
+                !lunchStart ||
+                !lunchEnd ||
+                !lunchStartDate ||
+                !lunchEndDate
+            ) {
+                throw new AppError(
+                    `The site lunch period is not valid for worker ${row.full_name}'s shift.`
+                );
+            }
+
+            if (lunchEndDate <= lunchStartDate) {
+                throw new AppError(
+                    `Lunch end must be after lunch start for worker ${row.full_name}.`
+                );
+            }
+
+            /*
+             * If this worker's shift does not overlap the site's lunch,
+             * we should NOT create a lunch deduction.
+             *
+             * Example:
+             *
+             * Worker:
+             * 07:00 -> 12:00
+             *
+             * Site lunch:
+             * 13:00 -> 14:00
+             *
+             * No overlap -> no Lunch record.
+             */
+            if (
+                lunchStartDate < checkOutDate &&
+                lunchEndDate > checkInDate
+            ) {
+                if (
+                    lunchStartDate < checkInDate ||
+                    lunchEndDate > checkOutDate
+                ) {
+                    throw new AppError(
+                        `Lunch period is not completely inside worker ${row.full_name}'s shift.`
+                    );
+                }
+
+                const [existingLunch] = await connection.execute(
+                    `SELECT leave_id
+                     FROM attendanceleaveperiods
+                     WHERE attendance_id = ?
+                       AND leave_type = 'Lunch'
+                     ORDER BY leave_id DESC
+                     LIMIT 1`,
+                    [attendanceId]
+                );
+
+                if (existingLunch.length === 0) {
+                    const [insertedLunch] = await connection.execute(
+                        `INSERT INTO attendanceleaveperiods
+                         (
+                             attendance_id,
+                             leave_start_time,
+                             leave_end_time,
+                             leave_type
+                         )
+                         VALUES (?, ?, ?, 'Lunch')`,
+                        [
+                            attendanceId,
+                            lunchStart,
+                            lunchEnd
+                        ]
+                    );
+
+                    await connection.execute(
+                        `INSERT INTO auditlogs
+                         (
+                             table_name,
+                             record_id,
+                             action_type,
+                             user_id,
+                             old_values,
+                             new_values
+                         )
+                         VALUES
+                         (
+                             'attendanceleaveperiods',
+                             ?,
+                             'LUNCH_AUTO_CREATE_ON_SUBMIT',
+                             ?,
+                             NULL,
+                             ?
+                         )`,
+                        [
+                            insertedLunch.insertId,
+                            req.user.user_id,
+                            JSON.stringify({
+                                attendance_id: attendanceId,
+                                leave_start_time: lunchStart,
+                                leave_end_time: lunchEnd,
+                                leave_type: 'Lunch',
+                                reason: 'Worker confirmed they did not work during lunch.'
+                            })
+                        ]
+                    );
+                }
+            }
+
+            await connection.execute(
+                `INSERT INTO auditlogs
+                 (
+                     table_name,
+                     record_id,
+                     action_type,
+                     user_id,
+                     old_values,
+                     new_values
+                 )
+                 VALUES
+                 (
+                     'attendance',
+                     ?,
+                     'LUNCH_NOT_WORKED_CONFIRMED',
+                     ?,
+                     NULL,
+                     ?
+                 )`,
+                [
+                    attendanceId,
+                    req.user.user_id,
+                    JSON.stringify({
+                        worked_through_lunch: false,
+                        lunch_start: lunchStart,
+                        lunch_end: lunchEnd
+                    })
+                ]
+            );
         }
 
-        // 4) أنشئ سجلات "غياب" تلقائية للعمال المعينين على الموقع واللي ما إلهم أي سجل حضور اليوم
+        // ========================================================
+        // 7) Automatically create Absent records
+        // ========================================================
+
         await connection.execute(
-            `INSERT INTO attendance (worker_id, site_id, record_date, attendance_status, status, recorded_by_user_id, remarks)
-             SELECT w.worker_id, wsa.site_id, ?, 'Absent', 'Draft', ?, 'Auto-marked absent on day submission'
+            `INSERT INTO attendance
+             (
+                 worker_id,
+                 site_id,
+                 record_date,
+                 attendance_status,
+                 status,
+                 recorded_by_user_id,
+                 remarks
+             )
+             SELECT
+                 w.worker_id,
+                 wsa.site_id,
+                 ?,
+                 'Absent',
+                 'Draft',
+                 ?,
+                 'Auto-marked absent on day submission'
              FROM workersiteassignments wsa
-             JOIN workers w ON w.worker_id = wsa.worker_id AND w.status = 'Active'
-             WHERE wsa.site_id = ? AND wsa.unassigned_date IS NULL
+             JOIN workers w
+               ON w.worker_id = wsa.worker_id
+              AND w.status = 'Active'
+             WHERE wsa.site_id = ?
+               AND wsa.unassigned_date IS NULL
                AND NOT EXISTS (
-                   SELECT 1 FROM attendance a
-                   WHERE a.worker_id = w.worker_id AND a.site_id = wsa.site_id AND a.record_date = ?
+                   SELECT 1
+                   FROM attendance a
+                   WHERE a.worker_id = w.worker_id
+                     AND a.site_id = wsa.site_id
+                     AND a.record_date = ?
                )`,
-            [record_date, req.user.user_id, siteId, record_date]
+            [
+                record_date,
+                req.user.user_id,
+                siteId,
+                record_date
+            ]
         );
 
-        // 5) أعد حساب ساعات الشغل لكل سجل Draft عنده Check-in و Check-out (يشمل تصحيح الغدا/الاستراحات الأخيرة)
+        // ========================================================
+        // 8) Recalculate all completed Draft shifts
+        // ========================================================
+
         const [completedShifts] = await connection.execute(
-            `SELECT attendance_id FROM attendance
+            `SELECT attendance_id
+             FROM attendance
              WHERE site_id = ?
-               AND (record_date = ? OR record_date = DATE_SUB(?, INTERVAL 1 DAY))
+               AND (
+                    record_date = ?
+                    OR record_date = DATE_SUB(?, INTERVAL 1 DAY)
+               )
                AND status = 'Draft'
-               AND check_in_time IS NOT NULL AND check_out_time IS NOT NULL`,
-            [siteId, record_date, record_date]
+               AND check_in_time IS NOT NULL
+               AND check_out_time IS NOT NULL`,
+            [
+                siteId,
+                record_date,
+                record_date
+            ]
         );
+
         for (const shift of completedShifts) {
-            await attendanceService.calculateWorkingHours(shift.attendance_id, connection);
+            await attendanceService.calculateWorkingHours(
+                shift.attendance_id,
+                connection
+            );
         }
 
-        // 6) أرسل كل سجلات الـ Draft الخاصة بهاد الموقع/التاريخ لحالة Submitted
+        // ========================================================
+        // 9) Submit all Draft records
+        // ========================================================
+
         const [submitted] = await connection.execute(
             `UPDATE attendance
              SET status = 'Submitted'
              WHERE site_id = ?
-               AND (record_date = ? OR record_date = DATE_SUB(?, INTERVAL 1 DAY))
+               AND (
+                    record_date = ?
+                    OR record_date = DATE_SUB(?, INTERVAL 1 DAY)
+               )
                AND status = 'Draft'`,
-            [siteId, record_date, record_date]
+            [
+                siteId,
+                record_date,
+                record_date
+            ]
         );
 
         await connection.execute(
-            `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
-             VALUES ('attendance', 0, 'DAY_SUBMITTED', ?, NULL, ?)`,
-            [req.user.user_id, JSON.stringify({ site_id: siteId, record_date, affected_rows: submitted.affectedRows })]
+            `INSERT INTO auditlogs
+             (
+                 table_name,
+                 record_id,
+                 action_type,
+                 user_id,
+                 old_values,
+                 new_values
+             )
+             VALUES
+             (
+                 'attendance',
+                 0,
+                 'DAY_SUBMITTED',
+                 ?,
+                 NULL,
+                 ?
+             )`,
+            [
+                req.user.user_id,
+                JSON.stringify({
+                    site_id: siteId,
+                    record_date,
+                    affected_rows: submitted.affectedRows
+                })
+            ]
         );
 
         await connection.commit();
+
         return res.status(200).json({
             status: 'success',
             message: 'Day submitted successfully for review.',
             submitted_records: submitted.affectedRows
         });
+
     } catch (error) {
+
         if (transactionStarted) {
-            try { await connection.rollback(); } catch (rollbackError) { console.error('ROLLBACK ERROR:', rollbackError); }
+            try {
+                await connection.rollback();
+            } catch (rollbackError) {
+                console.error(
+                    'ROLLBACK ERROR:',
+                    rollbackError
+                );
+            }
         }
-        console.error('SUBMIT DAY ERROR:', error);
-        return res.status(500).json({ status: 'error', message: 'An error occurred while submitting the day, please try again.' });
+
+        console.error(
+            'SUBMIT DAY ERROR:',
+            error
+        );
+
+        const status =
+            error.isOperational ? 400 : 500;
+
+        return res.status(status).json({
+            status: 'error',
+            message:
+                error.isOperational
+                    ? error.message
+                    : 'An error occurred while submitting the day, please try again.'
+        });
+
     } finally {
         connection.release();
     }
