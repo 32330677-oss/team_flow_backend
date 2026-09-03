@@ -556,14 +556,21 @@ async function exportPayrollExcel(req, res) {
 }
 async function exportDailyAttendanceExcel(req, res) {
   const { date, site_id } = req.query || {};
+
   if (!isValidDate(date)) {
-    return res.status(400).json({ success: false, message: 'A valid date in YYYY-MM-DD format is required.' });
+    return res.status(400).json({
+      success: false,
+      message: 'A valid date in YYYY-MM-DD format is required.',
+    });
   }
 
   try {
     const ExcelJS = require('exceljs');
+    const path = require('path');
+
     const params = [date];
     let siteFilter = '';
+
     if (isSpecificSite(site_id)) {
       siteFilter = ' AND a.site_id = ?';
       params.push(site_id);
@@ -585,6 +592,30 @@ async function exportDailyAttendanceExcel(req, res) {
 
     const workbook = new ExcelJS.Workbook();
     const sheet = workbook.addWorksheet('Daily Attendance');
+
+    // =========================================================
+    // LOGO
+    // =========================================================
+
+    // ضع ملف اللوغو هنا:
+    // backend/assets/logo.png
+    const logoPath = path.join(__dirname, '../assets//logo.png');
+
+    const logoId = workbook.addImage({
+      filename: logoPath,
+      extension: 'png',
+    });
+
+    // اللوغو أعلى التقرير
+    sheet.addImage(logoId, {
+      tl: { col: 0.2, row: 0.15 },
+      ext: { width: 150, height: 60 },
+    });
+
+    // =========================================================
+    // COLUMNS
+    // =========================================================
+
     sheet.columns = [
       { header: 'No.', key: 'number', width: 8 },
       { header: 'Worker ID', key: 'worker_id', width: 16 },
@@ -596,16 +627,40 @@ async function exportDailyAttendanceExcel(req, res) {
       { header: 'Check Out', key: 'check_out', width: 22 },
       { header: 'Regular Hours', key: 'regular_hours', width: 16 },
       { header: 'Overtime Hours', key: 'overtime_hours', width: 16 },
-      { header: 'Management Leave Hours', key: 'management_leave_hours', width: 24 },
+      {
+        header: 'Management Leave Hours',
+        key: 'management_leave_hours',
+        width: 24,
+      },
       { header: 'Remarks', key: 'remarks', width: 36 },
-      { header: 'Admin Rejection Notes', key: 'admin_rejection_notes', width: 36 },
     ];
 
-    sheet.mergeCells('A1:M1');
+    // =========================================================
+    // REPORT HEADER
+    // =========================================================
+
+    sheet.mergeCells('A1:L1');
     sheet.getCell('A1').value = `Daily Attendance Report - ${date}`;
-    sheet.mergeCells('A2:M2');
-    sheet.getCell('A2').value = 'Attendance and hours only — no salary or rate calculation';
-    sheet.getRow(4).values = sheet.columns.map((column) => column.header);
+
+    sheet.mergeCells('A2:L2');
+    sheet.getCell('A2').value =
+        'Attendance and hours only — no salary or rate calculation';
+
+    // مساحة للوغو في الأعلى
+    sheet.getRow(1).height = 48;
+    sheet.getRow(2).height = 24;
+
+    // =========================================================
+    // TABLE HEADER
+    // =========================================================
+
+    sheet.getRow(4).values = sheet.columns.map(
+      (column) => column.header
+    );
+
+    // =========================================================
+    // DATA
+    // =========================================================
 
     rows.forEach((row, index) => {
       sheet.addRow({
@@ -619,29 +674,114 @@ async function exportDailyAttendanceExcel(req, res) {
         check_out: row.check_out_time || '',
         regular_hours: Number(row.total_working_hours || 0),
         overtime_hours: Number(row.overtime_hours || 0),
-        management_leave_hours: Number(row.management_leave_hours || 0),
+        management_leave_hours: Number(
+          row.management_leave_hours || 0
+        ),
         remarks: row.remarks || '',
-        admin_rejection_notes: row.admin_rejection_notes || '',
       });
     });
 
-    sheet.getRow(1).font = { bold: true, size: 16, color: { argb: 'FFFFFFFF' } };
-    sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
-    sheet.getRow(2).font = { italic: true, color: { argb: 'FF555555' } };
-    sheet.getRow(4).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-    sheet.getRow(4).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
-    sheet.views = [{ state: 'frozen', ySplit: 4 }];
-    sheet.autoFilter = { from: 'A4', to: 'M4' };
+    // =========================================================
+    // STYLING
+    // =========================================================
+
+    sheet.getRow(1).font = {
+      bold: true,
+      size: 16,
+      color: { argb: 'FFFFFFFF' },
+    };
+
+    sheet.getRow(1).fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FF1A2A6C' },
+    };
+
+    sheet.getRow(1).alignment = {
+      vertical: 'middle',
+      horizontal: 'center',
+    };
+
+    sheet.getRow(2).font = {
+      italic: true,
+      color: { argb: 'FF555555' },
+    };
+
+    sheet.getRow(2).alignment = {
+      vertical: 'middle',
+      horizontal: 'center',
+    };
+
+    sheet.getRow(4).font = {
+      bold: true,
+      color: { argb: 'FFFFFFFF' },
+    };
+
+    sheet.getRow(4).fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FF1A2A6C' },
+    };
+
+    sheet.getRow(4).alignment = {
+      vertical: 'middle',
+      horizontal: 'center',
+      wrapText: true,
+    };
+
+    // =========================================================
+    // FORMAT HOURS
+    // =========================================================
+
+    for (let rowIndex = 5; rowIndex <= sheet.rowCount; rowIndex++) {
+      sheet.getCell(`I${rowIndex}`).numFmt = '0.00';
+      sheet.getCell(`J${rowIndex}`).numFmt = '0.00';
+      sheet.getCell(`K${rowIndex}`).numFmt = '0.00';
+    }
+
+    // =========================================================
+    // FREEZE + FILTER
+    // =========================================================
+
+    sheet.views = [
+      {
+        state: 'frozen',
+        ySplit: 4,
+      },
+    ];
+
+    sheet.autoFilter = {
+      from: 'A4',
+      to: 'L4',
+    };
+
+    // =========================================================
+    // EXPORT
+    // =========================================================
 
     const fileName = `daily_attendance_${date}.xlsx`;
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${fileName}"`
+    );
+
     await workbook.xlsx.write(res);
     res.end();
+
   } catch (error) {
     console.error('exportDailyAttendanceExcel:', error);
+
     if (!res.headersSent) {
-      return res.status(500).json({ success: false, message: 'Failed to export daily attendance report.' });
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to export daily attendance report.',
+      });
     }
   }
 }
