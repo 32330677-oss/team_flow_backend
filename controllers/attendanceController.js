@@ -143,6 +143,7 @@ exports.getSiteWorkers = async (req, res) => {
         res.status(500).json({ status: 'error', message: 'An error occurred while fetching worker data, please try again.' });
     }
 };
+
 exports.checkIn = async (req, res) => {
     const { worker_id, site_id, check_in_time } = req.body;
     const recorded_by_user_id = req.user.user_id;
@@ -265,7 +266,6 @@ exports.checkIn = async (req, res) => {
     }
 };
 
-
 function normalizeWorkerIds(value) {
     if (!Array.isArray(value) || value.length === 0 || value.length > 500) return null;
     const ids = [...new Set(value.map(Number))];
@@ -289,6 +289,7 @@ async function verifyBulkWorkers(workerIds, siteId, executor) {
     return valid;
 }
 
+// ==================== Bulk Check-in / Bulk Check-out ====================
 async function runBulkAttendance(req, res, mode) {
     const { site_id, record_date, worker_ids } = req.body;
     const workerIds = normalizeWorkerIds(worker_ids);
@@ -584,7 +585,6 @@ exports.editAttendanceTimes = async (req, res) => {
     }
 };
 
-
 exports.checkOut = async (req, res) => {
     const { worker_id, site_id, check_out_time, record_date } = req.body;
     const userId = req.user.user_id;
@@ -681,21 +681,6 @@ function parseAttendanceDate(value) {
     return new Date(Date.UTC(year, month - 1, day, hour, minute, second));
 }
 
-function timeToMinutes(value) {
-    if (!value) return null;
-    if (value instanceof Date && !Number.isNaN(value.getTime())) {
-        return value.getUTCHours() * 60 + value.getUTCMinutes();
-    }
-    const text = String(value);
-    const match = /(?:^|T| )((?:[01]\d|2[0-3])):([0-5]\d)(?::[0-5]\d)?/.exec(text);
-    if (match) return Number(match[1]) * 60 + Number(match[2]);
-    const parsed = new Date(value);
-    if (!Number.isNaN(parsed.getTime())) {
-        return parsed.getUTCHours() * 60 + parsed.getUTCMinutes();
-    }
-    return null;
-}
-
 async function hasOverlappingLeave(executor, attendanceId, start, end, excludeLeaveId = null) {
     const params = [attendanceId, end, start];
     let exclusion = '';
@@ -716,6 +701,7 @@ async function hasOverlappingLeave(executor, attendanceId, start, end, excludeLe
     return rows.length > 0;
 }
 
+// ==================== Bulk Lunch (with per-worker exclusion / override) ====================
 exports.saveLunchBulk = async (req, res) => {
     const { siteId, date, default_start_time, default_end_time, overrides = {}, excluded_worker_ids = [] } = req.body;
     const selectedDate = /^\d{4}-\d{2}-\d{2}$/.test(String(date || '')) ? date : null;
@@ -848,9 +834,16 @@ exports.saveLunchBulk = async (req, res) => {
         return res.status(status).json({ status: 'error', message: error.isOperational ? error.message : 'An error occurred while saving lunch times.' });
     }
 };
+
+// ==================== Submit Day ====================
+// يغطّي الحالتين المطلوبتين:
+// 1) عامل ما اخد غدا وشغّال عالساعة -> ما بينضاف له سجل إجازة "Lunch"، فما بينخصم
+//    وقت من ساعات شغله. بس بيطلب سبب تأكيد لأن الشيفت طويل و/أو بيتقاطع مع وقت غدا الموقع.
+// 2) عامل طلّع Check-out قبل ما يبلش وقت الغدا -> شرط التقاطع ما بيتحقق أصلاً،
+//    فما بينطلب منه تأكيد وما بينخصم منه شي.
 exports.submitDay = async (req, res) => {
     const { siteId, record_date, confirmed_lunch_skips } = req.body;
-    // confirmed_lunch_skips: [{ attendance_id, reason }, ...] بدل force: true
+    // confirmed_lunch_skips: [{ attendance_id, reason }, ...]
 
     if (!siteId || !isValidDateOnly(record_date)) {
         return res.status(400).json({
@@ -871,9 +864,50 @@ exports.submitDay = async (req, res) => {
         await connection.beginTransaction();
         transactionStarted = true;
 
-        // ... فحص الـ open shifts وفحص الـ open leaves زي ما هيّ ...
+        // 1) امنع الـ Submit إذا في شيفت مفتوح (Check-in بدون Check-out)
+        const [openShifts] = await connection.execute(
+            `SELECT a.attendance_id, w.full_name
+             FROM attendance a
+             JOIN workers w ON w.worker_id = a.worker_id
+             WHERE a.site_id = ?
+               AND (a.record_date = ? OR a.record_date = DATE_SUB(?, INTERVAL 1 DAY))
+               AND a.status = 'Draft'
+               AND a.check_in_time IS NOT NULL AND a.check_out_time IS NULL`,
+            [siteId, record_date, record_date]
+        );
+        if (openShifts.length > 0) {
+            await connection.rollback();
+            transactionStarted = false;
+            return res.status(400).json({
+                status: 'error',
+                message: 'Some workers are still checked in and have not checked out yet.',
+                open_workers: openShifts.map(r => ({ attendance_id: r.attendance_id, full_name: r.full_name }))
+            });
+        }
 
-        // ============= فحص Missing Lunch (معدّل) =============
+        // 2) امنع الـ Submit إذا في استراحة/غدا مفتوح لسا ما انسكر
+        const [openLeaves] = await connection.execute(
+            `SELECT alp.leave_id, w.full_name
+             FROM attendanceleaveperiods alp
+             JOIN attendance a ON a.attendance_id = alp.attendance_id
+             JOIN workers w ON w.worker_id = a.worker_id
+             WHERE a.site_id = ?
+               AND (a.record_date = ? OR a.record_date = DATE_SUB(?, INTERVAL 1 DAY))
+               AND a.status = 'Draft'
+               AND alp.leave_end_time IS NULL`,
+            [siteId, record_date, record_date]
+        );
+        if (openLeaves.length > 0) {
+            await connection.rollback();
+            transactionStarted = false;
+            return res.status(400).json({
+                status: 'error',
+                message: 'Some workers still have an active break that has not ended.',
+                open_workers: openLeaves.map(r => ({ leave_id: r.leave_id, full_name: r.full_name }))
+            });
+        }
+
+        // 3) فحص Missing Lunch — بس للي فعلاً شيفتهم بيتقاطع مع وقت الغدا (أو طويل بدون غدا مسجّل بالموقع)
         const [missingLunch] = await connection.execute(
             `SELECT a.attendance_id, w.full_name
              FROM attendance a
@@ -932,7 +966,9 @@ exports.submitDay = async (req, res) => {
                 });
             }
 
-            // كل العمال الناقصين معهم سبب مؤكد → وثّق كل واحد بالـ remarks + audit log
+            // كل العمال الناقصين معهم سبب مؤكد -> وثّق كل واحد بالـ remarks + audit log
+            // ملاحظة مهمة: ما منضيف أي سجل إجازة "Lunch" هون، فبالتالي ما في أي خصم
+            // من ساعات شغلهم — تماماً متل المطلوب (اشتغل عالساعة و ما اخد غدا).
             for (const row of missingLunch) {
                 const reason = confirmedMap.get(Number(row.attendance_id));
                 await connection.execute(
@@ -949,7 +985,55 @@ exports.submitDay = async (req, res) => {
             }
         }
 
-        // ... باقي الكود (إنشاء سجلات الغياب، حساب الساعات، Submit) زي ما هوّ بدون تغيير ...
+        // 4) أنشئ سجلات "غياب" تلقائية للعمال المعينين على الموقع واللي ما إلهم أي سجل حضور اليوم
+        await connection.execute(
+            `INSERT INTO attendance (worker_id, site_id, record_date, attendance_status, status, recorded_by_user_id, remarks)
+             SELECT w.worker_id, wsa.site_id, ?, 'Absent', 'Draft', ?, 'Auto-marked absent on day submission'
+             FROM workersiteassignments wsa
+             JOIN workers w ON w.worker_id = wsa.worker_id AND w.status = 'Active'
+             WHERE wsa.site_id = ? AND wsa.unassigned_date IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM attendance a
+                   WHERE a.worker_id = w.worker_id AND a.site_id = wsa.site_id AND a.record_date = ?
+               )`,
+            [record_date, req.user.user_id, siteId, record_date]
+        );
+
+        // 5) أعد حساب ساعات الشغل لكل سجل Draft عنده Check-in و Check-out (يشمل تصحيح الغدا/الاستراحات الأخيرة)
+        const [completedShifts] = await connection.execute(
+            `SELECT attendance_id FROM attendance
+             WHERE site_id = ?
+               AND (record_date = ? OR record_date = DATE_SUB(?, INTERVAL 1 DAY))
+               AND status = 'Draft'
+               AND check_in_time IS NOT NULL AND check_out_time IS NOT NULL`,
+            [siteId, record_date, record_date]
+        );
+        for (const shift of completedShifts) {
+            await attendanceService.calculateWorkingHours(shift.attendance_id, connection);
+        }
+
+        // 6) أرسل كل سجلات الـ Draft الخاصة بهاد الموقع/التاريخ لحالة Submitted
+        const [submitted] = await connection.execute(
+            `UPDATE attendance
+             SET status = 'Submitted'
+             WHERE site_id = ?
+               AND (record_date = ? OR record_date = DATE_SUB(?, INTERVAL 1 DAY))
+               AND status = 'Draft'`,
+            [siteId, record_date, record_date]
+        );
+
+        await connection.execute(
+            `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+             VALUES ('attendance', 0, 'DAY_SUBMITTED', ?, NULL, ?)`,
+            [req.user.user_id, JSON.stringify({ site_id: siteId, record_date, affected_rows: submitted.affectedRows })]
+        );
+
+        await connection.commit();
+        return res.status(200).json({
+            status: 'success',
+            message: 'Day submitted successfully for review.',
+            submitted_records: submitted.affectedRows
+        });
     } catch (error) {
         if (transactionStarted) {
             try { await connection.rollback(); } catch (rollbackError) { console.error('ROLLBACK ERROR:', rollbackError); }
