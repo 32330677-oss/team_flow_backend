@@ -61,7 +61,15 @@ function normalizedCompensationValues(payment_type, daily_rate, regular_hourly_r
 // 1. جلب جميع العمال
 exports.getAllWorkers = async (req, res) => {
     try {
-        const query = 'SELECT * FROM workers ORDER BY created_at DESC';
+        const query = `
+            SELECT w.*,
+                   wsa.site_id AS assigned_site_id,
+                   s.site_name AS assigned_site_name
+            FROM workers w
+            LEFT JOIN workersiteassignments wsa
+                   ON wsa.worker_id = w.worker_id AND wsa.unassigned_date IS NULL
+            LEFT JOIN sites s ON s.site_id = wsa.site_id
+            ORDER BY w.created_at DESC`;
         const [rows] = await db.query(query);
 
         const processedRows = rows.map(row => {

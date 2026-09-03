@@ -20,6 +20,6 @@ router.patch('/:attendance_id/resubmit', restrictTo('Supervisor'), attendanceCon
 // attendanceRoutes.js
 router.post('/bulk/checkin', restrictTo('Admin', 'Supervisor'), attendanceController.bulkCheckIn);
 router.post('/bulk/checkout', restrictTo('Admin', 'Supervisor'), attendanceController.bulkCheckOut);
-
+router.patch('/:attendance_id/edit-times', attendanceController.editAttendanceTimes);
 
 module.exports = router;

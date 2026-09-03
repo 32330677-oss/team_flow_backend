@@ -143,120 +143,114 @@ exports.getSiteWorkers = async (req, res) => {
         res.status(500).json({ status: 'error', message: 'An error occurred while fetching worker data, please try again.' });
     }
 };
-
 exports.checkIn = async (req, res) => {
+    const { worker_id, site_id, check_in_time } = req.body;
+    const recorded_by_user_id = req.user.user_id;
+
+    if (!worker_id || !site_id) {
+        return res.status(400).json({ status: 'error', message: 'Worker and site are required.' });
+    }
+    if (!check_in_time) {
+        return res.status(400).json({ status: 'error', message: 'Check-in time is required.' });
+    }
+
+    const formattedCheckIn = formatToMySqlDateTime(check_in_time);
+    if (!formattedCheckIn) {
+        return res.status(400).json({ status: 'error', message: 'Invalid check-in time format.' });
+    }
+
+    if (!(await verifySiteAction(req, site_id))) {
+        return res.status(403).json({ status: 'error', message: 'You are not authorized to record attendance at this site.' });
+    }
+    if (!(await verifyWorkerAssignedToSite(worker_id, site_id))) {
+        return res.status(400).json({ status: 'error', message: 'Worker is not active or is not assigned to this site.' });
+    }
+
+    const recordDate = formattedCheckIn.slice(0, 10);
+    const connection = await db.getConnection();
+
     try {
-        const { worker_id, site_id, check_in_time } = req.body;
-        const recorded_by_user_id = req.user.user_id;
+        await connection.beginTransaction();
 
-        if (!worker_id || !site_id) {
-            return res.status(400).json({ status: 'error', message: 'Worker and site are required.' });
-        }
-        if (!check_in_time) {
-            return res.status(400).json({ status: 'error', message: 'Check-in time is required.' });
-        }
-
-        const formattedCheckIn = formatToMySqlDateTime(check_in_time);
-        if (!formattedCheckIn) {
-            return res.status(400).json({ status: 'error', message: 'Invalid check-in time format.' });
+        // قفل أي شيفت مفتوح سابق لنفس العامل (بما فيه شيفت بلش أمس ولسا مفتوح)
+        const openShiftId = await getAttendanceId(worker_id, site_id, recordDate, connection, true);
+        if (openShiftId) {
+            await connection.rollback();
+            return res.status(409).json({
+                status: 'error',
+                message: 'There is a previous open shift that hasn\'t been closed yet. Close it first before logging in again.'
+            });
         }
 
-        if (!(await verifySiteAction(req, site_id))) {
-            return res.status(403).json({ status: 'error', message: 'You are not authorized to record attendance at this site.' });
-        }
-        if (!(await verifyWorkerAssignedToSite(worker_id, site_id))) {
-            return res.status(400).json({ status: 'error', message: 'Worker is not active or is not assigned to this site.' });
-        }
-
-        const recordDate = formattedCheckIn.slice(0, 10);
-        // قبل إنشاء سجل جديد، تحقق أولاً من عدم وجود أي شيفت مفتوح للعامل (بصرف النظر عن الموقع أو التاريخ الدقيق)
-const openShift = await getAttendanceId(worker_id, site_id, recordDate); // نفس الدالة المستخدمة في checkOut
-if (openShift) {
-    return res.status(409).json({ status: 'error', message: 'There is a previous open shift that hasnt been closed yet. Close it first before logging in again.' });
-}
-        const [existingToday] = await db.execute(
+        const [existingToday] = await connection.execute(
             `SELECT attendance_id, attendance_status, check_in_time, check_out_time, status
              FROM attendance
              WHERE worker_id = ? AND site_id = ? AND record_date = ?
              ORDER BY attendance_id DESC
-             LIMIT 1`,
+             LIMIT 1 FOR UPDATE`,
             [worker_id, site_id, recordDate]
         );
+
         if (existingToday.length > 0) {
             const existing = existingToday[0];
+
             if (existing.status === 'Rejected') {
+                await connection.rollback();
                 return res.status(409).json({
                     status: 'error',
                     message: 'This attendance record was rejected. Open Rejected Records and resubmit it.'
                 });
             }
             if (existing.status !== 'Draft') {
+                await connection.rollback();
                 return res.status(409).json({ status: 'error', message: 'Worker already has a finalized attendance record for today.' });
             }
             if (['Absent', 'Sick', 'Vacation', 'Holiday'].includes(existing.attendance_status) && !existing.check_in_time && !existing.check_out_time) {
-                const connection = await db.getConnection();
-                try {
-                    await connection.beginTransaction();
-                    const [revived] = await connection.execute(
-                        `UPDATE attendance
-                         SET check_in_time = ?, attendance_status = 'Present', remarks = NULL
-                         WHERE attendance_id = ? AND status = 'Draft'
-                           AND check_in_time IS NULL AND check_out_time IS NULL`,
-                        [formattedCheckIn, existing.attendance_id]
-                    );
-                    if (revived.affectedRows !== 1) {
-                        throw new AppError('Attendance was changed by another request.');
-                    }
-                    await connection.execute(
-                        `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
-                         VALUES ('attendance', ?, 'CHECK_IN', ?, ?, ?)`,
-                        [existing.attendance_id, recorded_by_user_id, JSON.stringify({ attendance_status: existing.attendance_status }), JSON.stringify({ check_in_time: formattedCheckIn, attendance_status: 'Present' })]
-                    );
-                    await connection.commit();
-                    return res.status(200).json({
-                        status: 'success',
-                        message: 'Check-in recorded successfully',
-                        data: { attendance_id: existing.attendance_id, check_in_time: formattedCheckIn, attendance_status: 'Present' }
-                    });
-                } catch (error) {
-                    await connection.rollback();
-                    throw error;
-                } finally {
-                    connection.release();
-                }
+                const [revived] = await connection.execute(
+                    `UPDATE attendance
+                     SET check_in_time = ?, attendance_status = 'Present', remarks = NULL
+                     WHERE attendance_id = ? AND status = 'Draft'
+                       AND check_in_time IS NULL AND check_out_time IS NULL`,
+                    [formattedCheckIn, existing.attendance_id]
+                );
+                if (revived.affectedRows !== 1) throw new AppError('Attendance was changed by another request.');
+
+                await connection.execute(
+                    `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+                     VALUES ('attendance', ?, 'CHECK_IN', ?, ?, ?)`,
+                    [existing.attendance_id, recorded_by_user_id, JSON.stringify({ attendance_status: existing.attendance_status }), JSON.stringify({ check_in_time: formattedCheckIn, attendance_status: 'Present' })]
+                );
+                await connection.commit();
+                return res.status(200).json({
+                    status: 'success',
+                    message: 'Check-in recorded successfully',
+                    data: { attendance_id: existing.attendance_id, check_in_time: formattedCheckIn, attendance_status: 'Present' }
+                });
             }
+            await connection.rollback();
             return res.status(409).json({ status: 'error', message: 'Worker already has an attendance record for today.' });
         }
 
-        const connection = await db.getConnection();
-        try {
-            await connection.beginTransaction();
+        const [result] = await connection.execute(
+            `INSERT INTO attendance (worker_id, site_id, record_date, check_in_time, attendance_status, status, recorded_by_user_id)
+             VALUES (?, ?, ?, ?, 'Present', 'Draft', ?)`,
+            [worker_id, site_id, recordDate, formattedCheckIn, recorded_by_user_id]
+        );
 
-            const [result] = await connection.execute(
-                `INSERT INTO attendance (worker_id, site_id, record_date, check_in_time, attendance_status, status, recorded_by_user_id)
-                 VALUES (?, ?, ?, ?, 'Present', 'Draft', ?)`,
-                [worker_id, site_id, recordDate, formattedCheckIn, recorded_by_user_id]
-            );
+        await connection.execute(
+            `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+             VALUES ('attendance', ?, 'CHECK_IN', ?, NULL, ?)`,
+            [result.insertId, recorded_by_user_id, JSON.stringify({ check_in_time: formattedCheckIn })]
+        );
 
-            await connection.execute(
-                `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
-                 VALUES ('attendance', ?, 'CHECK_IN', ?, NULL, ?)`,
-                [result.insertId, recorded_by_user_id, JSON.stringify({ check_in_time: formattedCheckIn })]
-            );
-
-            await connection.commit();
-            res.status(201).json({
-                status: 'success',
-                message: 'Check-in recorded successfully',
-                data: { attendance_id: result.insertId, check_in_time: formattedCheckIn, attendance_status: 'Present' }
-            });
-        } catch (error) {
-            await connection.rollback();
-            throw error;
-        } finally {
-            connection.release();
-        }
+        await connection.commit();
+        return res.status(201).json({
+            status: 'success',
+            message: 'Check-in recorded successfully',
+            data: { attendance_id: result.insertId, check_in_time: formattedCheckIn, attendance_status: 'Present' }
+        });
     } catch (error) {
+        await connection.rollback();
         console.error("CHECK-IN ERROR:", error);
         if (error.code === 'ER_DUP_ENTRY' || error.errno === 1062) {
             return res.status(409).json({ status: 'error', message: 'Worker already has an attendance record for this date.' });
@@ -266,6 +260,8 @@ if (openShift) {
             status: 'error',
             message: error.isOperational ? error.message : 'An error occurred while recording check-in, please try again.'
         });
+    } finally {
+        connection.release();
     }
 };
 
@@ -497,6 +493,97 @@ exports.setAttendanceStatus = async (req, res) => {
         connection.release();
     }
 };
+
+// السماح للأدمن/السوبرفايزر بتصحيح وقت الدخول أو الخروج لسجل لسا Draft
+// (لم يُرسل للمراجعة بعد). يمنع التعديل بعد Submit عمداً حفاظاً على سلامة السجل.
+exports.editAttendanceTimes = async (req, res) => {
+    const { attendance_id } = req.params;
+    const { check_in_time, check_out_time } = req.body;
+    const userId = req.user.user_id;
+
+    if (!check_in_time && !check_out_time) {
+        return res.status(400).json({ status: 'error', message: 'Provide at least a new check-in or check-out time.' });
+    }
+
+    const connection = await db.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const [rows] = await connection.execute(
+            'SELECT * FROM attendance WHERE attendance_id = ? FOR UPDATE',
+            [attendance_id]
+        );
+        if (rows.length === 0) throw new AppError('Attendance record not found.');
+        const record = rows[0];
+
+        if (record.status !== 'Draft') {
+            throw new AppError('Only records still in Draft status can be edited here.');
+        }
+        if (!(await verifySiteAction(req, record.site_id))) {
+            throw new AppError('You are not authorized to edit attendance for this site.');
+        }
+
+        const newCheckIn = check_in_time ? formatToMySqlDateTime(check_in_time) : record.check_in_time;
+        const newCheckOut = check_out_time ? formatToMySqlDateTime(check_out_time) : record.check_out_time;
+
+        if (check_in_time && !newCheckIn) throw new AppError('Invalid check-in time format.');
+        if (check_out_time && !newCheckOut) throw new AppError('Invalid check-out time format.');
+
+        if (newCheckIn && newCheckOut) {
+            const start = parseAttendanceDate(newCheckIn);
+            const end = parseAttendanceDate(newCheckOut);
+            if (!start || !end || end <= start) {
+                throw new AppError('Check-out time must be after check-in time.');
+            }
+
+            const [leaves] = await connection.execute(
+                `SELECT leave_start_time, leave_end_time FROM attendanceleaveperiods WHERE attendance_id = ?`,
+                [attendance_id]
+            );
+            for (const leave of leaves) {
+                const leaveStart = parseAttendanceDate(leave.leave_start_time);
+                const leaveEnd = leave.leave_end_time ? parseAttendanceDate(leave.leave_end_time) : null;
+                if (leaveStart && leaveStart < start) {
+                    throw new AppError('Cannot set check-in after an existing break/lunch start. Adjust the break first.');
+                }
+                if (leaveEnd && leaveEnd > end) {
+                    throw new AppError('Cannot set check-out before an existing break/lunch end. Adjust the break first.');
+                }
+            }
+        }
+
+        const [updated] = await connection.execute(
+            `UPDATE attendance SET check_in_time = ?, check_out_time = ? WHERE attendance_id = ? AND status = 'Draft'`,
+            [newCheckIn, newCheckOut, attendance_id]
+        );
+        if (updated.affectedRows !== 1) throw new AppError('Attendance was changed by another request.');
+
+        await connection.execute(
+            `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+             VALUES ('attendance', ?, 'TIMES_CORRECTED', ?, ?, ?)`,
+            [
+                attendance_id, userId,
+                JSON.stringify({ check_in_time: record.check_in_time, check_out_time: record.check_out_time }),
+                JSON.stringify({ check_in_time: newCheckIn, check_out_time: newCheckOut })
+            ]
+        );
+
+        if (newCheckIn && newCheckOut) {
+            await attendanceService.calculateWorkingHours(attendance_id, connection);
+        }
+
+        await connection.commit();
+        return res.status(200).json({ status: 'success', message: 'Attendance times updated successfully.' });
+    } catch (error) {
+        await connection.rollback();
+        console.error('EDIT ATTENDANCE TIMES ERROR:', error);
+        const status = error.isOperational ? 400 : 500;
+        return res.status(status).json({ status: 'error', message: error.isOperational ? error.message : 'An error occurred while editing attendance times.' });
+    } finally {
+        connection.release();
+    }
+};
+
 
 exports.checkOut = async (req, res) => {
     const { worker_id, site_id, check_out_time, record_date } = req.body;
@@ -753,7 +840,7 @@ exports.saveLunchBulk = async (req, res) => {
     }
 };
 exports.submitDay = async (req, res) => {
-    const { siteId, record_date } = req.body;
+    const { siteId, record_date, force } = req.body;
 
     if (!siteId || !isValidDateOnly(record_date)) {
         return res.status(400).json({
@@ -845,40 +932,59 @@ exports.submitDay = async (req, res) => {
         // 5. التحقق من Missing Lunch
         // =========================================================
         // هذا مجرد Validation، لذلك لا نستخدم FOR UPDATE.
-        const [missingLunch] = await connection.execute(
-            `SELECT a.attendance_id, w.full_name
-             FROM attendance a
-             JOIN workers w
-                  ON w.worker_id = a.worker_id
-             LEFT JOIN attendanceleaveperiods alp
-                  ON alp.attendance_id = a.attendance_id
-                 AND alp.leave_type = 'Lunch'
-             WHERE a.site_id = ?
-               AND a.status = 'Draft'
-               AND (
-                    a.record_date = ?
-                    OR a.record_date = DATE_SUB(?, INTERVAL 1 DAY)
-               )
-               AND a.check_in_time IS NOT NULL
-               AND a.check_out_time IS NOT NULL
-               AND alp.leave_id IS NULL`,
-            [siteId, record_date, record_date]
-        );
+             // =========================================================
+        // 5. التحقق من Missing Lunch (بشكل ذكي)
+        // فقط العمال يلي وردياتهم فعلاً بتتقاطع مع وقت الغدا الفعلي
+        // المسجّل لباقي الموقع بنفس اليوم. إذا ما في غدا مسجل لحدا لسا
+        // (site_lunch_start = NULL) منكتفي بفحص الورديات الطويلة (>=5 ساعات).
+        // =========================================================
+        if (!force) {
+            const [missingLunch] = await connection.execute(
+                `SELECT a.attendance_id, w.full_name
+                 FROM attendance a
+                 JOIN workers w ON w.worker_id = a.worker_id
+                 LEFT JOIN attendanceleaveperiods alp
+                        ON alp.attendance_id = a.attendance_id
+                       AND alp.leave_type = 'Lunch'
+                 LEFT JOIN (
+                        SELECT MIN(alp2.leave_start_time) AS site_lunch_start,
+                               MAX(alp2.leave_end_time)   AS site_lunch_end
+                        FROM attendanceleaveperiods alp2
+                        JOIN attendance a2 ON a2.attendance_id = alp2.attendance_id
+                        WHERE a2.site_id = ?
+                          AND alp2.leave_type = 'Lunch'
+                          AND (a2.record_date = ? OR a2.record_date = DATE_SUB(?, INTERVAL 1 DAY))
+                 ) ref ON 1 = 1
+                 WHERE a.site_id = ?
+                   AND a.status = 'Draft'
+                   AND (a.record_date = ? OR a.record_date = DATE_SUB(?, INTERVAL 1 DAY))
+                   AND a.check_in_time IS NOT NULL
+                   AND a.check_out_time IS NOT NULL
+                   AND alp.leave_id IS NULL
+                   AND (
+                        (ref.site_lunch_start IS NULL
+                            AND TIMESTAMPDIFF(MINUTE, a.check_in_time, a.check_out_time) >= 300)
+                        OR
+                        (ref.site_lunch_start IS NOT NULL
+                            AND a.check_in_time < ref.site_lunch_end
+                            AND a.check_out_time > ref.site_lunch_start)
+                   )`,
+                [siteId, record_date, record_date, siteId, record_date, record_date]
+            );
 
-        if (missingLunch.length > 0) {
-            await connection.rollback();
-            transactionStarted = false;
+            if (missingLunch.length > 0) {
+                await connection.rollback();
+                transactionStarted = false;
 
-            const names = missingLunch
-                .map(row => row.full_name)
-                .join(', ');
+                const names = missingLunch.map(row => row.full_name).join(', ');
 
-            return res.status(200).json({
-                status: 'warning',
-                requires_confirmation: true,
-                message: `Warning: Lunch time is missing for: ${names}. Do you still want to submit?`,
-                missing_workers: missingLunch.map(row => row.full_name)
-            });
+                return res.status(200).json({
+                    status: 'warning',
+                    requires_confirmation: true,
+                    message: `Warning: Lunch time is missing for: ${names}. Do you still want to submit?`,
+                    missing_workers: missingLunch.map(row => row.full_name)
+                });
+            }
         }
 
         // =========================================================
