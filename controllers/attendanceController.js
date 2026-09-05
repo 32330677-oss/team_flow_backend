@@ -1,6 +1,6 @@
 const db = require('../config/db');
 const attendanceService = require('../services/attendanceService');
-
+const settingsCache = require('../services/settingsCache');
 class AppError extends Error {
     constructor(message) {
         super(message);
@@ -1743,6 +1743,18 @@ exports.endLeave = async (req, res) => {
     }
 };
 
+// =====================================================================
+// Add this require at the top of controllers/attendanceController.js
+// (it is not currently imported there):
+//
+//   const settingsCache = require('../services/settingsCache');
+//
+// Then REPLACE the existing `exports.setManagementLeaveHours` function
+// with the version below. Nothing else in the file needs to change —
+// attendanceService.calculateWorkingHours() is still used unchanged for
+// the "complete shift" case.
+// =====================================================================
+
 exports.setManagementLeaveHours = async (req, res) => {
     const { attendance_id } = req.params;
     const { hours, reason } = req.body;
@@ -1756,8 +1768,12 @@ exports.setManagementLeaveHours = async (req, res) => {
         return res.status(403).json({ status: 'error', message: 'Only an Admin can grant management leave hours.' });
     }
 
+    const trimmedReason = String(reason || '').trim();
+
     const connection = await db.getConnection();
     let oldRecord;
+    let responseMessage = 'Management leave hours recorded successfully';
+    let responseWarning = null;
 
     try {
         await connection.beginTransaction();
@@ -1766,21 +1782,69 @@ exports.setManagementLeaveHours = async (req, res) => {
         if (rows.length === 0) throw new AppError('Record not found');
         oldRecord = rows[0];
 
-        const [updated] = await connection.execute(
-            'UPDATE attendance SET management_leave_hours = ? WHERE attendance_id = ?',
-            [numericHours, attendance_id]
-        );
-        if (updated.affectedRows !== 1) throw new AppError('Attendance was changed by another request.');
+        const hasCheckIn = Boolean(oldRecord.check_in_time);
+        const hasCheckOut = Boolean(oldRecord.check_out_time);
+
+        // Case C: no shift at all (Absent / Sick / Vacation / Holiday).
+        // Admin is granting hours with nothing to attach them to, so a
+        // reason is mandatory and we must set total_working_hours directly
+        // — calculateWorkingHours() cannot run without check-in/check-out.
+        if (!hasCheckIn) {
+            if (!trimmedReason) {
+                throw new AppError('A reason is required when granting management leave hours to a worker with no check-in (Absent/Sick/Vacation/Holiday).');
+            }
+
+            let standardMinutes;
+            if (oldRecord.standard_minutes_snapshot !== null && oldRecord.standard_minutes_snapshot !== undefined) {
+                standardMinutes = Number(oldRecord.standard_minutes_snapshot);
+            } else {
+                const configured = Number(await settingsCache.getSetting('standard_work_minutes', '600'));
+                standardMinutes = Number.isFinite(configured) && configured > 0 ? configured : 600;
+            }
+
+            const standardHours = standardMinutes / 60;
+            const regularHours = Math.min(numericHours, standardHours);
+            const overtimeHours = Math.max(0, numericHours - standardHours);
+
+            const [updated] = await connection.execute(
+                `UPDATE attendance
+                 SET management_leave_hours = ?,
+                     total_working_hours = ?,
+                     overtime_hours = ?,
+                     standard_minutes_snapshot = COALESCE(standard_minutes_snapshot, ?)
+                 WHERE attendance_id = ?`,
+                [numericHours, regularHours.toFixed(2), overtimeHours.toFixed(2), standardMinutes, attendance_id]
+            );
+            if (updated.affectedRows !== 1) throw new AppError('Attendance was changed by another request.');
+
+            responseMessage = `Management leave recorded (${numericHours}h) and counted directly as working hours since the worker has no check-in.`;
+        } else if (hasCheckIn && !hasCheckOut) {
+            // Case B: shift still open. Do NOT touch total_working_hours —
+            // leave the existing "wait for checkout" behavior untouched.
+            const [updated] = await connection.execute(
+                'UPDATE attendance SET management_leave_hours = ? WHERE attendance_id = ?',
+                [numericHours, attendance_id]
+            );
+            if (updated.affectedRows !== 1) throw new AppError('Attendance was changed by another request.');
+
+            responseWarning = 'Worker has not checked out yet. These hours are saved but will not be reflected in working hours until checkout is completed.';
+        } else {
+            // Case A: complete shift (check-in + check-out). Existing behavior.
+            const [updated] = await connection.execute(
+                'UPDATE attendance SET management_leave_hours = ? WHERE attendance_id = ?',
+                [numericHours, attendance_id]
+            );
+            if (updated.affectedRows !== 1) throw new AppError('Attendance was changed by another request.');
+
+            await attendanceService.calculateWorkingHours(attendance_id, connection);
+        }
 
         await connection.execute(
             `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
              VALUES ('attendance', ?, 'MANAGEMENT_LEAVE', ?, ?, ?)`,
-            [attendance_id, adminId, JSON.stringify(oldRecord), JSON.stringify({ management_leave_hours: numericHours, reason })]
+            [attendance_id, adminId, JSON.stringify(oldRecord), JSON.stringify({ management_leave_hours: numericHours, reason: trimmedReason || null })]
         );
 
-        if (oldRecord.check_out_time) {
-            await attendanceService.calculateWorkingHours(attendance_id, connection);
-        }
         await connection.commit();
     } catch (error) {
         await connection.rollback();
@@ -1792,7 +1856,7 @@ exports.setManagementLeaveHours = async (req, res) => {
         connection.release();
     }
 
-    res.status(200).json({ status: 'success', message: 'Management leave hours recorded successfully' });
+    res.status(200).json({ status: 'success', message: responseMessage, warning: responseWarning });
 };
 
 exports.resubmitAttendance = async (req, res) => {
