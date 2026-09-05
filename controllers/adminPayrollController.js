@@ -28,6 +28,13 @@ function money(value) {
   return Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 }
 
+// ============================================================
+// REPLACEMENT for generatePayrollBatch in controllers/adminPayrollController.js
+// (everything else in that file — getPayrollReport, getPayrollBatchDetails,
+// markBatchAsPaid, getLastBatchEndDate, exportPayrollExcel,
+// exportDailyAttendanceExcel — stays exactly as it is, no changes needed there)
+// ============================================================
+
 async function generatePayrollBatch(req, res) {
   const { start_date, end_date, site_id } = req.body || {};
   const userId = req.user?.user_id;
@@ -61,22 +68,52 @@ async function generatePayrollBatch(req, res) {
       return res.status(409).json({ success: false, message: 'An overlapping payroll batch already exists for this scope.' });
     }
 
-    // NOTE: added a.attendance_status + a.standard_minutes_snapshot.
-    // We need these two to correctly prorate Daily-rate workers by actual
-    // hours worked instead of paying a full day for any approved record.
+    // =========================================================================
+    // FIX #1: the previous version used
+    //   JOIN workersiteassignments wsa
+    //     ON wsa.worker_id = a.worker_id AND wsa.site_id = a.site_id
+    //    AND wsa.assigned_date <= a.record_date
+    //    AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date >= a.record_date)
+    // Using ">=" makes the interval CLOSED on both ends. If a worker is
+    // unassigned and immediately re-assigned to the SAME site on the SAME day
+    // (very common on same-day transfers), there are TWO assignment rows that
+    // both satisfy the condition for that exact record_date, so the JOIN
+    // returns the attendance row TWICE and the worker gets paid double for
+    // that day. Below the interval is HALF-OPEN ([assigned_date, unassigned_date)),
+    // via a correlated subquery, so at most one assignment can ever match a
+    // given (worker, site, date) triple.
+    //
+    // FIX #2: the previous version required "w.status = 'Active'". If a
+    // worker becomes Inactive/leaves AFTER the payroll period but BEFORE the
+    // payroll is generated, their already-Approved attendance for that period
+    // was silently dropped — money owed for real worked hours simply
+    // vanished with no error. That filter has been removed: payroll must
+    // reflect what was actually approved in attendance, not the worker's
+    // current status.
+    //
+    // FIX #3: if an Approved attendance record has NO matching assignment
+    // at all for that site/date (a data-integrity gap), the old code just
+    // silently excluded it via the INNER JOIN. Now we detect this explicitly
+    // and FAIL LOUDLY with the exact worker/site/date, instead of quietly
+    // generating a payroll that doesn't match attendance.
+    // =========================================================================
     const attParams = [start_date, end_date];
     let attSql = `
       SELECT a.attendance_id, a.worker_id, w.full_name AS worker_name, w.payment_type,
              a.record_date, a.site_id, a.total_working_hours, a.overtime_hours,
              a.attendance_status, a.standard_minutes_snapshot,
-             wsa.contract_id
+             (
+               SELECT wsa2.contract_id
+               FROM workersiteassignments wsa2
+               WHERE wsa2.worker_id = a.worker_id
+                 AND wsa2.site_id = a.site_id
+                 AND wsa2.assigned_date <= a.record_date
+                 AND (wsa2.unassigned_date IS NULL OR wsa2.unassigned_date > a.record_date)
+               ORDER BY wsa2.assigned_date DESC, wsa2.assignment_id DESC
+               LIMIT 1
+             ) AS contract_id
       FROM attendance a
-      JOIN workers w ON w.worker_id = a.worker_id AND w.status = 'Active'
-      JOIN workersiteassignments wsa
-        ON wsa.worker_id = a.worker_id
-       AND wsa.site_id = a.site_id
-       AND wsa.assigned_date <= a.record_date
-       AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date >= a.record_date)
+      JOIN workers w ON w.worker_id = a.worker_id
       WHERE a.record_date BETWEEN ? AND ?
         AND a.status = 'Approved'`;
     if (scopedSite) { attSql += ' AND a.site_id = ?'; attParams.push(site_id); }
@@ -87,6 +124,21 @@ async function generatePayrollBatch(req, res) {
     if (!attendanceRows.length) {
       await connection.rollback();
       return res.status(404).json({ success: false, message: 'No Approved attendance found for this period.' });
+    }
+
+    // FIX #3 continued: reject up front if any approved attendance has no
+    // matching assignment record, instead of silently skipping it.
+    const missingAssignment = attendanceRows.filter((r) => r.contract_id === null || r.contract_id === undefined);
+    if (missingAssignment.length) {
+      await connection.rollback();
+      const sample = missingAssignment.slice(0, 5).map(
+        (r) => `worker_id=${r.worker_id} site_id=${r.site_id} date=${r.record_date}`
+      ).join('; ');
+      return res.status(422).json({
+        success: false,
+        message: `Found ${missingAssignment.length} approved attendance record(s) with no matching site assignment. ` +
+          `Payroll cannot be generated until this is fixed (e.g. missing/backdated workersiteassignments row). Examples: ${sample}`
+      });
     }
 
     const workerIds = [...new Set(attendanceRows.map(r => r.worker_id))];
@@ -143,7 +195,7 @@ async function generatePayrollBatch(req, res) {
           daily_rate: comp.daily_rate,
           regular_hourly_rate: comp.regular_hourly_rate,
           overtime_hourly_rate: comp.overtime_hourly_rate,
-          days_worked: 0,     // now stores PAID day-equivalents (can be fractional, e.g. 0.5)
+          days_worked: 0,     // PAID day-equivalents (can be fractional, e.g. 0.5)
           regular_hours: 0,
           overtime_hours: 0,
         });
@@ -151,27 +203,25 @@ async function generatePayrollBatch(req, res) {
       const g = groups.get(groupKey);
 
       if (comp.payment_type === 'Daily') {
-        // ============ THE ACTUAL FIX ============
         let dayFraction;
         if (rec.attendance_status === 'Absent') {
-  dayFraction = 0;
-} else if (['Sick', 'Vacation', 'Holiday'].includes(rec.attendance_status)) {
-  dayFraction = 0;
-} else {
-  const standardMinutes = Number(rec.standard_minutes_snapshot) > 0
-    ? Number(rec.standard_minutes_snapshot)
-    : fallbackStandardMinutes;
+          dayFraction = 0;
+        } else if (['Sick', 'Vacation', 'Holiday'].includes(rec.attendance_status)) {
+          dayFraction = 0;
+        } else {
+          const standardMinutes = Number(rec.standard_minutes_snapshot) > 0
+            ? Number(rec.standard_minutes_snapshot)
+            : fallbackStandardMinutes;
 
-  const standardHours = standardMinutes / 60;
-  const workedHours = Number(rec.total_working_hours || 0);
+          const standardHours = standardMinutes / 60;
+          const workedHours = Number(rec.total_working_hours || 0);
 
-  dayFraction = standardHours > 0
-    ? Math.min(1, workedHours / standardHours)
-    : 0;
-}
-        
+          dayFraction = standardHours > 0
+            ? Math.min(1, workedHours / standardHours)
+            : 0;
+        }
+
         g.days_worked += dayFraction;
-        // =========================================
       } else {
         g.regular_hours += Number(rec.total_working_hours || 0);
         g.overtime_hours += Number(rec.overtime_hours || 0);
@@ -265,7 +315,7 @@ async function generatePayrollBatch(req, res) {
             !isDaily ? item.hourlyRate : null,
             !isDaily ? item.overtimeRate : null,
             isDaily ? item.dailyRate : null,
-            isDaily ? item.daysWorked : null, // الآن رقم عشري ممكن (0.5 مثلاً)
+            isDaily ? item.daysWorked : null,
             !isDaily ? item.regularHours : null,
             !isDaily ? item.overtimeHours : null,
             item.baseSalary,
@@ -291,6 +341,8 @@ async function generatePayrollBatch(req, res) {
     connection.release();
   }
 }
+
+module.exports.generatePayrollBatch = generatePayrollBatch;
 
 async function getPayrollReport(req, res) {
   try {
