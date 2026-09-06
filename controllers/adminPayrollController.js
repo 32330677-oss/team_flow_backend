@@ -660,8 +660,8 @@ async function exportPayrollExcel(req, res) {
     function addLogo(sheet, worksheetWorkbook) {
       try {
         const logoId = worksheetWorkbook.addImage({ filename: logoPath, extension: 'png' });
-        // وضع اللوغو في الأعلى، وترك المساحة للأسفل للعنوان
-        sheet.addImage(logoId, { tl: { col: 0.2, row: 0.1 }, ext: { width: 140, height: 50 } });
+        // وضعنا اللوغو بحيث يبدأ في الخلية A1 وبحجم مناسب لا يغطي الكتابات التحتية
+        sheet.addImage(logoId, { tl: { col: 0.1, row: 0.1 }, ext: { width: 130, height: 45 } });
       } catch (e) {
         console.warn('Logo not added:', e.message);
       }
@@ -701,7 +701,7 @@ async function exportPayrollExcel(req, res) {
       { header: 'Worker Name', key: 'worker_name', width: 28 },
       { header: 'Sites', key: 'sites', width: 32 },
       { header: 'Net Salary', key: 'net_salary', width: 18 },
-      { header: 'Signature', key: 'signature', width: 18 }, // عمود البصمة للطباعة
+      { header: 'Signature', key: 'signature', width: 18 },
     ];
 
     summarySheet.mergeCells('A1:F1');
@@ -711,11 +711,11 @@ async function exportPayrollExcel(req, res) {
     summarySheet.mergeCells('A3:F3');
     summarySheet.getCell('A3').value = `Currency: Syrian Pound (ل.س)`;
     
-    // ضبط ارتفاع الصفوف الأولى لتجنب تداخل اللوغو مع النصوص
-    summarySheet.getRow(1).height = 20;
-    summarySheet.getRow(2).height = 20;
-    summarySheet.getRow(3).height = 20;
-    summarySheet.getRow(4).height = 15; // صف فارغ فاصل
+    // توسيع ارتفاع أول 4 أسطر لإعطاء مساحة كافية تحت اللوغو وعدم التداخل
+    summarySheet.getRow(1).height = 25;
+    summarySheet.getRow(2).height = 25;
+    summarySheet.getRow(3).height = 25;
+    summarySheet.getRow(4).height = 20; 
     summarySheet.getRow(5).values = summarySheet.columns.map((c) => c.header);
 
     let grandTotalNet = 0;
@@ -728,7 +728,7 @@ async function exportPayrollExcel(req, res) {
         worker_name: worker.worker_name,
         sites: [...worker.sites].join(', '),
         net_salary: worker.net_salary,
-        signature: '', // فارغ للطباعة اليدوية
+        signature: '',
       });
       grandTotalNet += worker.net_salary;
     }
@@ -773,7 +773,7 @@ async function exportPayrollExcel(req, res) {
         { header: 'Base Salary', key: 'base_salary', width: 16 },
         { header: 'Overtime Pay', key: 'overtime_pay', width: 16 },
         { header: 'Site Total', key: 'site_total', width: 16 },
-        { header: 'Signature', key: 'signature', width: 18 }, // عمود البصمة/التوقيع في النهاية
+        { header: 'Signature', key: 'signature', width: 18 },
       ];
 
       sheet.mergeCells('A1:N1');
@@ -783,10 +783,11 @@ async function exportPayrollExcel(req, res) {
       sheet.mergeCells('A3:N3');
       sheet.getCell('A3').value = `Currency: Syrian Pound (ل.س) — Overtime rate: ${OVERTIME_FLAT_RATE_SYP} ل.س/hour (flat, all workers)`;
       
-      sheet.getRow(1).height = 30;
-      sheet.getRow(2).height = 30;
-      sheet.getRow(3).height = 30;
-      sheet.getRow(4).height = 15; // صف فاصل تحت اللوغو
+      // رفع ارتفاع الأسطر لضمان عدم تغطية اللوغو للنصوص
+      sheet.getRow(1).height = 25;
+      sheet.getRow(2).height = 25;
+      sheet.getRow(3).height = 25;
+      sheet.getRow(4).height = 20; 
       sheet.getRow(5).values = sheet.columns.map((c) => c.header);
 
       let siteTotalBase = 0, siteTotalOT = 0, siteTotalAll = 0;
@@ -804,7 +805,7 @@ async function exportPayrollExcel(req, res) {
           base_salary: Number(item.base_salary || 0),
           overtime_pay: Number(item.overtime_pay || 0),
           site_total: rowTotal,
-          signature: '', // فارغ للطباعة
+          signature: '',
         };
         if (isDaily) {
           rowData.days_worked = item.days_worked;
