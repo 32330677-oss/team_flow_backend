@@ -660,7 +660,6 @@ async function exportPayrollExcel(req, res) {
     function addLogo(sheet, worksheetWorkbook) {
       try {
         const logoId = worksheetWorkbook.addImage({ filename: logoPath, extension: 'png' });
-        // وضعنا اللوغو بحيث يبدأ في الخلية A1 وبحجم مناسب لا يغطي الكتابات التحتية
         sheet.addImage(logoId, { tl: { col: 0.1, row: 0.1 }, ext: { width: 130, height: 45 } });
       } catch (e) {
         console.warn('Logo not added:', e.message);
@@ -691,6 +690,17 @@ async function exportPayrollExcel(req, res) {
       byWorker.get(row.worker_id).sites.add(row.site_name || 'Unassigned');
     }
 
+    // NEW: total distinct workers across the whole batch
+    const totalWorkerCount = byWorker.size;
+
+    // NEW: distinct worker count per site (site_id -> Set of worker_id)
+    const workerCountBySite = new Map();
+    for (const row of rows) {
+      const key = row.site_id ?? 'unassigned';
+      if (!workerCountBySite.has(key)) workerCountBySite.set(key, new Set());
+      workerCountBySite.get(key).add(row.worker_id);
+    }
+
     // ---------------- Summary sheet ----------------
     const summarySheet = workbook.addWorksheet('Summary');
     addLogo(summarySheet, workbook);
@@ -710,12 +720,16 @@ async function exportPayrollExcel(req, res) {
     summarySheet.getCell('A2').value = `Period: ${dateOnly(batch.start_date)} - ${dateOnly(batch.end_date)}`;
     summarySheet.mergeCells('A3:F3');
     summarySheet.getCell('A3').value = `Currency: Syrian Pound (ل.س)`;
-    
-    // توسيع ارتفاع أول 4 أسطر لإعطاء مساحة كافية تحت اللوغو وعدم التداخل
+
+    // NEW: total worker count line (uses the row previously left blank as a spacer)
+    summarySheet.mergeCells('A4:F4');
+    summarySheet.getCell('A4').value = `Total Workers Paid: ${totalWorkerCount}`;
+    summarySheet.getCell('A4').font = { bold: true };
+
     summarySheet.getRow(1).height = 25;
     summarySheet.getRow(2).height = 25;
     summarySheet.getRow(3).height = 25;
-    summarySheet.getRow(4).height = 20; 
+    summarySheet.getRow(4).height = 22;
     summarySheet.getRow(5).values = summarySheet.columns.map((c) => c.header);
 
     let grandTotalNet = 0;
@@ -747,7 +761,7 @@ async function exportPayrollExcel(req, res) {
 
     // ---------------- One worksheet per site ----------------
     const usedNames = new Set(['Summary']);
-    for (const { siteName, rows: siteRows } of bySite.values()) {
+    for (const [siteKey, { siteName, rows: siteRows }] of bySite.entries()) {
       let safeName = siteName.replace(/[\\/*?:[\]]/g, ' ').trim().slice(0, 28) || 'Site';
       let finalName = safeName;
       let counter = 1;
@@ -776,18 +790,24 @@ async function exportPayrollExcel(req, res) {
         { header: 'Signature', key: 'signature', width: 18 },
       ];
 
+      const siteWorkerCount = workerCountBySite.get(siteKey)?.size || 0;
+
       sheet.mergeCells('A1:N1');
       sheet.getCell('A1').value = `Payroll Batch #${batchId} - Site: ${siteName}`;
       sheet.mergeCells('A2:N2');
       sheet.getCell('A2').value = `Period: ${dateOnly(batch.start_date)} - ${dateOnly(batch.end_date)}`;
       sheet.mergeCells('A3:N3');
       sheet.getCell('A3').value = `Currency: Syrian Pound (ل.س) — Overtime rate: ${OVERTIME_FLAT_RATE_SYP} ل.س/hour (flat, all workers)`;
-      
-      // رفع ارتفاع الأسطر لضمان عدم تغطية اللوغو للنصوص
+
+      // NEW: workers-at-this-site count line
+      sheet.mergeCells('A4:N4');
+      sheet.getCell('A4').value = `Workers at this site: ${siteWorkerCount}`;
+      sheet.getCell('A4').font = { bold: true };
+
       sheet.getRow(1).height = 25;
       sheet.getRow(2).height = 25;
       sheet.getRow(3).height = 25;
-      sheet.getRow(4).height = 20; 
+      sheet.getRow(4).height = 22;
       sheet.getRow(5).values = sheet.columns.map((c) => c.header);
 
       let siteTotalBase = 0, siteTotalOT = 0, siteTotalAll = 0;
