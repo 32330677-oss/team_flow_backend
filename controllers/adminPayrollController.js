@@ -623,6 +623,8 @@ async function exportPayrollExcel(req, res) {
 
   try {
     const ExcelJS = require('exceljs');
+    const path = require('path');
+
     const [batches] = await pool.execute(
       `SELECT payroll_batch_id, start_date, end_date, total_workers, total_amount, status,
               version_number, is_finalized
@@ -630,9 +632,11 @@ async function exportPayrollExcel(req, res) {
       [batchId]
     );
     if (!batches.length) return res.status(404).json({ success: false, message: 'Batch not found.' });
+    const batch = batches[0];
 
     const [rows] = await pool.execute(
-      `SELECT w.full_name AS worker_name, s.site_name, pi.pay_type,
+      `SELECT w.full_name AS worker_name, w.worker_unique_id, p.worker_id,
+              s.site_id, s.site_name, pi.pay_type,
               pi.regular_hours_worked, pi.overtime_hours_worked,
               pi.hourly_rate_snapshot, pi.overtime_hourly_rate_snapshot,
               pi.daily_rate_snapshot, pi.days_worked,
@@ -642,86 +646,186 @@ async function exportPayrollExcel(req, res) {
        JOIN payrollitems pi ON pi.payroll_id = p.payroll_id
        LEFT JOIN sites s ON s.site_id = pi.site_id
        WHERE p.payroll_batch_id = ?
-       ORDER BY w.full_name, s.site_name`,
+       ORDER BY s.site_name, w.full_name`,
       [batchId]
     );
 
-    const workbook = new ExcelJS.Workbook();
-    const sheet = workbook.addWorksheet('Payroll');
-    const batch = batches[0];
-    const dateOnly = (v) => (v instanceof Date ? v.toISOString().slice(0, 10) : String(v || '').slice(0, 10));
+    if (!rows.length) {
+      return res.status(404).json({ success: false, message: 'No payroll items found for this batch.' });
+    }
 
-    sheet.columns = [
+    const dateOnly = (v) => (v instanceof Date ? v.toISOString().slice(0, 10) : String(v || '').slice(0, 10));
+    const logoPath = path.join(__dirname, '../assets/logo.png');
+
+    function addLogo(sheet, worksheetWorkbook) {
+      try {
+        const logoId = worksheetWorkbook.addImage({ filename: logoPath, extension: 'png' });
+        sheet.addImage(logoId, { tl: { col: 0.2, row: 0.15 }, ext: { width: 150, height: 60 } });
+      } catch (e) {
+        console.warn('Logo not added:', e.message);
+      }
+    }
+
+    const workbook = new ExcelJS.Workbook();
+
+    // Group rows by site
+    const bySite = new Map();
+    for (const row of rows) {
+      const key = row.site_id ?? 'unassigned';
+      if (!bySite.has(key)) bySite.set(key, { siteName: row.site_name || 'Unassigned', rows: [] });
+      bySite.get(key).rows.push(row);
+    }
+
+    // Group by worker for the true (deduped) net salary in the Summary sheet
+    const byWorker = new Map();
+    for (const row of rows) {
+      if (!byWorker.has(row.worker_id)) {
+        byWorker.set(row.worker_id, {
+          worker_name: row.worker_name,
+          worker_unique_id: row.worker_unique_id,
+          net_salary: Number(row.net_salary || 0),
+          sites: new Set(),
+        });
+      }
+      byWorker.get(row.worker_id).sites.add(row.site_name || 'Unassigned');
+    }
+
+    // ---------------- Summary sheet ----------------
+    const summarySheet = workbook.addWorksheet('Summary');
+    addLogo(summarySheet, workbook);
+
+    summarySheet.columns = [
       { header: 'No.', key: 'number', width: 6 },
+      { header: 'Worker ID', key: 'worker_id', width: 16 },
       { header: 'Worker Name', key: 'worker_name', width: 28 },
-      { header: 'Site', key: 'site_name', width: 20 },
-      { header: 'Payment Type', key: 'pay_type', width: 14 },
-      { header: 'Days Worked', key: 'days_worked', width: 12 },
-      { header: 'Daily Rate', key: 'daily_rate', width: 14 },
-      { header: 'Regular Hours', key: 'regular_hours', width: 14 },
-      { header: 'Overtime Hours', key: 'overtime_hours', width: 14 },
-      { header: 'Regular Rate', key: 'regular_rate', width: 14 },
-      { header: 'Overtime Rate', key: 'overtime_rate', width: 14 },
-      { header: 'Base Salary', key: 'base_salary', width: 16 },
-      { header: 'Overtime Pay', key: 'overtime_pay', width: 16 },
-      { header: 'Net Salary', key: 'net_salary', width: 16 },
+      { header: 'Sites', key: 'sites', width: 32 },
+      { header: 'Net Salary', key: 'net_salary', width: 18 },
     ];
 
-    sheet.mergeCells('A1:M1');
-    sheet.getCell('A1').value = `Payroll Batch #${batchId} (v${batch.version_number}${batch.is_finalized ? ' - Finalized' : ''})`;
-    sheet.mergeCells('A2:M2');
-    sheet.getCell('A2').value = `Period: ${dateOnly(batch.start_date)} - ${dateOnly(batch.end_date)}`;
-    sheet.mergeCells('A3:M3');
-    sheet.getCell('A3').value = `Currency: Syrian Pound (ل.س) — Overtime rate: ${OVERTIME_FLAT_RATE_SYP} ل.س/hour (flat, all workers)`;
-    sheet.getRow(5).values = sheet.columns.map((c) => c.header);
+    summarySheet.mergeCells('A1:E1');
+    summarySheet.getCell('A1').value = `Payroll Batch #${batchId} (v${batch.version_number}${batch.is_finalized ? ' - Finalized' : ''})`;
+    summarySheet.mergeCells('A2:E2');
+    summarySheet.getCell('A2').value = `Period: ${dateOnly(batch.start_date)} - ${dateOnly(batch.end_date)}`;
+    summarySheet.mergeCells('A3:E3');
+    summarySheet.getCell('A3').value = `Currency: Syrian Pound (ل.س) — Overtime rate: ${OVERTIME_FLAT_RATE_SYP} ل.س/hour (flat, all workers)`;
+    summarySheet.getRow(1).height = 48;
+    summarySheet.getRow(5).values = summarySheet.columns.map((c) => c.header);
 
-    let totalBase = 0, totalOT = 0, totalNet = 0;
-
-    rows.forEach((item, index) => {
-      const isDaily = item.pay_type === 'Daily';
-      const rowData = {
-        number: index + 1,
-        worker_name: item.worker_name,
-        site_name: item.site_name || '',
-        pay_type: item.pay_type,
-        overtime_hours: Number(item.overtime_hours_worked || 0),
-        overtime_rate: Number(item.overtime_hourly_rate_snapshot || 0),
-        base_salary: Number(item.base_salary || 0),
-        overtime_pay: Number(item.overtime_pay || 0),
-        net_salary: Number(item.net_salary || 0),
-      };
-      if (isDaily) {
-        rowData.days_worked = item.days_worked;
-        rowData.daily_rate = Number(item.daily_rate_snapshot || 0);
-        // regular hours / regular rate intentionally left blank for Daily rows
-      } else {
-        rowData.regular_hours = Number(item.regular_hours_worked || 0);
-        rowData.regular_rate = Number(item.hourly_rate_snapshot || 0);
-        // days_worked / daily_rate intentionally left blank for Hourly rows
-      }
-      sheet.addRow(rowData);
-
-      totalBase += rowData.base_salary;
-      totalOT += rowData.overtime_pay;
-      totalNet += rowData.net_salary;
+    let grandTotalNet = 0;
+    let idx = 0;
+    for (const worker of byWorker.values()) {
+      idx += 1;
+      summarySheet.addRow({
+        number: idx,
+        worker_id: worker.worker_unique_id,
+        worker_name: worker.worker_name,
+        sites: [...worker.sites].join(', '),
+        net_salary: worker.net_salary,
+      });
+      grandTotalNet += worker.net_salary;
+    }
+    const summaryTotalRow = summarySheet.addRow({
+      worker_name: 'GRAND TOTAL',
+      net_salary: Math.round(grandTotalNet * 100) / 100,
     });
+    summaryTotalRow.font = { bold: true };
 
-    const totalRow = sheet.addRow({
-      worker_name: 'TOTAL',
-      base_salary: Math.round(totalBase * 100) / 100,
-      overtime_pay: Math.round(totalOT * 100) / 100,
-      net_salary: Math.round(totalNet * 100) / 100,
-    });
+    summarySheet.getRow(1).font = { bold: true, size: 16, color: { argb: 'FFFFFFFF' } };
+    summarySheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
+    summarySheet.getRow(5).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    summarySheet.getRow(5).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
+    for (let r = 6; r <= summarySheet.rowCount; r += 1) {
+      summarySheet.getCell(r, 5).numFmt = '#,##0 "ل.س"';
+    }
+    summarySheet.views = [{ state: 'frozen', ySplit: 5 }];
 
-    sheet.getRow(1).font = { bold: true, size: 16, color: { argb: 'FFFFFFFF' } };
-    sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
-    sheet.getRow(5).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-    sheet.getRow(5).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
-    totalRow.font = { bold: true };
-    for (let row = 6; row <= sheet.rowCount; row += 1) {
-      for (const col of [6, 9, 10, 11, 12, 13]) {
-        sheet.getCell(row, col).numFmt = '#,##0 "ل.س"';
+    // ---------------- One worksheet per site ----------------
+    const usedNames = new Set(['Summary']);
+    for (const { siteName, rows: siteRows } of bySite.values()) {
+      let safeName = siteName.replace(/[\\/*?:[\]]/g, ' ').trim().slice(0, 28) || 'Site';
+      let finalName = safeName;
+      let counter = 1;
+      while (usedNames.has(finalName)) {
+        finalName = `${safeName} (${counter++})`;
       }
+      usedNames.add(finalName);
+
+      const sheet = workbook.addWorksheet(finalName);
+      addLogo(sheet, workbook);
+
+      sheet.columns = [
+        { header: 'No.', key: 'number', width: 6 },
+        { header: 'Worker ID', key: 'worker_id', width: 16 },
+        { header: 'Worker Name', key: 'worker_name', width: 28 },
+        { header: 'Payment Type', key: 'pay_type', width: 14 },
+        { header: 'Days Worked', key: 'days_worked', width: 12 },
+        { header: 'Daily Rate', key: 'daily_rate', width: 14 },
+        { header: 'Regular Hours', key: 'regular_hours', width: 14 },
+        { header: 'Overtime Hours', key: 'overtime_hours', width: 14 },
+        { header: 'Regular Rate', key: 'regular_rate', width: 14 },
+        { header: 'Overtime Rate', key: 'overtime_rate', width: 14 },
+        { header: 'Base Salary', key: 'base_salary', width: 16 },
+        { header: 'Overtime Pay', key: 'overtime_pay', width: 16 },
+        { header: 'Site Total', key: 'site_total', width: 16 },
+      ];
+
+      sheet.mergeCells('A1:M1');
+      sheet.getCell('A1').value = `Payroll Batch #${batchId} - Site: ${siteName}`;
+      sheet.mergeCells('A2:M2');
+      sheet.getCell('A2').value = `Period: ${dateOnly(batch.start_date)} - ${dateOnly(batch.end_date)}`;
+      sheet.mergeCells('A3:M3');
+      sheet.getCell('A3').value = `Currency: Syrian Pound (ل.س) — Overtime rate: ${OVERTIME_FLAT_RATE_SYP} ل.س/hour (flat, all workers)`;
+      sheet.getRow(1).height = 48;
+      sheet.getRow(5).values = sheet.columns.map((c) => c.header);
+
+      let siteTotalBase = 0, siteTotalOT = 0, siteTotalAll = 0;
+
+      siteRows.forEach((item, index) => {
+        const isDaily = item.pay_type === 'Daily';
+        const rowTotal = Number(item.base_salary || 0) + Number(item.overtime_pay || 0);
+        const rowData = {
+          number: index + 1,
+          worker_id: item.worker_unique_id,
+          worker_name: item.worker_name,
+          pay_type: item.pay_type,
+          overtime_hours: Number(item.overtime_hours_worked || 0),
+          overtime_rate: Number(item.overtime_hourly_rate_snapshot || 0),
+          base_salary: Number(item.base_salary || 0),
+          overtime_pay: Number(item.overtime_pay || 0),
+          site_total: rowTotal,
+        };
+        if (isDaily) {
+          rowData.days_worked = item.days_worked;
+          rowData.daily_rate = Number(item.daily_rate_snapshot || 0);
+        } else {
+          rowData.regular_hours = Number(item.regular_hours_worked || 0);
+          rowData.regular_rate = Number(item.hourly_rate_snapshot || 0);
+        }
+        sheet.addRow(rowData);
+
+        siteTotalBase += rowData.base_salary;
+        siteTotalOT += rowData.overtime_pay;
+        siteTotalAll += rowTotal;
+      });
+
+      const totalRow = sheet.addRow({
+        worker_name: 'SITE TOTAL',
+        base_salary: Math.round(siteTotalBase * 100) / 100,
+        overtime_pay: Math.round(siteTotalOT * 100) / 100,
+        site_total: Math.round(siteTotalAll * 100) / 100,
+      });
+      totalRow.font = { bold: true };
+
+      sheet.getRow(1).font = { bold: true, size: 16, color: { argb: 'FFFFFFFF' } };
+      sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
+      sheet.getRow(5).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+      sheet.getRow(5).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
+      for (let r = 6; r <= sheet.rowCount; r += 1) {
+        for (const col of [6, 9, 10, 11, 12, 13]) {
+          sheet.getCell(r, col).numFmt = '#,##0 "ل.س"';
+        }
+      }
+      sheet.views = [{ state: 'frozen', ySplit: 5 }];
     }
 
     const fileName = `payroll_batch_${batchId}.xlsx`;
