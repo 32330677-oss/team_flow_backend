@@ -783,9 +783,9 @@ async function exportPayrollExcel(req, res) {
       sheet.mergeCells('A3:N3');
       sheet.getCell('A3').value = `Currency: Syrian Pound (ل.س) — Overtime rate: ${OVERTIME_FLAT_RATE_SYP} ل.س/hour (flat, all workers)`;
       
-      sheet.getRow(1).height = 20;
-      sheet.getRow(2).height = 20;
-      sheet.getRow(3).height = 20;
+      sheet.getRow(1).height = 30;
+      sheet.getRow(2).height = 30;
+      sheet.getRow(3).height = 30;
       sheet.getRow(4).height = 15; // صف فاصل تحت اللوغو
       sheet.getRow(5).values = sheet.columns.map((c) => c.header);
 
