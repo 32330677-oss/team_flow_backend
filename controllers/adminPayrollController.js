@@ -660,7 +660,8 @@ async function exportPayrollExcel(req, res) {
     function addLogo(sheet, worksheetWorkbook) {
       try {
         const logoId = worksheetWorkbook.addImage({ filename: logoPath, extension: 'png' });
-        sheet.addImage(logoId, { tl: { col: 0.2, row: 0.15 }, ext: { width: 150, height: 60 } });
+        // وضع اللوغو في الأعلى، وترك المساحة للأسفل للعنوان
+        sheet.addImage(logoId, { tl: { col: 0.2, row: 0.1 }, ext: { width: 140, height: 50 } });
       } catch (e) {
         console.warn('Logo not added:', e.message);
       }
@@ -700,15 +701,21 @@ async function exportPayrollExcel(req, res) {
       { header: 'Worker Name', key: 'worker_name', width: 28 },
       { header: 'Sites', key: 'sites', width: 32 },
       { header: 'Net Salary', key: 'net_salary', width: 18 },
+      { header: 'Signature', key: 'signature', width: 18 }, // عمود البصمة للطباعة
     ];
 
-    summarySheet.mergeCells('A1:E1');
+    summarySheet.mergeCells('A1:F1');
     summarySheet.getCell('A1').value = `Payroll Batch #${batchId} (v${batch.version_number}${batch.is_finalized ? ' - Finalized' : ''})`;
-    summarySheet.mergeCells('A2:E2');
+    summarySheet.mergeCells('A2:F2');
     summarySheet.getCell('A2').value = `Period: ${dateOnly(batch.start_date)} - ${dateOnly(batch.end_date)}`;
-    summarySheet.mergeCells('A3:E3');
-    summarySheet.getCell('A3').value = `Currency: Syrian Pound (ل.س) — Overtime rate: ${OVERTIME_FLAT_RATE_SYP} ل.س/hour (flat, all workers)`;
-    summarySheet.getRow(1).height = 48;
+    summarySheet.mergeCells('A3:F3');
+    summarySheet.getCell('A3').value = `Currency: Syrian Pound (ل.س)`;
+    
+    // ضبط ارتفاع الصفوف الأولى لتجنب تداخل اللوغو مع النصوص
+    summarySheet.getRow(1).height = 20;
+    summarySheet.getRow(2).height = 20;
+    summarySheet.getRow(3).height = 20;
+    summarySheet.getRow(4).height = 15; // صف فارغ فاصل
     summarySheet.getRow(5).values = summarySheet.columns.map((c) => c.header);
 
     let grandTotalNet = 0;
@@ -721,6 +728,7 @@ async function exportPayrollExcel(req, res) {
         worker_name: worker.worker_name,
         sites: [...worker.sites].join(', '),
         net_salary: worker.net_salary,
+        signature: '', // فارغ للطباعة اليدوية
       });
       grandTotalNet += worker.net_salary;
     }
@@ -730,8 +738,6 @@ async function exportPayrollExcel(req, res) {
     });
     summaryTotalRow.font = { bold: true };
 
-    summarySheet.getRow(1).font = { bold: true, size: 16, color: { argb: 'FFFFFFFF' } };
-    summarySheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
     summarySheet.getRow(5).font = { bold: true, color: { argb: 'FFFFFFFF' } };
     summarySheet.getRow(5).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
     for (let r = 6; r <= summarySheet.rowCount; r += 1) {
@@ -767,15 +773,20 @@ async function exportPayrollExcel(req, res) {
         { header: 'Base Salary', key: 'base_salary', width: 16 },
         { header: 'Overtime Pay', key: 'overtime_pay', width: 16 },
         { header: 'Site Total', key: 'site_total', width: 16 },
+        { header: 'Signature', key: 'signature', width: 18 }, // عمود البصمة/التوقيع في النهاية
       ];
 
-      sheet.mergeCells('A1:M1');
+      sheet.mergeCells('A1:N1');
       sheet.getCell('A1').value = `Payroll Batch #${batchId} - Site: ${siteName}`;
-      sheet.mergeCells('A2:M2');
+      sheet.mergeCells('A2:N2');
       sheet.getCell('A2').value = `Period: ${dateOnly(batch.start_date)} - ${dateOnly(batch.end_date)}`;
-      sheet.mergeCells('A3:M3');
+      sheet.mergeCells('A3:N3');
       sheet.getCell('A3').value = `Currency: Syrian Pound (ل.س) — Overtime rate: ${OVERTIME_FLAT_RATE_SYP} ل.س/hour (flat, all workers)`;
-      sheet.getRow(1).height = 48;
+      
+      sheet.getRow(1).height = 20;
+      sheet.getRow(2).height = 20;
+      sheet.getRow(3).height = 20;
+      sheet.getRow(4).height = 15; // صف فاصل تحت اللوغو
       sheet.getRow(5).values = sheet.columns.map((c) => c.header);
 
       let siteTotalBase = 0, siteTotalOT = 0, siteTotalAll = 0;
@@ -793,6 +804,7 @@ async function exportPayrollExcel(req, res) {
           base_salary: Number(item.base_salary || 0),
           overtime_pay: Number(item.overtime_pay || 0),
           site_total: rowTotal,
+          signature: '', // فارغ للطباعة
         };
         if (isDaily) {
           rowData.days_worked = item.days_worked;
@@ -816,8 +828,6 @@ async function exportPayrollExcel(req, res) {
       });
       totalRow.font = { bold: true };
 
-      sheet.getRow(1).font = { bold: true, size: 16, color: { argb: 'FFFFFFFF' } };
-      sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
       sheet.getRow(5).font = { bold: true, color: { argb: 'FFFFFFFF' } };
       sheet.getRow(5).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
       for (let r = 6; r <= sheet.rowCount; r += 1) {
