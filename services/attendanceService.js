@@ -65,32 +65,46 @@ exports.calculateWorkingHours = async (attendance_id, executor = db) => {
     totalMinutes = Math.max(0, totalMinutes + managementHours * 60);
 
     // تحديد الـ standardMinutes باستخدام الـ Snapshot أو جلبها وحفظها إن لم تكن موجودة
-    let standardMinutes;
-    if (standard_minutes_snapshot !== null) {
-        standardMinutes = Number(standard_minutes_snapshot);
-    } else {
-        const configuredStandardMinutes = Number(await settingsCache.getSetting('standard_work_minutes', '600'));
-
-        standardMinutes = Number.isFinite(configuredStandardMinutes) && configuredStandardMinutes > 0
-            ? configuredStandardMinutes
-            : 600;
-
-        await executor.execute(
-            `UPDATE attendance
-             SET standard_minutes_snapshot = ?
-             WHERE attendance_id = ?
-               AND standard_minutes_snapshot IS NULL`,
-            [standardMinutes, attendance_id]
-        );
-    }
-
-    const regularHours = Math.min(999.99, Math.min(totalMinutes, standardMinutes) / 60);
-    const overtimeHours = Math.min(99.99, Math.max(0, totalMinutes - standardMinutes) / 60);
-
-    await executor.execute(
-        `UPDATE attendance SET total_working_hours = ?, overtime_hours = ? WHERE attendance_id = ?`,
-        [regularHours.toFixed(2), overtimeHours.toFixed(2), attendance_id]
+let standardMinutes;
+if (standard_minutes_snapshot !== null) {
+    standardMinutes = Number(standard_minutes_snapshot);
+} else {
+    // استخدام JOIN لتحسين الأداء بدل الـ Subquery
+    const [[workerRow]] = await executor.execute(
+        `SELECT w.standard_daily_minutes 
+         FROM attendance a
+         JOIN workers w ON w.worker_id = a.worker_id
+         WHERE a.attendance_id = ?
+         LIMIT 1`,
+        [attendance_id]
     );
+    const workerCustomMinutes = workerRow?.standard_daily_minutes;
+
+    const configuredStandardMinutes = Number(await settingsCache.getSetting('standard_work_minutes', '600'));
+
+    standardMinutes = (Number.isFinite(Number(workerCustomMinutes)) && Number(workerCustomMinutes) > 0)
+        ? Number(workerCustomMinutes)
+        : (Number.isFinite(configuredStandardMinutes) && configuredStandardMinutes > 0
+            ? configuredStandardMinutes
+            : 600);
+
+    // حفظ الـ snapshot مرة واحدة فقط هنا دون تكرار
+    await executor.execute(
+        `UPDATE attendance
+         SET standard_minutes_snapshot = ?
+         WHERE attendance_id = ?
+           AND standard_minutes_snapshot IS NULL`,
+        [standardMinutes, attendance_id]
+    );
+}
+
+const regularHours = Math.min(999.99, Math.min(totalMinutes, standardMinutes) / 60);
+const overtimeHours = Math.min(99.99, Math.max(0, totalMinutes - standardMinutes) / 60);
+
+await executor.execute(
+    `UPDATE attendance SET total_working_hours = ?, overtime_hours = ? WHERE attendance_id = ?`,
+    [regularHours.toFixed(2), overtimeHours.toFixed(2), attendance_id]
+);
 
     console.log(`Calculation: ID=${attendance_id}, record_date=${String(record_date).slice(0, 10)}, regular=${regularHours.toFixed(2)}, overtime=${overtimeHours.toFixed(2)}`);
 };
