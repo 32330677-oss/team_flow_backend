@@ -8,7 +8,7 @@ const { forgotPasswordLimiter } = require('../middleware/rateLimiter');
 router.post('/login', authController.login);
 
 router.post('/forgot-password', forgotPasswordLimiter, authController.forgotPassword);
-router.post('/reset-password/:token', authController.resetPassword);
+router.post('/reset-password-otp', forgotPasswordLimiter, authController.resetPasswordWithOtp);
 router.post('/change-password', authMiddleware, authController.changePassword);
 
 module.exports = router;

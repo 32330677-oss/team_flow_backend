@@ -2,7 +2,7 @@ const db = require('../config/db');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
-const { sendPasswordResetEmail, buildResetLink } = require('../services/emailService');
+const { sendPasswordResetOtp } = require('../services/emailService');
 exports.login = async (req, res) => {
     // 1. Receive identifier (email or username) along with password and device_id
     const loginIdentifier = req.body.email || req.body.username;
@@ -124,6 +124,7 @@ function parseMySqlDateTime(value) {
 const PASSWORD_MIN_LENGTH = 8;
 
 // 1) Request a password reset (sends the email)
+// 1) Request a password reset (sends an OTP code by email)
 exports.forgotPassword = async (req, res) => {
     const { email } = req.body;
     if (!email || !String(email).trim()) {
@@ -137,11 +138,10 @@ exports.forgotPassword = async (req, res) => {
         );
 
         // Always return the same response whether or not the email exists,
-        // to avoid leaking which addresses are registered (timing is close
-        // enough here since both branches hit the DB and neither does bcrypt).
+        // to avoid leaking which addresses are registered.
         const genericResponse = {
             status: 'success',
-            message: 'If this email is registered, a password reset link has been sent.'
+            message: 'If this email is registered, a verification code has been sent to it.'
         };
 
         if (users.length === 0) {
@@ -149,13 +149,13 @@ exports.forgotPassword = async (req, res) => {
         }
 
         const user = users[0];
-        const rawToken = crypto.randomBytes(32).toString('hex');
-        const hashedToken = crypto.createHash('sha256').update(rawToken).digest('hex');
-        const expires = new Date(Date.now() + 30 * 60 * 1000); // valid for 30 minutes
+        const otp = String(crypto.randomInt(100000, 1000000)); // always 6 digits
+        const hashedOtp = crypto.createHash('sha256').update(otp).digest('hex');
+        const expires = new Date(Date.now() + 10 * 60 * 1000); // valid for 10 minutes
 
         await db.query(
             'UPDATE users SET password_reset_token = ?, password_reset_expires = ? WHERE user_id = ?',
-            [hashedToken, expires, user.user_id]
+            [hashedOtp, expires, user.user_id]
         );
 
         await db.query(
@@ -164,14 +164,10 @@ exports.forgotPassword = async (req, res) => {
             [user.user_id, user.user_id, JSON.stringify({ email: user.email })]
         );
 
-        const resetLink = buildResetLink(rawToken);
-
         try {
-            await sendPasswordResetEmail(user.email, user.full_name, resetLink);
+            await sendPasswordResetOtp(user.email, user.full_name, otp);
         } catch (mailError) {
-            // The token is already saved; a resend will simply overwrite it.
-            // We still return the generic success message to the caller so
-            // we don't leak account existence, but we log the real failure.
+            // The OTP is already saved; a resend will simply overwrite it.
             console.error('FORGOT PASSWORD - EMAIL SEND FAILED:', mailError);
         }
 
@@ -182,30 +178,35 @@ exports.forgotPassword = async (req, res) => {
     }
 };
 
-// 2) Perform the reset (after clicking the emailed link)
-exports.resetPassword = async (req, res) => {
-    const { token } = req.params;
-    const { new_password } = req.body;
+// 2) Perform the reset using the OTP code sent by email
+exports.resetPasswordWithOtp = async (req, res) => {
+    const { email, otp, new_password } = req.body;
 
-    if (!token) {
-        return res.status(400).json({ status: 'error', message: 'Reset token is required' });
+    if (!email || !String(email).trim()) {
+        return res.status(400).json({ status: 'error', message: 'Email is required' });
+    }
+    if (!otp || !/^\d{6}$/.test(String(otp).trim())) {
+        return res.status(400).json({ status: 'error', message: 'A valid 6-digit code is required' });
     }
     if (!new_password || new_password.length < PASSWORD_MIN_LENGTH) {
         return res.status(400).json({ status: 'error', message: `Password must be at least ${PASSWORD_MIN_LENGTH} characters` });
     }
 
     try {
-        const hashedToken = crypto.createHash('sha256').update(token).digest('hex');
-
         const [users] = await db.query(
-            'SELECT user_id, password_reset_expires FROM users WHERE password_reset_token = ? LIMIT 1',
-            [hashedToken]
+            'SELECT user_id, password_reset_token, password_reset_expires FROM users WHERE email = ? LIMIT 1',
+            [email]
         );
 
-        const expiresAt = users.length > 0 ? parseMySqlDateTime(users[0].password_reset_expires) : null;
+        if (users.length === 0 || !users[0].password_reset_token) {
+            return res.status(400).json({ status: 'error', message: 'This code is invalid or has expired' });
+        }
 
-        if (users.length === 0 || !expiresAt || expiresAt < new Date()) {
-            return res.status(400).json({ status: 'error', message: 'This reset link is invalid or has expired' });
+        const hashedOtp = crypto.createHash('sha256').update(String(otp).trim()).digest('hex');
+        const expiresAt = parseMySqlDateTime(users[0].password_reset_expires);
+
+        if (hashedOtp !== users[0].password_reset_token || !expiresAt || expiresAt < new Date()) {
+            return res.status(400).json({ status: 'error', message: 'This code is invalid or has expired' });
         }
 
         const hashedPassword = await bcrypt.hash(new_password, 12);
@@ -225,7 +226,7 @@ exports.resetPassword = async (req, res) => {
 
         return res.status(200).json({ status: 'success', message: 'Password has been reset successfully' });
     } catch (error) {
-        console.error('RESET PASSWORD ERROR:', error);
+        console.error('RESET PASSWORD (OTP) ERROR:', error);
         return res.status(500).json({ status: 'error', message: 'An error occurred while resetting the password' });
     }
 };
