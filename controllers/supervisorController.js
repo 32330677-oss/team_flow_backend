@@ -26,108 +26,140 @@ exports.getAllSupervisors = async (req, res) => {
     }
 };
 
-// 2. إضافة مشرف جديد مع حفظ حالته كـ Active تلقائياً
+// 2. Add a new supervisor and save their status as Active automatically
 exports.createSupervisor = async (req, res) => {
-    const { full_name, username, password } = req.body;
+    const { full_name, username, password, email } = req.body;
 
     if (!full_name || !username || !password) {
         return res.status(400).json({
             status: 'fail',
-            message: 'يرجى تقديم جميع البيانات المطلوبة'
+            message: 'Please provide all required fields'
         });
     }
 
     try {
-        // التأكد من عدم تكرار اسم المستخدم
+        // Ensure the username is not already taken
         const [existingUser] = await db.query('SELECT user_id FROM users WHERE username = ?', [username]);
         if (existingUser.length > 0) {
             return res.status(400).json({
                 status: 'fail',
-                message: 'اسم المستخدم هذا مستخدم بالفعل'
+                message: 'This username is already in use'
             });
         }
 
-        // تشفير كلمة المرور
+        // Ensure the email is not already taken (if provided)
+        const normalizedEmail = email && String(email).trim() ? email.trim() : null;
+        if (normalizedEmail) {
+            const [existingEmail] = await db.query('SELECT user_id FROM users WHERE email = ?', [normalizedEmail]);
+            if (existingEmail.length > 0) {
+                return res.status(400).json({
+                    status: 'fail',
+                    message: 'This email is already in use by another account'
+                });
+            }
+        }
+
+        // Hash the password
         const hashedPassword = await bcrypt.hash(password, 10);
 
         const insertQuery = `
-            INSERT INTO users (full_name, username, password_hash, role, status) 
-            VALUES (?, ?, ?, 'Supervisor', 'Active')
+            INSERT INTO users (full_name, username, password_hash, email, role, status) 
+            VALUES (?, ?, ?, ?, 'Supervisor', 'Active')
         `;
 
         const [result] = await db.query(insertQuery, [
-            full_name, 
-            username, 
-            hashedPassword
+            full_name,
+            username,
+            hashedPassword,
+            normalizedEmail
         ]);
 
         res.status(201).json({
             status: 'success',
-            message: 'تم تسجيل المشرف بنجاح في النظام',
+            message: 'Supervisor registered successfully in the system',
             data: {
                 user_id: result.insertId,
                 full_name,
                 username,
+                email: normalizedEmail,
                 role: 'Supervisor',
                 status: 'Active'
             }
         });
     } catch (err) {
-        console.error("🚨 Error creating supervisor:", err); 
+        console.error("🚨 Error creating supervisor:", err);
         res.status(500).json({
             status: 'error',
-            message: `فشل إدخال المشرف: ${err.message}`
+            message: `Failed to insert supervisor: ${err.message}`
         });
     }
 };
 
-// 3. تعديل اسم وبيانات المشرف
+// 3. Update supervisor name and details (with email)
 exports.updateSupervisor = async (req, res) => {
     const { id } = req.params;
-    const { full_name, username } = req.body;
+    const { full_name, username, email } = req.body;
 
     if (!full_name || !username) {
         return res.status(400).json({
             status: 'fail',
-            message: 'يرجى تزويد الاسم الكامل واسم المستخدم لإتمام التعديل'
+            message: 'Please provide full name and username to complete the update'
         });
     }
 
     try {
         const [duplicateCheck] = await db.query(
-            'SELECT user_id FROM users WHERE username = ? AND user_id != ?', 
+            'SELECT user_id FROM users WHERE username = ? AND user_id != ?',
             [username, id]
         );
         if (duplicateCheck.length > 0) {
             return res.status(400).json({
                 status: 'fail',
-                message: 'اسم المستخدم الجديد مأخوذ بالفعل من قبل حساب آخر'
+                message: 'The new username is already taken by another account'
             });
+        }
+
+        if (email && String(email).trim()) {
+            const [emailCheck] = await db.query(
+                'SELECT user_id FROM users WHERE email = ? AND user_id != ?',
+                [email, id]
+            );
+            if (emailCheck.length > 0) {
+                return res.status(400).json({
+                    status: 'fail',
+                    message: 'The email address is already in use by another account'
+                });
+            }
         }
 
         const updateQuery = `
             UPDATE users 
-            SET full_name = ?, username = ?
+            SET full_name = ?, username = ?, email = ?
             WHERE user_id = ? AND role = 'Supervisor'
         `;
-        const [result] = await db.query(updateQuery, [full_name, username, id]);
+        const [result] = await db.query(updateQuery, [
+            full_name,
+            username,
+            email && String(email).trim() ? email.trim() : null,
+            id
+        ]);
 
         if (result.affectedRows === 0) {
             return res.status(404).json({
                 status: 'fail',
-                message: 'المشرف غير موجود أو تم تعديل صلاحيته مسبقاً'
+                message: 'Supervisor not found or their role has already been modified'
             });
         }
 
         res.status(200).json({
             status: 'success',
-            message: 'تم تحديث بيانات المشرف بنجاح'
+            message: 'Supervisor details updated successfully'
         });
     } catch (err) {
         console.error("🚨 Error updating supervisor:", err.message);
         res.status(500).json({
             status: 'error',
-            message: 'حدث خطأ أثناء محاولة تعديل بيانات المشرف'
+            message: 'An error occurred while trying to update supervisor details'
         });
     }
 };
