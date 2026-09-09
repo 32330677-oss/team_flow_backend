@@ -27,7 +27,7 @@ const app = express();
 // Middlewares
 app.use(cors());
 app.use(express.json());
-
+app.set('trust proxy', 1); // أو true
 // ربط المسارات بالسيرفر
 app.use('/api/auth', authRoutes);
 app.use('/api/projects', projectRoutes); 
