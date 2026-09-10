@@ -13,5 +13,8 @@ router.post('/generate', controller.generateStaffPayrollBatch);
 router.get('/report', controller.getStaffPayrollReport);
 router.get('/batch/:batchId', controller.getStaffPayrollBatchDetails);
 router.patch('/batch/:batchId/mark-paid', controller.markStaffBatchAsPaid);
-
+const versioning = require('../controllers/staffPayrollVersioningController');
+router.patch('/batch/:batchId/finalize', versioning.finalizeBatch);
+router.post('/batch/:batchId/new-version', versioning.createNewVersion);
+router.get('/batch/:batchId/versions', versioning.getVersionChain);
 module.exports = router;

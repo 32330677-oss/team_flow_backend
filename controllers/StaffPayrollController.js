@@ -46,12 +46,11 @@ async function generateStaffPayrollBatch(req, res) {
     const connection = await pool.getConnection();
     try {
         await connection.beginTransaction();
-
-        const [overlap] = await connection.execute(
-            `SELECT staff_payroll_batch_id FROM staff_payroll_batches
-             WHERE start_date <= ? AND end_date >= ? LIMIT 1 FOR UPDATE`,
-            [end_date, start_date]
-        );
+const [overlap] = await connection.execute(
+    `SELECT staff_payroll_batch_id FROM staff_payroll_batches
+     WHERE start_date <= ? AND end_date >= ? AND status <> 'Superseded' LIMIT 1 FOR UPDATE`,
+    [end_date, start_date]
+);
         if (overlap.length) {
             await connection.rollback();
             return res.status(409).json({ status: 'error', message: 'A payroll batch overlapping with this period already exists' });
@@ -169,15 +168,15 @@ async function getStaffPayrollBatchDetails(req, res) {
     try {
         const [batches] = await pool.execute('SELECT * FROM staff_payroll_batches WHERE staff_payroll_batch_id = ?', [batchId]);
         if (!batches.length) return res.status(404).json({ status: 'error', message: 'Payroll batch not found' });
-
-        const [items] = await pool.execute(
-            `SELECT sp.*, sm.full_name, sm.staff_unique_id
-             FROM staff_payroll sp
-             JOIN staff_members sm ON sm.staff_id = sp.staff_id
-             WHERE sp.staff_payroll_batch_id = ?
-             ORDER BY sm.full_name`,
-            [batchId]
-        );
+// داخل getStaffPayrollBatchDetails، بدّل الـ SELECT لـ items:
+const [items] = await pool.execute(
+    `SELECT sp.*, sm.full_name, sm.staff_unique_id, sm.position
+     FROM staff_payroll sp
+     JOIN staff_members sm ON sm.staff_id = sp.staff_id
+     WHERE sp.staff_payroll_batch_id = ?
+     ORDER BY sm.full_name`,
+    [batchId]
+);
         return res.json({ status: 'success', batch: batches[0], staff: items });
     } catch (error) {
         console.error('getStaffPayrollBatchDetails:', error);
