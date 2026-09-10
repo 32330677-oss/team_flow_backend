@@ -20,6 +20,14 @@ function countWorkingDays(startDate, endDate) {
     return count;
 }
 
+
+
+
+function isFriday(dateValue) {
+    const date = new Date(`${dateValue}T00:00:00Z`);
+    return date.getUTCDay() === 5;
+}
+
 function getPaidLeaveTypes(staff) {
     const defaults = ['Sick', 'Vacation', 'Holiday'];
     if (!staff.paid_leave_types) return defaults;
@@ -121,12 +129,12 @@ async function generateStaffPayrollBatch(req, res) {
             const standardDailyHours = Number(staff.standard_daily_hours) > 0 ? Number(staff.standard_daily_hours) : 8;
 
             // Only Approved records enter into salary calculation
-            const [records] = await connection.execute(
-                `SELECT attendance_status, is_paid, is_management_paid_absence, regular_hours, overtime_hours
-                 FROM staff_attendance
-                 WHERE staff_id = ? AND record_date BETWEEN ? AND ? AND status = 'Approved'`,
-                [staff.staff_id, start_date, end_date]
-            );
+const [records] = await connection.execute(
+    `SELECT record_date, attendance_status, is_paid, is_management_paid_absence, regular_hours, overtime_hours
+     FROM staff_attendance
+     WHERE staff_id = ? AND record_date BETWEEN ? AND ? AND status = 'Approved'`,
+    [staff.staff_id, start_date, end_date]
+);
 
             let presentDayFraction = 0;   // sum of prorated day-fractions for "Present" records
             let paidLeaveDays = 0;        // full days
@@ -134,11 +142,17 @@ async function generateStaffPayrollBatch(req, res) {
             let unpaidAbsenceDays = 0;    // informational only, not paid
             let overtimeHoursTotal = 0;   // display-only, never paid for staff
 
-            for (const record of records) {
-                if (record.attendance_status === 'Present') {
-                    presentDayFraction += computeDayFraction(record.regular_hours, standardDailyHours);
-                    overtimeHoursTotal += Number(record.overtime_hours || 0);
-                } else if (record.attendance_status === 'Absent') {
+for (const record of records) {
+    if (record.attendance_status === 'Present') {
+        // Friday attendance is recorded and remains visible in attendance,
+        // but it must not contribute to staff payroll.
+        if (isFriday(record.record_date)) {
+            continue;
+        }
+
+        presentDayFraction += computeDayFraction(record.regular_hours, standardDailyHours);
+        overtimeHoursTotal += Number(record.overtime_hours || 0);
+    } else if (record.attendance_status === 'Absent') {
                     // Absences are unpaid by default. An Admin can explicitly grant
                     // management-paid leave for a specific absence day beforehand
                     // (see controllers/staffAbsenceController.js). That day is then
