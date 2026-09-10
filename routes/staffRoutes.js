@@ -12,7 +12,6 @@ router.use(authMiddleware);
 router.get('/', restrictTo('Admin'), staffController.getAllStaff);
 router.post('/', restrictTo('Admin'), staffController.createStaff);
 router.put('/:id', restrictTo('Admin'), staffController.updateStaff);
-router.patch('/:id/status', restrictTo('Admin'), staffController.toggleStaffStatus); // kept for backward compatibility
 
 // NEW — lifecycle tracking
 router.patch('/:id/lifecycle', restrictTo('Admin'), staffLifecycleController.changeStatus);

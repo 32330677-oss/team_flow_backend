@@ -176,26 +176,3 @@ exports.updateStaff = async (req, res) => {
     }
 };
 
-// 4. Toggle staff member status (Active/Inactive)
-exports.toggleStaffStatus = async (req, res) => {
-    const { id } = req.params;
-    const { status } = req.body;
-
-    if (!status || !['Active', 'Inactive'].includes(status)) {
-        return res.status(400).json({ status: 'error', message: 'Status must be either Active or Inactive' });
-    }
-
-    try {
-        const [existing] = await db.query('SELECT staff_id FROM staff_members WHERE staff_id = ? LIMIT 1', [id]);
-        if (existing.length === 0) {
-            return res.status(404).json({ status: 'error', message: 'Staff member not found' });
-        }
-
-        await db.query('UPDATE staff_members SET status = ? WHERE staff_id = ?', [status, id]);
-
-        return res.status(200).json({ status: 'success', message: `Staff member status changed to ${status}` });
-    } catch (error) {
-        console.error('TOGGLE STAFF STATUS ERROR:', error);
-        return res.status(500).json({ status: 'error', message: 'An error occurred while updating staff member status' });
-    }
-};
