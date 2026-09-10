@@ -4,9 +4,13 @@ function isValidDateOnly(value) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(value || ''));
 }
 
-async function getOwnStaffId(userId) {
-  const [rows] = await db.query('SELECT staff_id FROM staff_members WHERE user_id = ? LIMIT 1', [userId]);
-  return rows.length ? rows[0].staff_id : null;
+function formatToMySqlDateTime(value) {
+  if (!value) return null;
+  const match = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?$/.exec(String(value));
+  if (!match) return null;
+  const [, y, mo, d, h, mi, s = '00'] = match;
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${y}-${mo}-${d} ${pad(h)}:${pad(mi)}:${pad(s)}`;
 }
 
 // GET /api/staff-attendance/admin/day?date=YYYY-MM-DD
@@ -16,15 +20,15 @@ exports.getDayView = async (req, res) => {
     return res.status(400).json({ status: 'error', message: 'A valid date (YYYY-MM-DD) is required.' });
   }
   try {
-    const ownStaffId = await getOwnStaffId(req.user.user_id);
     const [rows] = await db.execute(
       `SELECT sm.staff_id, sm.staff_unique_id, sm.full_name, sm.position, sm.standard_daily_hours,
-              sa.staff_attendance_id, sa.attendance_status, sa.regular_hours, sa.overtime_hours, sa.status
+              sa.staff_attendance_id, sa.attendance_status, sa.check_in_time, sa.check_out_time,
+              sa.regular_hours, sa.overtime_hours, sa.status
        FROM staff_members sm
        LEFT JOIN staff_attendance sa ON sa.staff_id = sm.staff_id AND sa.record_date = ?
-       WHERE sm.status = 'Active' ${ownStaffId ? 'AND sm.staff_id <> ?' : ''}
+       WHERE sm.status = 'Active'
        ORDER BY sm.full_name`,
-      ownStaffId ? [date, ownStaffId] : [date]
+      [date]
     );
     res.status(200).json({ status: 'success', data: rows });
   } catch (error) {
@@ -34,7 +38,7 @@ exports.getDayView = async (req, res) => {
 };
 
 // POST /api/staff-attendance/admin/bulk-set
-// body: { record_date, entries: [{ staff_id, attendance_status, hours }] }
+// body: { record_date, entries: [{ staff_id, attendance_status, check_in_time, check_out_time }] }
 exports.bulkSetAttendance = async (req, res) => {
   const { record_date, entries } = req.body || {};
   const adminId = req.user.user_id;
@@ -46,7 +50,6 @@ exports.bulkSetAttendance = async (req, res) => {
     return res.status(400).json({ status: 'error', message: 'At least one attendance entry is required.' });
   }
 
-  const ownStaffId = await getOwnStaffId(adminId);
   const ATTENDANCE_STATUSES = ['Present', 'Absent', 'Sick', 'Vacation', 'Holiday'];
   const today = new Date().toISOString().slice(0, 10);
 
@@ -58,14 +61,9 @@ exports.bulkSetAttendance = async (req, res) => {
     for (const entry of entries) {
       const staffId = Number(entry.staff_id);
       const status = entry.attendance_status;
-      const hours = Number(entry.hours || 0);
 
       if (!Number.isInteger(staffId) || staffId <= 0 || !ATTENDANCE_STATUSES.includes(status)) {
         results.skipped.push({ staff_id: entry.staff_id, reason: 'Invalid entry' });
-        continue;
-      }
-      if (ownStaffId && staffId === ownStaffId) {
-        results.skipped.push({ staff_id: staffId, reason: 'Use self-service attendance for your own record.' });
         continue;
       }
 
@@ -81,8 +79,24 @@ exports.bulkSetAttendance = async (req, res) => {
 
       let regularHours = 0;
       let overtimeHours = 0;
+      let checkIn = null;
+      let checkOut = null;
+
       if (status === 'Present') {
-        const workedHours = Math.max(0, hours);
+        checkIn = formatToMySqlDateTime(entry.check_in_time);
+        checkOut = formatToMySqlDateTime(entry.check_out_time);
+
+        if (!checkIn || !checkOut) {
+          results.skipped.push({ staff_id: staffId, reason: 'Check-in and check-out times are required for Present status.' });
+          continue;
+        }
+        const start = new Date(checkIn.replace(' ', 'T'));
+        const end = new Date(checkOut.replace(' ', 'T'));
+        if (end <= start) {
+          results.skipped.push({ staff_id: staffId, reason: 'Check-out time must be after check-in time.' });
+          continue;
+        }
+        const workedHours = (end.getTime() - start.getTime()) / 3600000;
         regularHours = Math.min(workedHours, standardHours);
         overtimeHours = Math.max(0, workedHours - standardHours);
       }
@@ -95,26 +109,27 @@ exports.bulkSetAttendance = async (req, res) => {
       if (existing.length > 0) {
         await connection.execute(
           `UPDATE staff_attendance
-           SET attendance_status = ?, regular_hours = ?, overtime_hours = ?,
+           SET attendance_status = ?, check_in_time = ?, check_out_time = ?,
+               regular_hours = ?, overtime_hours = ?,
                status = 'Approved', approved_by_user_id = ?, approval_date = NOW(),
                admin_rejection_notes = NULL, recorded_by_user_id = ?
            WHERE staff_attendance_id = ?`,
-          [status, regularHours.toFixed(2), overtimeHours.toFixed(2), adminId, adminId, existing[0].staff_attendance_id]
+          [status, checkIn, checkOut, regularHours.toFixed(2), overtimeHours.toFixed(2), adminId, adminId, existing[0].staff_attendance_id]
         );
       } else {
         await connection.execute(
           `INSERT INTO staff_attendance
-             (staff_id, record_date, attendance_status, regular_hours, overtime_hours,
-              recorded_by_user_id, status, approved_by_user_id, approval_date)
-           VALUES (?, ?, ?, ?, ?, ?, 'Approved', ?, NOW())`,
-          [staffId, record_date, status, regularHours.toFixed(2), overtimeHours.toFixed(2), adminId, adminId]
+             (staff_id, record_date, attendance_status, check_in_time, check_out_time,
+              regular_hours, overtime_hours, recorded_by_user_id, status, approved_by_user_id, approval_date)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Approved', ?, NOW())`,
+          [staffId, record_date, status, checkIn, checkOut, regularHours.toFixed(2), overtimeHours.toFixed(2), adminId, adminId]
         );
       }
 
       await connection.execute(
         `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
          VALUES ('staff_attendance', ?, 'ADMIN_BULK_SET', ?, NULL, ?)`,
-        [staffId, adminId, JSON.stringify({ record_date, status, regularHours, overtimeHours, backdated: record_date !== today })]
+        [staffId, adminId, JSON.stringify({ record_date, status, checkIn, checkOut, regularHours, overtimeHours, backdated: record_date !== today })]
       );
 
       results.updated.push(staffId);
