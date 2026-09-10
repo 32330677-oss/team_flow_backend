@@ -46,11 +46,11 @@ async function generateStaffPayrollBatch(req, res) {
     const connection = await pool.getConnection();
     try {
         await connection.beginTransaction();
-const [overlap] = await connection.execute(
-    `SELECT staff_payroll_batch_id FROM staff_payroll_batches
-     WHERE start_date <= ? AND end_date >= ? AND status <> 'Superseded' LIMIT 1 FOR UPDATE`,
-    [end_date, start_date]
-);
+        const [overlap] = await connection.execute(
+            `SELECT staff_payroll_batch_id FROM staff_payroll_batches
+             WHERE start_date <= ? AND end_date >= ? AND status <> 'Superseded' LIMIT 1 FOR UPDATE`,
+            [end_date, start_date]
+        );
         if (overlap.length) {
             await connection.rollback();
             return res.status(409).json({ status: 'error', message: 'A payroll batch overlapping with this period already exists' });
@@ -85,20 +85,30 @@ const [overlap] = await connection.execute(
 
             // Only Approved records enter into salary calculation
             const [records] = await connection.execute(
-                `SELECT attendance_status, is_paid FROM staff_attendance
+                `SELECT attendance_status, is_paid, is_management_paid_absence
+                 FROM staff_attendance
                  WHERE staff_id = ? AND record_date BETWEEN ? AND ? AND status = 'Approved'`,
                 [staff.staff_id, start_date, end_date]
             );
 
             let presentDays = 0;
             let paidLeaveDays = 0;
+            let managementPaidDays = 0;
             let unpaidAbsenceDays = 0;
 
             for (const record of records) {
                 if (record.attendance_status === 'Present') {
                     presentDays += 1;
                 } else if (record.attendance_status === 'Absent') {
-                    unpaidAbsenceDays += 1;
+                    // Absences are unpaid by default. An Admin can explicitly grant
+                    // management-paid leave for a specific absence day beforehand
+                    // (see controllers/staffAbsenceController.js). That day is then
+                    // paid and tracked separately so it shows as its own payroll column.
+                    if (Number(record.is_management_paid_absence) === 1) {
+                        managementPaidDays += 1;
+                    } else {
+                        unpaidAbsenceDays += 1;
+                    }
                 } else if (paidLeaveTypes.includes(record.attendance_status) && Number(record.is_paid) === 1) {
                     paidLeaveDays += 1;
                 } else {
@@ -107,16 +117,16 @@ const [overlap] = await connection.execute(
             }
 
             const dailyRate = money(Number(staff.monthly_salary) / workingDays);
-            const payableDays = presentDays + paidLeaveDays;
+            const payableDays = presentDays + paidLeaveDays + managementPaidDays;
             const netSalary = money(dailyRate * payableDays);
 
             const [payrollResult] = await connection.execute(
                 `INSERT INTO staff_payroll
                     (staff_payroll_batch_id, staff_id, monthly_salary_snapshot, working_days_in_period,
-                     present_days, paid_leave_days, unpaid_absence_days, daily_rate, net_salary)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                     present_days, paid_leave_days, management_paid_days, unpaid_absence_days, daily_rate, net_salary)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 [batchId, staff.staff_id, staff.monthly_salary, workingDays,
-                    presentDays, paidLeaveDays, unpaidAbsenceDays, dailyRate, netSalary]
+                    presentDays, paidLeaveDays, managementPaidDays, unpaidAbsenceDays, dailyRate, netSalary]
             );
             if (!payrollResult.insertId) continue;
 
