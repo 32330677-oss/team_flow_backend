@@ -4,6 +4,9 @@ const router = express.Router();
 const staffController = require('../controllers/staffController');
 const staffLifecycleController = require('../controllers/staffLifecycleController');
 const staffAssignmentController = require('../controllers/staffAssignmentController');
+// 1. استيراد الـ Controller الخاص بالمشرفين في الأعلى مع البقية
+const staffSupervisorAssignmentController = require('../controllers/staffSupervisorAssignmentController');
+
 const authMiddleware = require('../middleware/authMiddleware');
 const restrictTo = require('../middleware/roleMiddleware');
 
@@ -21,10 +24,17 @@ router.get('/:id/lifecycle-history', restrictTo('Admin'), staffLifecycleControll
 router.get('/:id/assignments', restrictTo('Admin'), staffAssignmentController.getHistory);
 router.post('/:id/assignments', restrictTo('Admin'), staffAssignmentController.assignToSite);
 router.delete('/:id/assignments/current', restrictTo('Admin'), staffAssignmentController.unassignCurrent);
-const staffSupervisorAssignmentController = require('../controllers/staffSupervisorAssignmentController');
 
-// NEW — staff supervisor assignment (Admin only: assigning supervisors is an admin action)
+// ==========================================
+// NEW — STAFF SUPERVISOR ASSIGNMENTS
+// ==========================================
+
+// 2. راوت الـ bulk يجب أن يُكتب هنا (قبل راوتات الـ :id)
+router.post('/supervisor-assignments/bulk', restrictTo('Admin'), staffSupervisorAssignmentController.bulkAssignSupervisor);
+
+// 3. باقي راوتات المشرفين التي تحتوي على :id
 router.get('/:id/supervisor-assignments', restrictTo('Admin'), staffSupervisorAssignmentController.getHistory);
 router.post('/:id/supervisor-assignments', restrictTo('Admin'), staffSupervisorAssignmentController.assignSupervisor);
 router.delete('/:id/supervisor-assignments/current', restrictTo('Admin'), staffSupervisorAssignmentController.unassignCurrent);
+
 module.exports = router;
