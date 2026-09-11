@@ -1,16 +1,22 @@
-const db = require('../config/db'); 
+const db = require('../config/db');
 const bcrypt = require('bcryptjs');
 
-// 1. جلب جميع المشرفين بحالتهم الحقيقية من قاعدة البيانات
+const SUPERVISOR_ROLES = ['Supervisor', 'StaffSupervisor'];
+function resolveRole(value) {
+    return SUPERVISOR_ROLES.includes(value) ? value : 'Supervisor';
+}
+
+// 1. List supervisors, optionally scoped by ?role=Supervisor|StaffSupervisor (default: Supervisor)
 exports.getAllSupervisors = async (req, res) => {
+    const role = resolveRole(req.query.role);
     try {
         const query = `
             SELECT user_id, full_name, username, role, status, created_at, last_login 
             FROM users 
-            WHERE role = 'Supervisor'
+            WHERE role = ?
             ORDER BY created_at DESC
         `;
-        const [supervisors] = await db.query(query);
+        const [supervisors] = await db.query(query, [role]);
 
         res.status(200).json({
             status: 'success',
@@ -26,9 +32,10 @@ exports.getAllSupervisors = async (req, res) => {
     }
 };
 
-// 2. Add a new supervisor and save their status as Active automatically
+// 2. Add a new supervisor. body.role optional, defaults to 'Supervisor' (Worker Supervisor)
 exports.createSupervisor = async (req, res) => {
-    const { full_name, username, password, email } = req.body;
+    const { full_name, username, password, email, role } = req.body;
+    const targetRole = resolveRole(role);
 
     if (!full_name || !username || !password) {
         return res.status(400).json({
@@ -38,7 +45,6 @@ exports.createSupervisor = async (req, res) => {
     }
 
     try {
-        // Ensure the username is not already taken
         const [existingUser] = await db.query('SELECT user_id FROM users WHERE username = ?', [username]);
         if (existingUser.length > 0) {
             return res.status(400).json({
@@ -47,7 +53,6 @@ exports.createSupervisor = async (req, res) => {
             });
         }
 
-        // Ensure the email is not already taken (if provided)
         const normalizedEmail = email && String(email).trim() ? email.trim() : null;
         if (normalizedEmail) {
             const [existingEmail] = await db.query('SELECT user_id FROM users WHERE email = ?', [normalizedEmail]);
@@ -59,19 +64,19 @@ exports.createSupervisor = async (req, res) => {
             }
         }
 
-        // Hash the password
         const hashedPassword = await bcrypt.hash(password, 10);
 
         const insertQuery = `
             INSERT INTO users (full_name, username, password_hash, email, role, status) 
-            VALUES (?, ?, ?, ?, 'Supervisor', 'Active')
+            VALUES (?, ?, ?, ?, ?, 'Active')
         `;
 
         const [result] = await db.query(insertQuery, [
             full_name,
             username,
             hashedPassword,
-            normalizedEmail
+            normalizedEmail,
+            targetRole
         ]);
 
         res.status(201).json({
@@ -82,7 +87,7 @@ exports.createSupervisor = async (req, res) => {
                 full_name,
                 username,
                 email: normalizedEmail,
-                role: 'Supervisor',
+                role: targetRole,
                 status: 'Active'
             }
         });
@@ -95,7 +100,7 @@ exports.createSupervisor = async (req, res) => {
     }
 };
 
-// 3. Update supervisor name and details (with email)
+// 3. Update supervisor name and details (with email). Works for either supervisor role.
 exports.updateSupervisor = async (req, res) => {
     const { id } = req.params;
     const { full_name, username, email } = req.body;
@@ -135,13 +140,15 @@ exports.updateSupervisor = async (req, res) => {
         const updateQuery = `
             UPDATE users 
             SET full_name = ?, username = ?, email = ?
-            WHERE user_id = ? AND role = 'Supervisor'
+            WHERE user_id = ? AND role IN (?, ?)
         `;
         const [result] = await db.query(updateQuery, [
             full_name,
             username,
             email && String(email).trim() ? email.trim() : null,
-            id
+            id,
+            'Supervisor',
+            'StaffSupervisor'
         ]);
 
         if (result.affectedRows === 0) {
@@ -164,10 +171,10 @@ exports.updateSupervisor = async (req, res) => {
     }
 };
 
-// 4. تغيير حالة حساب المشرف بشكل حقيقي في قاعدة البيانات
+// 4. Toggle status for either supervisor role
 exports.toggleSupervisorStatus = async (req, res) => {
     const { id } = req.params;
-    const { status } = req.body; // يتوقع استقبال 'Active' أو 'Inactive'
+    const { status } = req.body;
 
     if (!status || !['Active', 'Inactive'].includes(status)) {
         return res.status(400).json({
@@ -180,9 +187,9 @@ exports.toggleSupervisorStatus = async (req, res) => {
         const query = `
             UPDATE users 
             SET status = ?
-            WHERE user_id = ? AND role = 'Supervisor'
+            WHERE user_id = ? AND role IN (?, ?)
         `;
-        const [result] = await db.query(query, [status, id]);
+        const [result] = await db.query(query, [status, id, 'Supervisor', 'StaffSupervisor']);
 
         if (result.affectedRows === 0) {
             return res.status(404).json({

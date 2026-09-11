@@ -13,6 +13,7 @@ const path = require('path');
 const staffRoutes = require('./routes/staffRoutes');
 const staffAttendanceRoutes = require('./routes/staffAttendanceRoutes');
 const staffPayrollRoutes = require('./routes/StaffPayrollRoutes');
+const staffOvertimeRoutes = require('./routes/staffOvertimeRoutes');
 require('dotenv').config();
 if (!process.env.JWT_SECRET) {
     console.error("FATAL ERROR: JWT_SECRET environment variable is not defined.");
@@ -45,6 +46,7 @@ app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/staff', staffRoutes);
 app.use('/api/staff-attendance', staffAttendanceRoutes);
 app.use('/api/staff-payroll', staffPayrollRoutes);
+app.use('/api/staff-overtime', staffOvertimeRoutes);
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });
 });

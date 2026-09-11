@@ -7,6 +7,7 @@ const restrictTo = require('../middleware/roleMiddleware');
 router.use(authMiddleware);
 
 // ==================== Workers Bulk Attendance (Admin / Supervisor) ====================
+// UNCHANGED — this is worker attendance (Worker Supervisor), not staff. Do not touch.
 router.post('/workers/bulk-checkin', restrictTo('Admin', 'Supervisor'), staffAttendanceController.bulkCheckIn);
 router.post('/workers/bulk-checkout', restrictTo('Admin', 'Supervisor'), staffAttendanceController.bulkCheckOut);
 
@@ -14,10 +15,14 @@ router.post('/workers/bulk-checkout', restrictTo('Admin', 'Supervisor'), staffAt
 router.post('/self', restrictTo('Staff'), staffAttendanceController.selfMarkAttendance);
 router.get('/self', restrictTo('Staff'), staffAttendanceController.getMyAttendance);
 
-// ==================== Admin / Supervisor Review (Staff Attendance) ====================
-router.get('/pending', restrictTo('Admin', 'Supervisor'), staffAttendanceController.getPendingStaffAttendance);
-router.post('/review', restrictTo('Admin', 'Supervisor'), staffAttendanceController.reviewStaffAttendance);
-router.get('/by-date', restrictTo('Admin', 'Supervisor'), staffAttendanceController.getStaffAttendanceByDate);
+// ==================== Admin / Staff Supervisor Review (Staff Attendance) ====================
+// CHANGED: 'Supervisor' -> 'StaffSupervisor'. Worker Supervisors never had
+// staff attendance data in scope; this closes that gap. Scope filtering to
+// only assigned staff is applied inside the controller for StaffSupervisor.
+router.get('/pending', restrictTo('Admin', 'StaffSupervisor'), staffAttendanceController.getPendingStaffAttendance);
+router.post('/review', restrictTo('Admin', 'StaffSupervisor'), staffAttendanceController.reviewStaffAttendance);
+router.get('/by-date', restrictTo('Admin', 'StaffSupervisor'), staffAttendanceController.getStaffAttendanceByDate);
+
 const staffAttendanceAdminController = require('../controllers/staffAttendanceAdminController');
 router.get('/admin/day', restrictTo('Admin'), staffAttendanceAdminController.getDayView);
 router.post('/admin/bulk-set', restrictTo('Admin'), staffAttendanceAdminController.bulkSetAttendance);

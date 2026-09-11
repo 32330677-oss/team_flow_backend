@@ -66,7 +66,7 @@ async function getStaffByUserId(userId, executor = db) {
     );
     return rows.length > 0 ? rows[0] : null;
 }
-
+const { getAssignedStaffIdsForSupervisor } = require('./staffSupervisorAssignmentController');
 // ==================== Self-service (Staff role) ====================
 
 exports.selfMarkAttendance = async (req, res) => {
@@ -318,14 +318,24 @@ exports.bulkCheckOut = (req, res) => exports.runBulkAttendance(req, res, 'checko
 
 exports.getPendingStaffAttendance = async (req, res) => {
     try {
-        const [rows] = await db.execute(
-            `SELECT sa.*, sm.full_name, sm.staff_unique_id, s.site_name
+        let query = `SELECT sa.*, sm.full_name, sm.staff_unique_id, s.site_name
              FROM staff_attendance sa
              JOIN staff_members sm ON sm.staff_id = sa.staff_id
              LEFT JOIN sites s ON s.site_id = sm.site_id
-             WHERE sa.status IN ('Submitted', 'Rejected')
-             ORDER BY sa.record_date DESC`
-        );
+             WHERE sa.status IN ('Submitted', 'Rejected')`;
+        const params = [];
+
+        if (req.user.role === 'StaffSupervisor') {
+            const assignedIds = await getAssignedStaffIdsForSupervisor(req.user.user_id);
+            if (assignedIds.length === 0) {
+                return res.status(200).json({ status: 'success', data: [] });
+            }
+            query += ` AND sa.staff_id IN (${assignedIds.map(() => '?').join(',')})`;
+            params.push(...assignedIds);
+        }
+
+        query += ' ORDER BY sa.record_date DESC';
+        const [rows] = await db.execute(query, params);
         return res.status(200).json({ status: 'success', data: rows });
     } catch (error) {
         console.error('GET PENDING STAFF ATTENDANCE ERROR:', error);
@@ -354,6 +364,15 @@ exports.reviewStaffAttendance = async (req, res) => {
         );
         if (rows.length === 0) throw new AppError('Record not found.');
         const record = rows[0];
+
+        // Scope check: a StaffSupervisor may only review staff explicitly assigned to them.
+        if (req.user.role === 'StaffSupervisor') {
+            const assignedIds = await getAssignedStaffIdsForSupervisor(req.user.user_id, connection);
+            if (!assignedIds.includes(record.staff_id)) {
+                throw new AppError('You are not authorized to review this staff member\'s attendance.');
+            }
+        }
+
         if (record.status !== 'Submitted') throw new AppError('Cannot review a record that is not in pending status.');
 
         const resolvedIsPaid = (is_paid === 0 || is_paid === 1) ? is_paid : record.is_paid;
@@ -390,15 +409,24 @@ exports.getStaffAttendanceByDate = async (req, res) => {
     const { date } = req.query;
     if (!isValidDateOnly(date)) return res.status(400).json({ status: 'error', message: 'Please provide a valid date.' });
     try {
-        const [rows] = await db.execute(
-            `SELECT sa.*, sm.full_name, sm.staff_unique_id, s.site_name
+        let query = `SELECT sa.*, sm.full_name, sm.staff_unique_id, s.site_name
              FROM staff_attendance sa
              JOIN staff_members sm ON sm.staff_id = sa.staff_id
              LEFT JOIN sites s ON s.site_id = sm.site_id
-             WHERE sa.record_date = ?
-             ORDER BY sm.full_name`,
-            [date]
-        );
+             WHERE sa.record_date = ?`;
+        const params = [date];
+
+        if (req.user.role === 'StaffSupervisor') {
+            const assignedIds = await getAssignedStaffIdsForSupervisor(req.user.user_id);
+            if (assignedIds.length === 0) {
+                return res.status(200).json({ status: 'success', data: [] });
+            }
+            query += ` AND sa.staff_id IN (${assignedIds.map(() => '?').join(',')})`;
+            params.push(...assignedIds);
+        }
+
+        query += ' ORDER BY sm.full_name';
+        const [rows] = await db.execute(query, params);
         return res.status(200).json({ status: 'success', data: rows });
     } catch (error) {
         console.error('GET STAFF ATTENDANCE BY DATE ERROR:', error);

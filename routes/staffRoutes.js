@@ -21,5 +21,10 @@ router.get('/:id/lifecycle-history', restrictTo('Admin'), staffLifecycleControll
 router.get('/:id/assignments', restrictTo('Admin'), staffAssignmentController.getHistory);
 router.post('/:id/assignments', restrictTo('Admin'), staffAssignmentController.assignToSite);
 router.delete('/:id/assignments/current', restrictTo('Admin'), staffAssignmentController.unassignCurrent);
+const staffSupervisorAssignmentController = require('../controllers/staffSupervisorAssignmentController');
 
+// NEW — staff supervisor assignment (Admin only: assigning supervisors is an admin action)
+router.get('/:id/supervisor-assignments', restrictTo('Admin'), staffSupervisorAssignmentController.getHistory);
+router.post('/:id/supervisor-assignments', restrictTo('Admin'), staffSupervisorAssignmentController.assignSupervisor);
+router.delete('/:id/supervisor-assignments/current', restrictTo('Admin'), staffSupervisorAssignmentController.unassignCurrent);
 module.exports = router;
