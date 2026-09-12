@@ -271,3 +271,25 @@ exports.getAssignedStaffIdsForSupervisor = async (supervisorUserId, executor = d
   );
   return rows.map((r) => r.staff_id);
 };
+
+
+// GET /api/staff/my-assigned-staff  (StaffSupervisor only)
+exports.getMyAssignedStaff = async (req, res) => {
+  const supervisorId = req.user.user_id;
+  try {
+    const [rows] = await db.execute(
+      `SELECT sm.staff_id, sm.staff_unique_id, sm.full_name, sm.position,
+              sm.standard_daily_hours, sm.status
+       FROM staff_supervisor_assignments ssa
+       JOIN staff_members sm ON sm.staff_id = ssa.staff_id
+       WHERE ssa.supervisor_user_id = ? AND ssa.unassigned_date IS NULL
+         AND sm.status = 'Active'
+       ORDER BY sm.full_name`,
+      [supervisorId]
+    );
+    return res.status(200).json({ status: 'success', data: rows });
+  } catch (error) {
+    console.error('GET MY ASSIGNED STAFF ERROR:', error);
+    return res.status(500).json({ status: 'error', message: 'Failed to load assigned staff.' });
+  }
+};

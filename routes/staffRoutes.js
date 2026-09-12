@@ -11,7 +11,7 @@ const authMiddleware = require('../middleware/authMiddleware');
 const restrictTo = require('../middleware/roleMiddleware');
 
 router.use(authMiddleware);
-
+router.get('/my-assigned-staff', restrictTo('StaffSupervisor'), staffSupervisorAssignmentController.getMyAssignedStaff);
 router.get('/', restrictTo('Admin'), staffController.getAllStaff);
 router.post('/', restrictTo('Admin'), staffController.createStaff);
 router.put('/:id', restrictTo('Admin'), staffController.updateStaff);

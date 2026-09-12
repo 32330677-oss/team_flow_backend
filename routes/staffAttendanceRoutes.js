@@ -26,7 +26,9 @@ router.get('/by-date', restrictTo('Admin', 'StaffSupervisor'), staffAttendanceCo
 const staffAttendanceAdminController = require('../controllers/staffAttendanceAdminController');
 router.get('/admin/day', restrictTo('Admin'), staffAttendanceAdminController.getDayView);
 router.post('/admin/bulk-set', restrictTo('Admin'), staffAttendanceAdminController.bulkSetAttendance);
-
+const staffAttendanceSupervisorController = require('../controllers/staffAttendanceSupervisorController');
+router.get('/supervisor/day', restrictTo('StaffSupervisor'), staffAttendanceSupervisorController.getDayView);
+router.post('/supervisor/bulk-set', restrictTo('StaffSupervisor'), staffAttendanceSupervisorController.bulkSetAttendance);
 // ==================== Pre-payroll: Management-Paid Absences ====================
 const staffAbsenceController = require('../controllers/staffAbsenceController');
 router.get('/admin/absences', restrictTo('Admin'), staffAbsenceController.getAbsenceSummary);
