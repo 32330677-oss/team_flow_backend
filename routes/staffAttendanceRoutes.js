@@ -11,10 +11,6 @@ router.use(authMiddleware);
 router.post('/workers/bulk-checkin', restrictTo('Admin', 'Supervisor'), staffAttendanceController.bulkCheckIn);
 router.post('/workers/bulk-checkout', restrictTo('Admin', 'Supervisor'), staffAttendanceController.bulkCheckOut);
 
-// ==================== Staff Self-Service ====================
-router.post('/self', restrictTo('Staff'), staffAttendanceController.selfMarkAttendance);
-router.get('/self', restrictTo('Staff'), staffAttendanceController.getMyAttendance);
-
 // ==================== Admin / Staff Supervisor Review (Staff Attendance) ====================
 // CHANGED: 'Supervisor' -> 'StaffSupervisor'. Worker Supervisors never had
 // staff attendance data in scope; this closes that gap. Scope filtering to

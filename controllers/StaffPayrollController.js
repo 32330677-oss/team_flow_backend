@@ -298,18 +298,26 @@ async function markStaffBatchAsPaid(req, res) {
     try {
         await connection.beginTransaction();
         const [batches] = await connection.execute(
-            'SELECT status FROM staff_payroll_batches WHERE staff_payroll_batch_id = ? FOR UPDATE',
-            [batchId]
-        );
-        if (!batches.length) {
-            await connection.rollback();
-            return res.status(404).json({ status: 'error', message: 'Payroll batch not found' });
-        }
-        if (batches[0].status === 'Paid') {
-            await connection.rollback();
-            return res.status(409).json({ status: 'error', message: 'Payroll batch is already paid' });
-        }
-        await connection.execute(`UPDATE staff_payroll_batches SET status = 'Paid' WHERE staff_payroll_batch_id = ?`, [batchId]);
+    'SELECT status, is_finalized FROM staff_payroll_batches WHERE staff_payroll_batch_id = ? FOR UPDATE',
+    [batchId]
+);
+if (!batches.length) {
+    await connection.rollback();
+    return res.status(404).json({ status: 'error', message: 'Payroll batch not found' });
+}
+if (batches[0].status === 'Superseded') {
+    await connection.rollback();
+    return res.status(409).json({ status: 'error', message: 'A superseded batch cannot be marked as paid' });
+}
+if (batches[0].status === 'Paid') {
+    await connection.rollback();
+    return res.status(409).json({ status: 'error', message: 'Payroll batch is already paid' });
+}
+if (!batches[0].is_finalized) {
+    await connection.rollback();
+    return res.status(409).json({ status: 'error', message: 'Finalize this payroll batch before marking it as paid.' });
+}
+await connection.execute(`UPDATE staff_payroll_batches SET status = 'Paid' WHERE staff_payroll_batch_id = ?`, [batchId]);
         await connection.commit();
         return res.json({ status: 'success', message: 'Payroll batch marked as paid successfully' });
     } catch (error) {
