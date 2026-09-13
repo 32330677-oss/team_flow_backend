@@ -329,3 +329,52 @@ exports.getShortfallDays = async (req, res) => {
     return res.status(500).json({ status: 'error', message: 'Failed to load shortfall days.' });
   }
 };
+
+// GET /api/staff-overtime/monthly-ledger?staff_id=&month=YYYY-MM
+// Read-only: القيم محسوبة تلقائيًا من StaffPayrollController عند توليد
+// دفعة الرواتب. لا يوجد تعويض يدوي بعد الآن — الاعتماد بالكامل على
+// المبدأ الشهري التلقائي.
+exports.getMonthlyLedger = async (req, res) => {
+  const staffId = Number(req.query.staff_id);
+  const month = req.query.month;
+
+  if (!Number.isInteger(staffId) || staffId <= 0) {
+    return res.status(400).json({ status: 'error', message: 'A valid staff_id is required.' });
+  }
+  if (!/^\d{4}-\d{2}$/.test(String(month || ''))) {
+    return res.status(400).json({ status: 'error', message: 'A valid month (YYYY-MM) is required.' });
+  }
+
+  try {
+    const [rows] = await db.execute(
+      `SELECT sml.*, spb.status AS batch_status, spb.is_finalized
+       FROM staff_monthly_overtime_ledger sml
+       LEFT JOIN staff_payroll_batches spb ON spb.staff_payroll_batch_id = sml.staff_payroll_batch_id
+       WHERE sml.staff_id = ? AND sml.payroll_month = ?
+       LIMIT 1`,
+      [staffId, month]
+    );
+
+    if (rows.length === 0) {
+      return res.status(200).json({
+        status: 'success',
+        data: null,
+        message: 'No payroll batch has been generated for this month yet.',
+      });
+    }
+
+    return res.status(200).json({ status: 'success', data: rows[0] });
+  } catch (error) {
+    console.error('GET STAFF MONTHLY LEDGER ERROR:', error);
+    return res.status(500).json({ status: 'error', message: 'Failed to load the monthly overtime ledger.' });
+  }
+};
+
+module.exports = {
+  getBalance: exports.getBalance,
+  getHistory: exports.getHistory,
+  grantCompensation: exports.grantCompensation,
+  reverseCompensation: exports.reverseCompensation,
+  getShortfallDays: exports.getShortfallDays,
+  getMonthlyLedger: exports.getMonthlyLedger,
+};
