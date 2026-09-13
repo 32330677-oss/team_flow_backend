@@ -1,4 +1,5 @@
 const pool = require('../config/db');
+const { countNonFridayDays, isFriday, round2 } = require('../services/staffAttendanceService');
 
 function isValidDate(value) {
     return /^\d{4}-\d{2}-\d{2}$/.test(String(value || '')) && !Number.isNaN(Date.parse(`${value}T00:00:00`));
@@ -6,23 +7,6 @@ function isValidDate(value) {
 
 function money(value) {
     return Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
-}
-
-// All days of the week are considered working days except Friday (5 = Friday according to getUTCDay)
-function countWorkingDays(startDate, endDate) {
-    let count = 0;
-    const cursor = new Date(`${startDate}T00:00:00Z`);
-    const end = new Date(`${endDate}T00:00:00Z`);
-    while (cursor <= end) {
-        if (cursor.getUTCDay() !== 5) count += 1;
-        cursor.setUTCDate(cursor.getUTCDate() + 1);
-    }
-    return count;
-}
-
-function isFriday(dateValue) {
-    const date = new Date(`${dateValue}T00:00:00Z`);
-    return date.getUTCDay() === 5;
 }
 
 function getPaidLeaveTypes(staff) {
@@ -37,27 +21,29 @@ function getPaidLeaveTypes(staff) {
 }
 
 // ============================================================
-// PARTIAL-DAY (HOURLY-PRORATED) PAY FOR "Present" DAYS
-// ------------------------------------------------------------
-//   dayFraction = MIN(1, effectiveRegularHours / standard_daily_hours)
+// NEW MONTHLY PRINCIPLE (replaces the old day-fraction/manual-OT-grant model)
 //
-// effectiveRegularHours = stored regular_hours + any ACTIVE overtime
-// compensation hours explicitly granted by Admin against that SAME day
-// (see staffOvertimeCompensationController.js). This NEVER rewrites the
-// stored regular_hours/overtime_hours columns (rule 22) — it only affects
-// this in-memory payroll calculation, by reading the ledger table.
+//   required_hours       = non-Friday working days in period * standard_daily_hours
+//   actual_regular_raw    = sum(regular_hours) over Present days
+//                           + standard_daily_hours for every paid-leave day
+//                           + standard_daily_hours for every management-paid absence day
+//   actual_regular_hours  = MIN(actual_regular_raw, required_hours)   -- capped, rule 11
+//   overflow_as_ot        = MAX(0, actual_regular_raw - required_hours)
+//   ot_earned_hours       = sum(daily overtime_hours over Present days) + overflow_as_ot
+//   shortage_hours        = MAX(0, required_hours - actual_regular_hours)
+//   ot_used_hours         = MIN(shortage_hours, ot_earned_hours)
+//   ot_remaining_hours    = ot_earned_hours - ot_used_hours
+//   uncovered_shortage    = shortage_hours - ot_used_hours
+//   hourly_rate           = monthly_salary / required_hours
+//   salary_deduction      = uncovered_shortage * hourly_rate
+//   net_salary            = monthly_salary - salary_deduction
 //
-// overtime_hours is summed separately (overtimeHoursTotal) for display
-// only. It never contributes to net_salary directly — the only way OT
-// affects pay is via the effectiveRegularHours path above, and only for
-// hours an Admin has explicitly applied to compensate a shortfall.
+// Friday: only counted via actual_regular_raw when explicitly confirmed
+// (is_friday_worked = 1) for that staff member on that day; required_hours
+// is NEVER increased by Friday, so Friday hours only ever help cover an
+// existing shortage or spill over into overtime — never inflate the basic
+// salary beyond what the required hours already buy (rule 11).
 // ============================================================
-function computeDayFraction(effectiveRegularHours, standardDailyHours) {
-    const worked = Number(effectiveRegularHours || 0);
-    const standard = Number(standardDailyHours) > 0 ? Number(standardDailyHours) : 8;
-    if (!Number.isFinite(worked) || worked <= 0) return 0;
-    return Math.min(1, worked / standard);
-}
 
 async function generateStaffPayrollBatch(req, res) {
     const { start_date, end_date } = req.body || {};
@@ -84,11 +70,8 @@ async function generateStaffPayrollBatch(req, res) {
             return res.status(409).json({ status: 'error', message: 'A payroll batch overlapping with this period already exists' });
         }
 
-        // LIFECYCLE FIX (Test 13): include staff who were Active for at least
-        // part of this period even if they've since been Terminated, as long
-        // as their termination happened on/after this period's start. Staff
-        // terminated entirely before this period started are correctly
-        // excluded. Fully-employed-for-the-whole-period staff are unaffected.
+        // Staff who were Active for at least part of this period, even if
+        // since Terminated (as long as termination happened on/after start).
         const [staffList] = await connection.execute(
             `SELECT staff_id, full_name, monthly_salary, paid_leave_types, standard_daily_hours,
                     hire_date, termination_date, status
@@ -101,12 +84,16 @@ async function generateStaffPayrollBatch(req, res) {
             return res.status(404).json({ status: 'error', message: 'No active staff members found' });
         }
 
-        // Batch-level sanity check only (not used as any staff's divisor anymore).
-        const batchWorkingDays = countWorkingDays(start_date, end_date);
-        if (batchWorkingDays <= 0) {
+        const batchNonFridayDays = countNonFridayDays(start_date, end_date);
+        if (batchNonFridayDays <= 0) {
             await connection.rollback();
             return res.status(400).json({ status: 'error', message: 'The selected period contains no working days' });
         }
+
+        // payroll_month for the ledger: the period's start month (a payroll
+        // period is expected to sit within a single calendar month; if it
+        // spans months, the ledger is keyed to the start month).
+        const payrollMonth = start_date.slice(0, 7);
 
         const [batchResult] = await connection.execute(
             `INSERT INTO staff_payroll_batches (start_date, end_date, generated_by_user_id, status)
@@ -121,12 +108,7 @@ async function generateStaffPayrollBatch(req, res) {
             const paidLeaveTypes = getPaidLeaveTypes(staff);
             const standardDailyHours = Number(staff.standard_daily_hours) > 0 ? Number(staff.standard_daily_hours) : 8;
 
-            // ----------------------------------------------------------
-            // LIFECYCLE: clamp the period to this staff member's actual
-            // employment window (rule 13 / Test 13). Byte-identical to the
-            // old global-workingDays behavior when hire_date <= start_date
-            // and there's no termination (or termination_date >= end_date).
-            // ----------------------------------------------------------
+            // Clamp to this staff member's actual employment window.
             let effectiveStart = start_date;
             let effectiveEnd = end_date;
             if (staff.hire_date) {
@@ -139,92 +121,112 @@ async function generateStaffPayrollBatch(req, res) {
             }
             if (effectiveStart > effectiveEnd) continue; // not employed at all during this period
 
-            const staffWorkingDays = countWorkingDays(effectiveStart, effectiveEnd);
-            if (staffWorkingDays <= 0) continue;
+            const requiredHours = round2(countNonFridayDays(effectiveStart, effectiveEnd) * standardDailyHours);
+            if (requiredHours <= 0) continue;
 
-            // Only Approved records within this staff member's actual employment
-            // window enter into salary calculation.
             const [records] = await connection.execute(
                 `SELECT staff_attendance_id, record_date, attendance_status, is_paid,
-                        is_management_paid_absence, regular_hours, overtime_hours
+                        is_management_paid_absence, regular_hours, overtime_hours, is_friday_worked
                  FROM staff_attendance
                  WHERE staff_id = ? AND record_date BETWEEN ? AND ? AND status = 'Approved'`,
                 [staff.staff_id, effectiveStart, effectiveEnd]
             );
 
-            // Pull active (non-reversed) OT compensations already granted
-            // against this staff member's Present days in this batch.
-            const presentIds = records
-                .filter((r) => r.attendance_status === 'Present')
-                .map((r) => r.staff_attendance_id);
-            const otUsedMap = new Map();
-            if (presentIds.length) {
-                const [otRows] = await connection.query(
-                    `SELECT target_attendance_id, SUM(hours_used) AS used
-                     FROM staff_overtime_compensations
-                     WHERE target_attendance_id IN (?) AND reversed_at IS NULL
-                     GROUP BY target_attendance_id`,
-                    [presentIds]
-                );
-                otRows.forEach((r) => otUsedMap.set(r.target_attendance_id, Number(r.used)));
-            }
-
-            let presentDayFraction = 0;   // sum of prorated day-fractions for "Present" records
-            let paidLeaveDays = 0;        // full days
-            let managementPaidDays = 0;   // full days
-            let unpaidAbsenceDays = 0;    // informational only, not paid
-            let overtimeHoursTotal = 0;   // display-only, never paid directly for staff
+            let actualRegularRaw = 0;   // hours toward the required monthly entitlement
+            let dailyOtEarned = 0;      // sum of per-day overtime_hours (Present days only)
+            let presentDaysCount = 0;
+            let paidLeaveDays = 0;
+            let managementPaidDays = 0;
+            let unpaidAbsenceDays = 0;
 
             for (const record of records) {
+                const recordDateStr = String(record.record_date).slice(0, 10);
+                const recordIsFriday = isFriday(recordDateStr);
+
                 if (record.attendance_status === 'Present') {
-                    // Friday attendance is recorded and remains visible in attendance,
-                    // but it must not contribute to staff payroll.
-                    if (isFriday(record.record_date)) {
+                    // A Friday Present record only counts if it was explicitly
+                    // confirmed (is_friday_worked = 1) when it was recorded.
+                    if (recordIsFriday && Number(record.is_friday_worked) !== 1) {
                         continue;
                     }
-
-                    const otUsedForDay = otUsedMap.get(record.staff_attendance_id) || 0;
-                    const effectiveRegularHours = Number(record.regular_hours || 0) + otUsedForDay;
-
-                    presentDayFraction += computeDayFraction(effectiveRegularHours, standardDailyHours);
-                    overtimeHoursTotal += Number(record.overtime_hours || 0);
+                    actualRegularRaw += Number(record.regular_hours || 0);
+                    dailyOtEarned += Number(record.overtime_hours || 0);
+                    presentDaysCount += 1;
                 } else if (record.attendance_status === 'Absent') {
-                    // Absences are unpaid by default. An Admin can explicitly grant
-                    // management-paid leave for a specific absence day beforehand
-                    // (see controllers/staffAbsenceController.js). That day is then
-                    // paid as a FULL day and tracked separately.
                     if (Number(record.is_management_paid_absence) === 1) {
+                        actualRegularRaw += standardDailyHours;
                         managementPaidDays += 1;
                     } else {
                         unpaidAbsenceDays += 1;
                     }
                 } else if (paidLeaveTypes.includes(record.attendance_status) && Number(record.is_paid) === 1) {
+                    actualRegularRaw += standardDailyHours;
                     paidLeaveDays += 1;
                 } else {
                     unpaidAbsenceDays += 1;
                 }
             }
 
-            const dailyRate = money(Number(staff.monthly_salary) / staffWorkingDays);
-            const payableDays = money(presentDayFraction + paidLeaveDays + managementPaidDays);
-            // Overtime is intentionally excluded from net_salary for staff except
-            // via the explicit shortfall-compensation path folded into presentDayFraction above.
-            const netSalary = money(dailyRate * payableDays);
+            const actualRegularHours = round2(Math.min(actualRegularRaw, requiredHours));
+            const overflowAsOt = round2(Math.max(0, actualRegularRaw - requiredHours));
+            const otEarnedHours = round2(dailyOtEarned + overflowAsOt);
+
+            const shortageHours = round2(Math.max(0, requiredHours - actualRegularHours));
+            const otUsedHours = round2(Math.min(shortageHours, otEarnedHours));
+            const otRemainingHours = round2(otEarnedHours - otUsedHours);
+            const uncoveredShortageHours = round2(shortageHours - otUsedHours);
+
+            const hourlyRate = money(Number(staff.monthly_salary) / requiredHours);
+            const salaryDeduction = money(uncoveredShortageHours * hourlyRate);
+            const netSalary = money(Number(staff.monthly_salary) - salaryDeduction);
 
             const [payrollResult] = await connection.execute(
                 `INSERT INTO staff_payroll
                     (staff_payroll_batch_id, staff_id, monthly_salary_snapshot, working_days_in_period,
                      present_days, paid_leave_days, management_paid_days, unpaid_absence_days,
-                     overtime_hours, daily_rate, net_salary)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                     overtime_hours, daily_rate, net_salary,
+                     required_hours, ot_earned_hours, ot_used_hours, ot_remaining_hours,
+                     shortage_hours, salary_deduction_amount)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 [
-                    batchId, staff.staff_id, staff.monthly_salary, staffWorkingDays,
-                    payableDays > 0 ? money(presentDayFraction) : 0,
-                    paidLeaveDays, managementPaidDays, unpaidAbsenceDays,
-                    money(overtimeHoursTotal), dailyRate, netSalary
+                    batchId, staff.staff_id, staff.monthly_salary, countNonFridayDays(effectiveStart, effectiveEnd),
+                    presentDaysCount, paidLeaveDays, managementPaidDays, unpaidAbsenceDays,
+                    otEarnedHours, hourlyRate, netSalary,
+                    requiredHours, otEarnedHours, otUsedHours, otRemainingHours,
+                    shortageHours, salaryDeduction,
                 ]
             );
             if (!payrollResult.insertId) continue;
+
+            // One ledger row per (staff, payroll_month). If a batch is
+            // regenerated for the same month, this overwrites the prior
+            // snapshot rather than duplicating (rule: monthly OT is not
+            // day-by-day, and must not double count across regenerations).
+            await connection.execute(
+                `INSERT INTO staff_monthly_overtime_ledger
+                    (staff_id, payroll_month, required_hours, actual_regular_hours,
+                     ot_earned_hours, ot_used_hours, ot_remaining_hours,
+                     shortage_hours, uncovered_shortage_hours,
+                     hourly_rate_snapshot, salary_deduction_amount, staff_payroll_batch_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE
+                    required_hours = VALUES(required_hours),
+                    actual_regular_hours = VALUES(actual_regular_hours),
+                    ot_earned_hours = VALUES(ot_earned_hours),
+                    ot_used_hours = VALUES(ot_used_hours),
+                    ot_remaining_hours = VALUES(ot_remaining_hours),
+                    shortage_hours = VALUES(shortage_hours),
+                    uncovered_shortage_hours = VALUES(uncovered_shortage_hours),
+                    hourly_rate_snapshot = VALUES(hourly_rate_snapshot),
+                    salary_deduction_amount = VALUES(salary_deduction_amount),
+                    staff_payroll_batch_id = VALUES(staff_payroll_batch_id)`,
+                [
+                    staff.staff_id, payrollMonth, requiredHours, actualRegularHours,
+                    otEarnedHours, otUsedHours, otRemainingHours,
+                    shortageHours, uncoveredShortageHours,
+                    hourlyRate, salaryDeduction, batchId,
+                ]
+            );
 
             totalStaff += 1;
             totalAmount = money(totalAmount + netSalary);

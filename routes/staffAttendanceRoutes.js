@@ -19,9 +19,6 @@ router.get('/pending', restrictTo('Admin', 'StaffSupervisor'), staffAttendanceCo
 router.post('/review', restrictTo('Admin', 'StaffSupervisor'), staffAttendanceController.reviewStaffAttendance);
 router.get('/by-date', restrictTo('Admin', 'StaffSupervisor'), staffAttendanceController.getStaffAttendanceByDate);
 
-const staffAttendanceAdminController = require('../controllers/staffAttendanceAdminController');
-router.get('/admin/day', restrictTo('Admin'), staffAttendanceAdminController.getDayView);
-router.post('/admin/bulk-set', restrictTo('Admin'), staffAttendanceAdminController.bulkSetAttendance);
 const staffAttendanceSupervisorController = require('../controllers/staffAttendanceSupervisorController');
 router.get('/supervisor/day', restrictTo('StaffSupervisor'), staffAttendanceSupervisorController.getDayView);
 router.post('/supervisor/bulk-set', restrictTo('StaffSupervisor'), staffAttendanceSupervisorController.bulkSetAttendance);
