@@ -378,27 +378,26 @@ async function exportStaffPayrollExcel(req, res) {
         } catch (e) {
             console.warn('Logo not added:', e.message);
         }
-
-        sheet.columns = [
-            { header: 'No.', key: 'number', width: 6 },
-            { header: 'Staff ID', key: 'staff_id', width: 14 },
-            { header: 'Full Name', key: 'full_name', width: 26 },
-            { header: 'Position', key: 'position', width: 20 },
-            { header: 'Monthly Salary', key: 'monthly_salary', width: 16 },
-            { header: 'Working Days', key: 'working_days', width: 14 },
-            { header: 'Present Days', key: 'present_days', width: 14 },
-            { header: 'Paid Leave Days', key: 'paid_leave_days', width: 16 },
-            { header: 'Mgmt-Paid Absence', key: 'management_paid_days', width: 18 },
-            { header: 'Unpaid Absence', key: 'unpaid_absence_days', width: 16 },
-            { header: 'Required Hrs', key: 'required_hours', width: 14 },
-            { header: 'OT Earned', key: 'ot_earned_hours', width: 12 },
-            { header: 'OT Used', key: 'ot_used_hours', width: 12 },
-            { header: 'OT Remaining', key: 'ot_remaining_hours', width: 14 },
-            { header: 'Shortage Hrs', key: 'shortage_hours', width: 14 },
-            { header: 'Deduction', key: 'salary_deduction_amount', width: 14 },
-            { header: 'Net Salary', key: 'net_salary', width: 16 },
-            { header: 'Signature', key: 'signature', width: 18 },
-        ];
+sheet.columns = [
+    { header: 'No.', key: 'number', width: 5 },
+    { header: 'Staff ID', key: 'staff_id', width: 10 },
+    { header: 'Full Name', key: 'full_name', width: 20 },       // كان 26
+    { header: 'Position', key: 'position', width: 14 },          // كان 20
+    { header: 'Monthly Salary', key: 'monthly_salary', width: 13 },
+    { header: 'Working Days', key: 'working_days', width: 11 },
+    { header: 'Present Days', key: 'present_days', width: 11 },
+    { header: 'Paid Leave Days', key: 'paid_leave_days', width: 12 },
+    { header: 'Mgmt-Paid Absence', key: 'management_paid_days', width: 13 },
+    { header: 'Unpaid Absence', key: 'unpaid_absence_days', width: 12 },
+    { header: 'Required Hrs', key: 'required_hours', width: 11 },
+    { header: 'OT Earned', key: 'ot_earned_hours', width: 10 },
+    { header: 'OT Used', key: 'ot_used_hours', width: 10 },
+    { header: 'OT Remaining', key: 'ot_remaining_hours', width: 11 },
+    { header: 'Shortage Hrs', key: 'shortage_hours', width: 11 },
+    { header: 'Deduction', key: 'salary_deduction_amount', width: 11 },
+    { header: 'Net Salary', key: 'net_salary', width: 13 },
+    { header: 'Signature', key: 'signature', width: 14 },
+];
 
         const statusLabel = batch.status === 'Superseded' ? 'Superseded'
             : batch.status === 'Paid' ? 'Paid' : 'Generated';
@@ -465,7 +464,7 @@ async function exportStaffPayrollExcel(req, res) {
             sheet.getCell(r, 16).numFmt = '#,##0.00';  // deduction
             sheet.getCell(r, 17).numFmt = '#,##0.00';  // net_salary
         }
-        sheet.views = [{ state: 'frozen', ySplit: 5 }];
+              sheet.views = [{ state: 'frozen', xSplit: 3, ySplit: 5 }];
         sheet.autoFilter = { from: 'A5', to: 'R5' };
 
         const fileName = `staff_payroll_batch_${batchId}.xlsx`;
