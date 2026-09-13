@@ -555,21 +555,21 @@ async function exportStaffPayrollPdf(req, res) {
 
         // ==================== Column layout ====================
  const columns = [
-    { key: 'no', label: 'No.', width: 28 },
-    { key: 'staff_id', label: 'Staff ID', width: 60 },
-    { key: 'full_name', label: 'Full Name', width: 120 },
-    { key: 'position', label: 'Position', width: 90 },
-    { key: 'monthly_salary', label: 'Monthly Salary', width: 75 },
-    { key: 'present_days', label: 'Present Days', width: 60 },
-    { key: 'paid_leave_days', label: 'Paid Leave', width: 55 },
-    { key: 'mgmt_paid_days', label: 'Mgmt-Paid Absence', width: 65 },
-    { key: 'unpaid_absence_days', label: 'Unpaid Absence', width: 60 },
-    { key: 'required_hours', label: 'Required Hrs', width: 65 },
-    { key: 'ot_earned_hours', label: 'OT Earned', width: 55 },
-    { key: 'ot_used_hours', label: 'OT Used', width: 50 },
-    { key: 'shortage_hours', label: 'Shortage Hrs', width: 60 },
-    { key: 'deduction', label: 'Deduction', width: 60 },
-    { key: 'net_salary', label: 'Net Salary', width: 65 },
+    { key: 'no', label: 'No.', width: 22 },
+    { key: 'staff_id', label: 'Staff ID', width: 48 },
+    { key: 'full_name', label: 'Full Name', width: 95 },
+    { key: 'position', label: 'Position', width: 70 },
+    { key: 'monthly_salary', label: 'Monthly Salary', width: 62 },
+    { key: 'present_days', label: 'Present Days', width: 48 },
+    { key: 'paid_leave_days', label: 'Paid Leave', width: 45 },
+    { key: 'mgmt_paid_days', label: 'Mgmt-Paid Absence', width: 52 },
+    { key: 'unpaid_absence_days', label: 'Unpaid Absence', width: 50 },
+    { key: 'required_hours', label: 'Required Hrs', width: 52 },
+    { key: 'ot_earned_hours', label: 'OT Earned', width: 45 },
+    { key: 'ot_used_hours', label: 'OT Used', width: 42 },
+    { key: 'shortage_hours', label: 'Shortage Hrs', width: 48 },
+    { key: 'deduction', label: 'Deduction', width: 50 },
+    { key: 'net_salary', label: 'Net Salary', width: 55 },
 ];
 const tableWidth = columns.reduce((s, c) => s + c.width, 0);
         const startX = doc.page.margins.left + (pageWidth - tableWidth) / 2;
