@@ -480,10 +480,258 @@ async function exportStaffPayrollExcel(req, res) {
         }
     }
 }
+
+
+
+
+// ============================================================
+// GET /api/staff-payroll/batch/:batchId/export.pdf
+// Formal one-document PDF report: company logo, period, status
+// (Finalized/Paid), full per-staff breakdown, and grand totals.
+// Meant to be handed directly to management.
+// ============================================================
+async function exportStaffPayrollPdf(req, res) {
+    const batchId = Number(req.params.batchId);
+    if (!Number.isInteger(batchId) || batchId <= 0) {
+        return res.status(400).json({ status: 'error', message: 'Invalid batch id.' });
+    }
+
+    try {
+        const PDFDocument = require('pdfkit');
+        const path = require('path');
+        const fs = require('fs');
+
+        const [batches] = await pool.execute(
+            `SELECT spb.*, u.full_name AS generated_by, fu.full_name AS finalized_by
+             FROM staff_payroll_batches spb
+             JOIN users u ON u.user_id = spb.generated_by_user_id
+             LEFT JOIN users fu ON fu.user_id = spb.finalized_by_user_id
+             WHERE spb.staff_payroll_batch_id = ?`,
+            [batchId]
+        );
+        if (!batches.length) return res.status(404).json({ status: 'error', message: 'Payroll batch not found.' });
+        const batch = batches[0];
+
+        const [rows] = await pool.execute(
+            `SELECT sp.*, sm.full_name, sm.staff_unique_id, sm.position
+             FROM staff_payroll sp
+             JOIN staff_members sm ON sm.staff_id = sp.staff_id
+             WHERE sp.staff_payroll_batch_id = ?
+             ORDER BY sm.full_name`,
+            [batchId]
+        );
+        if (!rows.length) return res.status(404).json({ status: 'error', message: 'No staff found in this batch.' });
+
+        const dateOnly = (v) => (v instanceof Date ? v.toISOString().slice(0, 10) : String(v || '').slice(0, 10));
+        const num = (v) => Number(v || 0);
+        const fmt = (v, digits = 2) => num(v).toFixed(digits);
+
+        const isFinalized = batch.is_finalized === 1 || batch.is_finalized === true;
+        const statusText = batch.status === 'Superseded' ? 'SUPERSEDED'
+            : batch.status === 'Paid' ? 'PAID' : 'GENERATED';
+        const finalizedText = isFinalized ? 'FINALIZED' : 'NOT FINALIZED';
+
+        // ---- Totals ----
+        let totalRegularHours = 0;
+        let totalOtEarned = 0;
+        let totalNet = 0;
+        let totalDeduction = 0;
+        rows.forEach((r) => {
+            totalRegularHours += num(r.present_days) > 0 ? num(r.required_hours) - num(r.shortage_hours) : num(r.actual_regular_hours || 0);
+            totalOtEarned += num(r.ot_earned_hours);
+            totalNet += num(r.net_salary);
+            totalDeduction += num(r.salary_deduction_amount);
+        });
+
+        const logoPath = path.join(__dirname, '../assets/logo.png');
+        const hasLogo = fs.existsSync(logoPath);
+
+        const doc = new PDFDocument({ size: 'A4', layout: 'landscape', margin: 36 });
+
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename="staff_payroll_batch_${batchId}.pdf"`);
+        doc.pipe(res);
+
+        const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+
+        // ==================== Column layout ====================
+        const columns = [
+            { key: 'no', label: 'No.', width: 28 },
+            { key: 'staff_id', label: 'Staff ID', width: 60 },
+            { key: 'full_name', label: 'Full Name', width: 120 },
+            { key: 'position', label: 'Position', width: 90 },
+            { key: 'monthly_salary', label: 'Monthly Salary', width: 75 },
+            { key: 'present_days', label: 'Present Days', width: 60 },
+            { key: 'paid_leave_days', label: 'Paid Leave', width: 55 },
+            { key: 'mgmt_paid_days', label: 'Mgmt-Paid Absence', width: 65 },
+            { key: 'unpaid_absence_days', label: 'Unpaid Absence', width: 60 },
+            { key: 'required_hours', label: 'Required Hrs', width: 65 },
+            { key: 'ot_earned_hours', label: 'OT Earned', width: 55 },
+            { key: 'ot_used_hours', label: 'OT Used', width: 50 },
+            { key: 'shortage_hours', label: 'Shortage Hrs', width: 60 },
+            { key: 'deduction', label: 'Deduction', width: 60 },
+            { key: 'net_salary', label: 'Net Salary', width: 65 },
+        ];
+        const tableWidth = columns.reduce((s, c) => s + c.width, 0);
+        const startX = doc.page.margins.left + (pageWidth - tableWidth) / 2;
+
+        function drawHeader() {
+            let cursorY = doc.page.margins.top;
+
+            if (hasLogo) {
+                doc.image(logoPath, doc.page.margins.left, cursorY, { width: 90, height: 40 });
+            }
+
+            doc.font('Helvetica-Bold').fontSize(16)
+                .text('STAFF PAYROLL REPORT', doc.page.margins.left, cursorY + 4, {
+                    width: pageWidth, align: 'center',
+                });
+
+            doc.font('Helvetica').fontSize(9)
+                .text('ASIK ENGINEERING CONSTRUCTION', doc.page.margins.left, cursorY + 24, {
+                    width: pageWidth, align: 'center',
+                });
+
+            cursorY += 52;
+
+            doc.font('Helvetica-Bold').fontSize(10);
+            doc.text(`Batch #${batchId}  (Version ${batch.version_number || 1})`, doc.page.margins.left, cursorY);
+            doc.text(
+                `Period: ${dateOnly(batch.start_date)}   to   ${dateOnly(batch.end_date)}`,
+                doc.page.margins.left, cursorY, { width: pageWidth, align: 'right' }
+            );
+            cursorY += 16;
+
+            // Status badges
+            doc.font('Helvetica-Bold').fontSize(10);
+            const finColor = isFinalized ? '#1a7a3c' : '#b21f1f';
+            const payColor = statusText === 'PAID' ? '#1a7a3c' : (statusText === 'SUPERSEDED' ? '#888888' : '#a06a00');
+
+            doc.fillColor(finColor).text(`Status: ${finalizedText}`, doc.page.margins.left, cursorY);
+            doc.fillColor(payColor).text(`Payment: ${statusText}`, doc.page.margins.left + 160, cursorY);
+            doc.fillColor('black');
+
+            doc.font('Helvetica').fontSize(9).text(
+                `Generated by: ${batch.generated_by || '-'}` +
+                (batch.finalized_by ? `   |   Finalized by: ${batch.finalized_by}` : ''),
+                doc.page.margins.left, cursorY, { width: pageWidth, align: 'right' }
+            );
+            cursorY += 20;
+
+            // Summary strip
+            doc.rect(doc.page.margins.left, cursorY, pageWidth, 22).fill('#f2f4fa');
+            doc.fillColor('#1a2a6c').font('Helvetica-Bold').fontSize(9);
+            const summaryText =
+                `Total Staff: ${rows.length}    |    ` +
+                `Total OT Earned: ${fmt(totalOtEarned)}h    |    ` +
+                `Total Deductions: ${fmt(totalDeduction)}    |    ` +
+                `TOTAL NET SALARY: ${fmt(totalNet)}`;
+            doc.text(summaryText, doc.page.margins.left + 10, cursorY + 6, { width: pageWidth - 20 });
+            doc.fillColor('black');
+            cursorY += 34;
+
+            return cursorY;
+        }
+
+        function drawTableHeaderRow(y) {
+            let x = startX;
+            doc.font('Helvetica-Bold').fontSize(7.5);
+            doc.rect(startX, y, tableWidth, 20).fill('#1a2a6c');
+            doc.fillColor('#ffffff');
+            columns.forEach((col) => {
+                doc.text(col.label, x + 3, y + 6, { width: col.width - 6, align: 'center' });
+                x += col.width;
+            });
+            doc.fillColor('black');
+            return y + 20;
+        }
+
+        function drawRow(y, values, opts = {}) {
+            const rowHeight = 18;
+            let x = startX;
+            if (opts.zebra) {
+                doc.rect(startX, y, tableWidth, rowHeight).fill('#f7f9fc');
+                doc.fillColor('black');
+            }
+            doc.font(opts.bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(7.5);
+            columns.forEach((col) => {
+                doc.rect(x, y, col.width, rowHeight).stroke('#dfe3e8');
+                doc.text(String(values[col.key] ?? ''), x + 3, y + 5, {
+                    width: col.width - 6, align: col.key === 'full_name' || col.key === 'position' ? 'left' : 'center',
+                });
+                x += col.width;
+            });
+            return y + rowHeight;
+        }
+
+        let y = drawHeader();
+        y = drawTableHeaderRow(y);
+
+        const bottomLimit = doc.page.height - doc.page.margins.bottom - 60;
+
+        rows.forEach((r, index) => {
+            if (y > bottomLimit) {
+                doc.addPage();
+                y = doc.page.margins.top;
+                y = drawTableHeaderRow(y);
+            }
+            y = drawRow(y, {
+                no: index + 1,
+                staff_id: r.staff_unique_id,
+                full_name: r.full_name,
+                position: r.position || '-',
+                monthly_salary: fmt(r.monthly_salary_snapshot),
+                present_days: fmt(r.present_days, 1),
+                paid_leave_days: fmt(r.paid_leave_days, 1),
+                mgmt_paid_days: fmt(r.management_paid_days || 0, 1),
+                unpaid_absence_days: fmt(r.unpaid_absence_days, 1),
+                required_hours: fmt(r.required_hours),
+                ot_earned_hours: fmt(r.ot_earned_hours),
+                ot_used_hours: fmt(r.ot_used_hours),
+                shortage_hours: fmt(r.shortage_hours),
+                deduction: fmt(r.salary_deduction_amount),
+                net_salary: fmt(r.net_salary),
+            }, { zebra: index % 2 === 1 });
+        });
+
+        // Grand total row
+        if (y > bottomLimit) {
+            doc.addPage();
+            y = doc.page.margins.top;
+            y = drawTableHeaderRow(y);
+        }
+        y = drawRow(y, {
+            no: '', staff_id: '', full_name: 'GRAND TOTAL', position: '',
+            monthly_salary: '', present_days: '', paid_leave_days: '', mgmt_paid_days: '',
+            unpaid_absence_days: '', required_hours: '', ot_earned_hours: fmt(totalOtEarned),
+            ot_used_hours: '', shortage_hours: '', deduction: fmt(totalDeduction),
+            net_salary: fmt(totalNet),
+        }, { bold: true });
+
+        // Signature footer
+        y += 40;
+        if (y > doc.page.height - doc.page.margins.bottom - 20) {
+            doc.addPage();
+            y = doc.page.margins.top + 20;
+        }
+        doc.font('Helvetica').fontSize(9);
+        doc.text('Prepared by: ____________________', doc.page.margins.left, y);
+        doc.text('Approved by (Management): ____________________', doc.page.margins.left + pageWidth / 2, y);
+        doc.text(`Generated on: ${new Date().toISOString().slice(0, 19).replace('T', ' ')}`, doc.page.margins.left, y + 24);
+
+        doc.end();
+    } catch (error) {
+        console.error('exportStaffPayrollPdf:', error);
+        if (!res.headersSent) {
+            return res.status(500).json({ status: 'error', message: 'Failed to export staff payroll PDF report.' });
+        }
+    }
+}
 module.exports = {
     generateStaffPayrollBatch,
     getStaffPayrollReport,
     getStaffPayrollBatchDetails,
     markStaffBatchAsPaid,
-    exportStaffPayrollExcel, // ← جديد
+    exportStaffPayrollExcel,
+    exportStaffPayrollPdf, // ← جديد
 };

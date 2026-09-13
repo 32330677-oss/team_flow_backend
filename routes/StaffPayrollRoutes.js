@@ -13,6 +13,7 @@ router.post('/generate', controller.generateStaffPayrollBatch);
 router.get('/report', controller.getStaffPayrollReport);
 router.get('/batch/:batchId', controller.getStaffPayrollBatchDetails);
 router.get('/batch/:batchId/export.xlsx', controller.exportStaffPayrollExcel); // ← جديد
+router.get('/batch/:batchId/export.pdf', controller.exportStaffPayrollPdf); // ← جديد
 
 router.patch('/batch/:batchId/mark-paid', controller.markStaffBatchAsPaid);
 const versioning = require('../controllers/staffPayrollVersioningController');
