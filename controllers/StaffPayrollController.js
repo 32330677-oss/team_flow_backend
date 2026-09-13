@@ -554,24 +554,24 @@ async function exportStaffPayrollPdf(req, res) {
         const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
 
         // ==================== Column layout ====================
-        const columns = [
-            { key: 'no', label: 'No.', width: 28 },
-            { key: 'staff_id', label: 'Staff ID', width: 60 },
-            { key: 'full_name', label: 'Full Name', width: 120 },
-            { key: 'position', label: 'Position', width: 90 },
-            { key: 'monthly_salary', label: 'Monthly Salary', width: 75 },
-            { key: 'present_days', label: 'Present Days', width: 60 },
-            { key: 'paid_leave_days', label: 'Paid Leave', width: 55 },
-            { key: 'mgmt_paid_days', label: 'Mgmt-Paid Absence', width: 65 },
-            { key: 'unpaid_absence_days', label: 'Unpaid Absence', width: 60 },
-            { key: 'required_hours', label: 'Required Hrs', width: 65 },
-            { key: 'ot_earned_hours', label: 'OT Earned', width: 55 },
-            { key: 'ot_used_hours', label: 'OT Used', width: 50 },
-            { key: 'shortage_hours', label: 'Shortage Hrs', width: 60 },
-            { key: 'deduction', label: 'Deduction', width: 60 },
-            { key: 'net_salary', label: 'Net Salary', width: 65 },
-        ];
-        const tableWidth = columns.reduce((s, c) => s + c.width, 0);
+ const columns = [
+    { key: 'no', label: 'No.', width: 28 },
+    { key: 'staff_id', label: 'Staff ID', width: 60 },
+    { key: 'full_name', label: 'Full Name', width: 120 },
+    { key: 'position', label: 'Position', width: 90 },
+    { key: 'monthly_salary', label: 'Monthly Salary', width: 75 },
+    { key: 'present_days', label: 'Present Days', width: 60 },
+    { key: 'paid_leave_days', label: 'Paid Leave', width: 55 },
+    { key: 'mgmt_paid_days', label: 'Mgmt-Paid Absence', width: 65 },
+    { key: 'unpaid_absence_days', label: 'Unpaid Absence', width: 60 },
+    { key: 'required_hours', label: 'Required Hrs', width: 65 },
+    { key: 'ot_earned_hours', label: 'OT Earned', width: 55 },
+    { key: 'ot_used_hours', label: 'OT Used', width: 50 },
+    { key: 'shortage_hours', label: 'Shortage Hrs', width: 60 },
+    { key: 'deduction', label: 'Deduction', width: 60 },
+    { key: 'net_salary', label: 'Net Salary', width: 65 },
+];
+const tableWidth = columns.reduce((s, c) => s + c.width, 0);
         const startX = doc.page.margins.left + (pageWidth - tableWidth) / 2;
 
         function drawHeader() {
