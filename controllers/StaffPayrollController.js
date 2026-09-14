@@ -722,10 +722,17 @@ async function exportStaffPayrollPdf(req, res) {
         }
 
         // دالة التوقيعات الثلاثية داخل النطاق الصحيح
-        function drawSignaturesFooter() {
-            const footerY = doc.page.height - doc.page.margins.bottom - 45;
-            doc.font('Helvetica').fontSize(8);
+// تعديل دالة التواقيع لتبدأ مباشرة تحت الجدول بناءً على مؤشر الـ y الحالي
+        function drawSignaturesFooter(currentY) {
+            const footerY = currentY + 15; // مسافة بسيطة بعد الجدول
             
+            // تحقق إذا كانت التواقيع ستنزل خارج الصفحة، إذاً انقلها لصفحة جديدة
+            if (footerY + 50 > doc.page.height - doc.page.margins.bottom) {
+                doc.addPage();
+                return doc.page.margins.top + 20;
+            }
+
+            doc.font('Helvetica').fontSize(8);
             const sectionWidth = pageWidth / 3;
             const signaturesData = [
                 { title: 'Prepared by', name: batch.generated_by || '-' },
@@ -740,6 +747,8 @@ async function exportStaffPayrollPdf(req, res) {
                 doc.text('Signature: ___________________', startXPos, footerY + 24, { width: sectionWidth - 20 });
                 doc.text(`Date: ____ / ____ / ________`, startXPos, footerY + 36, { width: sectionWidth - 20 });
             });
+
+            return footerY + 50;
         }
 
         let y = drawHeader();
@@ -772,6 +781,7 @@ async function exportStaffPayrollPdf(req, res) {
         });
 
         // Grand total row
+// Grand total row
         if (y > bottomLimit) {
             doc.addPage();
             y = doc.page.margins.top;
@@ -791,7 +801,7 @@ async function exportStaffPayrollPdf(req, res) {
             y = doc.page.margins.top + 20;
         }
         
-        drawSignaturesFooter();
+       drawSignaturesFooter(y);
 
         doc.end();
     } catch (error) {
