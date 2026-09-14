@@ -537,6 +537,7 @@ async function exportStaffPayrollPdf(req, res) {
         const dateOnly = (v) => (v instanceof Date ? v.toISOString().slice(0, 10) : String(v || '').slice(0, 10));
         const num = (v) => Number(v || 0);
         const fmt = (v, digits = 2) => num(v).toFixed(digits);
+const money = (v) => `$${num(v).toFixed(2)}`;
 
         const isFinalized = batch.is_finalized === 1 || batch.is_finalized === true;
         const statusText = batch.status === 'Superseded' ? 'SUPERSEDED'
@@ -567,11 +568,11 @@ async function exportStaffPayrollPdf(req, res) {
         const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
 
         // ==================== Column layout ====================
- const columns = [
-    { key: 'no', label: 'No.', width: 22 },
-    { key: 'staff_id', label: 'Staff ID', width: 48 },
-    { key: 'full_name', label: 'Full Name', width: 95 },
-    { key: 'position', label: 'Position', width: 70 },
+const columns = [
+    { key: 'no', label: 'No.', width: 25 },
+    { key: 'staff_id', label: 'Staff ID', width: 52 },
+    { key: 'full_name', label: 'Full Name', width: 115 },
+    { key: 'position', label: 'Position', width: 82 },
     { key: 'monthly_salary', label: 'Monthly Salary', width: 62 },
     { key: 'present_days', label: 'Present Days', width: 48 },
     { key: 'paid_leave_days', label: 'Paid Leave', width: 45 },
@@ -581,8 +582,7 @@ async function exportStaffPayrollPdf(req, res) {
     { key: 'ot_earned_hours', label: 'OT Earned', width: 45 },
     { key: 'ot_used_hours', label: 'OT Used', width: 42 },
     { key: 'shortage_hours', label: 'Shortage Hrs', width: 48 },
-    { key: 'deduction', label: 'Deduction', width: 50 },
-    { key: 'net_salary', label: 'Net Salary', width: 55 },
+    { key: 'net_salary', label: 'Net Salary', width: 52 },
 ];
 const tableWidth = columns.reduce((s, c) => s + c.width, 0);
         const startX = doc.page.margins.left + (pageWidth - tableWidth) / 2;
@@ -636,8 +636,7 @@ const tableWidth = columns.reduce((s, c) => s + c.width, 0);
             const summaryText =
                 `Total Staff: ${rows.length}    |    ` +
                 `Total OT Earned: ${fmt(totalOtEarned)}h    |    ` +
-                `Total Deductions: ${fmt(totalDeduction)}    |    ` +
-                `TOTAL NET SALARY: ${fmt(totalNet)}`;
+                 `TOTAL NET SALARY: ${money(totalNet)}`;
             doc.text(summaryText, doc.page.margins.left + 10, cursorY + 6, { width: pageWidth - 20 });
             doc.fillColor('black');
             cursorY += 34;
@@ -658,23 +657,33 @@ const tableWidth = columns.reduce((s, c) => s + c.width, 0);
             return y + 20;
         }
 
-        function drawRow(y, values, opts = {}) {
-            const rowHeight = 18;
-            let x = startX;
-            if (opts.zebra) {
-                doc.rect(startX, y, tableWidth, rowHeight).fill('#f7f9fc');
-                doc.fillColor('black');
-            }
-            doc.font(opts.bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(7.5);
-            columns.forEach((col) => {
-                doc.rect(x, y, col.width, rowHeight).stroke('#dfe3e8');
-                doc.text(String(values[col.key] ?? ''), x + 3, y + 5, {
-                    width: col.width - 6, align: col.key === 'full_name' || col.key === 'position' ? 'left' : 'center',
-                });
-                x += col.width;
-            });
-            return y + rowHeight;
-        }
+function drawRow(y, values, opts = {}) {
+    const rowHeight = 22;
+    let x = startX;
+
+    if (opts.zebra) {
+        doc.rect(startX, y, tableWidth, rowHeight).fill('#f7f9fc');
+        doc.fillColor('black');
+    }
+
+    doc.font(opts.bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(7.2);
+
+    columns.forEach((col) => {
+        doc.rect(x, y, col.width, rowHeight).stroke('#dfe3e8');
+
+        doc.text(String(values[col.key] ?? ''), x + 3, y + 6, {
+            width: col.width - 6,
+            align: col.key === 'full_name' || col.key === 'position'
+                ? 'left'
+                : 'center',
+            lineBreak: false,
+        });
+
+        x += col.width;
+    });
+
+    return y + rowHeight;
+}
 
         let y = drawHeader();
         y = drawTableHeaderRow(y);
@@ -692,7 +701,7 @@ const tableWidth = columns.reduce((s, c) => s + c.width, 0);
                 staff_id: r.staff_unique_id,
                 full_name: r.full_name,
                 position: r.position || '-',
-                monthly_salary: fmt(r.monthly_salary_snapshot),
+                monthly_salary: money(r.monthly_salary_snapshot),
                 present_days: fmt(r.present_days, 1),
                 paid_leave_days: fmt(r.paid_leave_days, 1),
                 mgmt_paid_days: fmt(r.management_paid_days || 0, 1),
@@ -701,8 +710,7 @@ const tableWidth = columns.reduce((s, c) => s + c.width, 0);
                 ot_earned_hours: fmt(r.ot_earned_hours),
                 ot_used_hours: fmt(r.ot_used_hours),
                 shortage_hours: fmt(r.shortage_hours),
-                deduction: fmt(r.salary_deduction_amount),
-                net_salary: fmt(r.net_salary),
+                net_salary: money(r.net_salary),
             }, { zebra: index % 2 === 1 });
         });
 
@@ -716,8 +724,7 @@ const tableWidth = columns.reduce((s, c) => s + c.width, 0);
             no: '', staff_id: '', full_name: 'GRAND TOTAL', position: '',
             monthly_salary: '', present_days: '', paid_leave_days: '', mgmt_paid_days: '',
             unpaid_absence_days: '', required_hours: '', ot_earned_hours: fmt(totalOtEarned),
-            ot_used_hours: '', shortage_hours: '', deduction: fmt(totalDeduction),
-            net_salary: fmt(totalNet),
+            ot_used_hours: '', shortage_hours: '', net_salary: money(totalNet),
         }, { bold: true });
 
         // Signature footer
