@@ -188,9 +188,10 @@ for (const dateStr of calendarDates) {
             const shortageHours        = round2(workedDayShortfall + absenceShortfall);       // للعرض فقط
             const uncoveredShortageHours = round2(uncoveredWorked + absenceShortfall);
 
-            const hourlyRate      = money(Number(staff.monthly_salary) / requiredHours);
-            const salaryDeduction = money(uncoveredShortageHours * hourlyRate);
-            const netSalary        = money(Number(staff.monthly_salary) - salaryDeduction);
+const hourlyRateRaw   = Number(staff.monthly_salary) / requiredHours; // بدون تقريب وسطي
+const salaryDeduction = money(uncoveredShortageHours * hourlyRateRaw);
+const netSalary        = money(Number(staff.monthly_salary) - salaryDeduction);
+const hourlyRate       = money(hourlyRateRaw); // هاد بس للعرض/التخزين بالتقرير
 
             const [payrollResult] = await connection.execute(
                 `INSERT INTO staff_payroll
