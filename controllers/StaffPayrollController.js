@@ -20,31 +20,6 @@ function getPaidLeaveTypes(staff) {
     }
 }
 
-// ============================================================
-// NEW MONTHLY PRINCIPLE (replaces the old day-fraction/manual-OT-grant model)
-//
-//   required_hours       = non-Friday working days in period * standard_daily_hours
-//   actual_regular_raw    = sum(regular_hours) over Present days
-//                           + standard_daily_hours for every paid-leave day
-//                           + standard_daily_hours for every management-paid absence day
-//   actual_regular_hours  = MIN(actual_regular_raw, required_hours)   -- capped, rule 11
-//   overflow_as_ot        = MAX(0, actual_regular_raw - required_hours)
-//   ot_earned_hours       = sum(daily overtime_hours over Present days) + overflow_as_ot
-//   shortage_hours        = MAX(0, required_hours - actual_regular_hours)
-//   ot_used_hours         = MIN(shortage_hours, ot_earned_hours)
-//   ot_remaining_hours    = ot_earned_hours - ot_used_hours
-//   uncovered_shortage    = shortage_hours - ot_used_hours
-//   hourly_rate           = monthly_salary / required_hours
-//   salary_deduction      = uncovered_shortage * hourly_rate
-//   net_salary            = monthly_salary - salary_deduction
-//
-// Friday: only counted via actual_regular_raw when explicitly confirmed
-// (is_friday_worked = 1) for that staff member on that day; required_hours
-// is NEVER increased by Friday, so Friday hours only ever help cover an
-// existing shortage or spill over into overtime — never inflate the basic
-// salary beyond what the required hours already buy (rule 11).
-// ============================================================
-
 async function generateStaffPayrollBatch(req, res) {
     const { start_date, end_date } = req.body || {};
     const userId = req.user?.user_id;
@@ -121,7 +96,130 @@ async function generateStaffPayrollBatch(req, res) {
             }
             if (effectiveStart > effectiveEnd) continue; // not employed at all during this period
 
-            const requiredHours = round2
+            const [records] = await connection.execute(
+                `SELECT staff_attendance_id, record_date, attendance_status, is_paid,
+                        is_management_paid_absence, regular_hours, overtime_hours, is_friday_worked
+                 FROM staff_attendance
+                 WHERE staff_id = ? AND record_date BETWEEN ? AND ? AND status = 'Approved'`,
+                [staff.staff_id, effectiveStart, effectiveEnd]
+            );
+
+            let requiredDays = 0;            // أيام إلها سجل فعلي (باستثناء الجمعة)
+            let actualRegularRaw = 0;        // ساعات محسوبة ضمن المطلوب (حضور فعلي + إجازات مدفوعة)
+            let workedDayShortfall = 0;      // نقص فقط بأيام حضر فيها الموظف فعليًا -> هاي وحدها تغطّى بالـ OT
+            let absenceShortfall = 0;        // نقص أيام غياب/إجازة غير مدفوعة كاملة -> ما بتتغطى بالـ OT أبدًا
+            let dailyOtEarned = 0;
+            let presentDaysCount = 0;
+            let paidLeaveDays = 0;
+            let managementPaidDays = 0;
+            let unpaidAbsenceDays = 0;
+
+            for (const record of records) {
+                const recordDateStr = String(record.record_date).slice(0, 10);
+                const recordIsFriday = isFriday(recordDateStr);
+
+                if (recordIsFriday) {
+                    // الجمعة ما بتدخل أبدًا على requiredDays / requiredHours.
+                    // إذا اتأكدت (is_friday_worked=1) بتنحسب أوفر تايم صافي كامل.
+                    if (record.attendance_status === 'Present' && Number(record.is_friday_worked) === 1) {
+                        dailyOtEarned += Number(record.regular_hours || 0) + Number(record.overtime_hours || 0);
+                        presentDaysCount += 1;
+                    }
+                    continue;
+                }
+
+                // أي سجل موجود (غير جمعة) = يوم مطلوب فعلاً من هالموظف
+                requiredDays += 1;
+
+                if (record.attendance_status === 'Present') {
+                    const regHours = Number(record.regular_hours || 0);
+                    workedDayShortfall += Math.max(0, standardDailyHours - regHours);
+                    actualRegularRaw += regHours;
+                    dailyOtEarned += Number(record.overtime_hours || 0);
+                    presentDaysCount += 1;
+                } else if (record.attendance_status === 'Absent') {
+                    if (Number(record.is_management_paid_absence) === 1) {
+                        actualRegularRaw += standardDailyHours;
+                        managementPaidDays += 1;
+                    } else {
+                        absenceShortfall += standardDailyHours;   // ← لا يُغطى من الـ OT
+                        unpaidAbsenceDays += 1;
+                    }
+                } else if (paidLeaveTypes.includes(record.attendance_status) && Number(record.is_paid) === 1) {
+                    actualRegularRaw += standardDailyHours;
+                    paidLeaveDays += 1;
+                } else {
+                    // إجازة من نوع غير مدرج بـ paid_leave_types، أو is_paid = 0
+                    absenceShortfall += standardDailyHours;        // ← لا يُغطى من الـ OT
+                    unpaidAbsenceDays += 1;
+                }
+            }
+
+            const requiredHours = round2(requiredDays * standardDailyHours);
+            if (requiredHours <= 0) continue; // ما في ولا سجل حضور لهالموظف بهالفترة -> تجاوزه بالكامل
+
+            const actualRegularHours   = round2(Math.min(actualRegularRaw, requiredHours));
+            const otEarnedHours        = round2(dailyOtEarned);
+            const otUsedHours          = round2(Math.min(otEarnedHours, workedDayShortfall)); // ← القيد الأساسي المطلوب
+            const otRemainingHours     = round2(otEarnedHours - otUsedHours);
+            const uncoveredWorked      = round2(Math.max(0, workedDayShortfall - otUsedHours));
+            const shortageHours        = round2(workedDayShortfall + absenceShortfall);       // للعرض فقط
+            const uncoveredShortageHours = round2(uncoveredWorked + absenceShortfall);
+
+            const hourlyRate      = money(Number(staff.monthly_salary) / requiredHours);
+            const salaryDeduction = money(uncoveredShortageHours * hourlyRate);
+            const netSalary        = money(Number(staff.monthly_salary) - salaryDeduction);
+
+            const [payrollResult] = await connection.execute(
+                `INSERT INTO staff_payroll
+                    (staff_payroll_batch_id, staff_id, monthly_salary_snapshot, working_days_in_period,
+                     present_days, paid_leave_days, management_paid_days, unpaid_absence_days,
+                     overtime_hours, daily_rate, net_salary,
+                     required_hours, ot_earned_hours, ot_used_hours, ot_remaining_hours,
+                     shortage_hours, salary_deduction_amount)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                    batchId, staff.staff_id, staff.monthly_salary, countNonFridayDays(effectiveStart, effectiveEnd),
+                    presentDaysCount, paidLeaveDays, managementPaidDays, unpaidAbsenceDays,
+                    otEarnedHours, hourlyRate, netSalary,
+                    requiredHours, otEarnedHours, otUsedHours, otRemainingHours,
+                    shortageHours, salaryDeduction,
+                ]
+            );
+            if (!payrollResult.insertId) continue;
+
+            // One ledger row per (staff, payroll_month). If a batch is
+            // regenerated for the same month, this overwrites the prior
+            // snapshot rather than duplicating (rule: monthly OT is not
+            // day-by-day, and must not double count across regenerations).
+            await connection.execute(
+                `INSERT INTO staff_monthly_overtime_ledger
+                    (staff_id, payroll_month, required_hours, actual_regular_hours,
+                     ot_earned_hours, ot_used_hours, ot_remaining_hours,
+                     shortage_hours, uncovered_shortage_hours,
+                     hourly_rate_snapshot, salary_deduction_amount, staff_payroll_batch_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE
+                    required_hours = VALUES(required_hours),
+                    actual_regular_hours = VALUES(actual_regular_hours),
+                    ot_earned_hours = VALUES(ot_earned_hours),
+                    ot_used_hours = VALUES(ot_used_hours),
+                    ot_remaining_hours = VALUES(ot_remaining_hours),
+                    shortage_hours = VALUES(shortage_hours),
+                    uncovered_shortage_hours = VALUES(uncovered_shortage_hours),
+                    hourly_rate_snapshot = VALUES(hourly_rate_snapshot),
+                    salary_deduction_amount = VALUES(salary_deduction_amount),
+                    staff_payroll_batch_id = VALUES(staff_payroll_batch_id)`,
+                [
+                    staff.staff_id, payrollMonth, requiredHours, actualRegularHours,
+                    otEarnedHours, otUsedHours, otRemainingHours,
+                    shortageHours, uncoveredShortageHours,
+                    hourlyRate, salaryDeduction, batchId,
+                ]
+            );
+
+            totalStaff += 1;
+            totalAmount = money(totalAmount + netSalary);
         }
 
         if (!totalStaff) {
