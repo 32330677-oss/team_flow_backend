@@ -494,7 +494,30 @@ sheet.columns = [
 }
 
 
+function drawSignaturesFooter() {
+    // تحديد ارتفاع وموقع قسم التوقيعات قبل الهامش السفلي بقليل
+    const footerY = doc.page.height - doc.page.margins.bottom - 45;
+    
+    doc.font('Helvetica').fontSize(8);
+    
+    // تقسيم عرض الصفحة الأفقية على 3 أقسام متساوية للتوقيعات الثلاثة
+    const sectionWidth = pageWidth / 3;
+    
+    const signaturesData = [
+        { title: 'Prepared by', name: batch.generated_by || '-' },
+        { title: 'Verified by', name: '-' }, // يمكنك استبدالها ببيانات من الـ batch إذا توفرت
+        { title: 'Approved by', name: batch.finalized_by || '-' }
+    ];
 
+    signaturesData.forEach((sig, index) => {
+        const startXPos = doc.page.margins.left + (index * sectionWidth);
+        
+        doc.font('Helvetica-Bold').text(`${sig.title}:`, startXPos, footerY, { width: sectionWidth - 20 });
+        doc.font('Helvetica').text(`Name: ${sig.name}`, startXPos, footerY + 12, { width: sectionWidth - 20 });
+        doc.text('Signature: ___________________', startXPos, footerY + 24, { width: sectionWidth - 20 });
+        doc.text(`Date: ____ / ____ / ________`, startXPos, footerY + 36, { width: sectionWidth - 20 });
+    });
+}
 
 // ============================================================
 // GET /api/staff-payroll/batch/:batchId/export.pdf
@@ -574,14 +597,14 @@ const columns = [
     { key: 'full_name', label: 'Full Name', width: 115 },
     { key: 'position', label: 'Position', width: 82 },
     { key: 'monthly_salary', label: 'Monthly Salary', width: 62 },
-    { key: 'present_days', label: 'Present Days', width: 48 },
+    { key: 'present_days', label: 'Present Days', width: 53 },
     { key: 'paid_leave_days', label: 'Paid Leave', width: 45 },
-    { key: 'mgmt_paid_days', label: 'Mgmt-Paid Absence', width: 52 },
-    { key: 'unpaid_absence_days', label: 'Unpaid Absence', width: 50 },
-    { key: 'required_hours', label: 'Required Hrs', width: 52 },
+    { key: 'mgmt_paid_days', label: 'Mgmt-Paid Absence', width: 58 },
+    { key: 'unpaid_absence_days', label: 'Unpaid Absence', width: 55 },
+    { key: 'required_hours', label: 'Required Hrs', width: 55 },
     { key: 'ot_earned_hours', label: 'OT Earned', width: 45 },
     { key: 'ot_used_hours', label: 'OT Used', width: 42 },
-    { key: 'shortage_hours', label: 'Shortage Hrs', width: 48 },
+    { key: 'shortage_hours', label: 'Shortage Hrs', width: 53 },
     { key: 'net_salary', label: 'Net Salary', width: 52 },
 ];
 const tableWidth = columns.reduce((s, c) => s + c.width, 0);
@@ -644,21 +667,10 @@ const tableWidth = columns.reduce((s, c) => s + c.width, 0);
             return cursorY;
         }
 
-        function drawTableHeaderRow(y) {
-            let x = startX;
-            doc.font('Helvetica-Bold').fontSize(7.5);
-            doc.rect(startX, y, tableWidth, 20).fill('#1a2a6c');
-            doc.fillColor('#ffffff');
-            columns.forEach((col) => {
-                doc.text(col.label, x + 3, y + 6, { width: col.width - 6, align: 'center' });
-                x += col.width;
-            });
-            doc.fillColor('black');
-            return y + 20;
-        }
+     drawTableHeaderRow
 
 function drawRow(y, values, opts = {}) {
-    const rowHeight = 22;
+    const rowHeight = 24;
     let x = startX;
 
     if (opts.zebra) {
@@ -688,7 +700,8 @@ function drawRow(y, values, opts = {}) {
         let y = drawHeader();
         y = drawTableHeaderRow(y);
 
-        const bottomLimit = doc.page.height - doc.page.margins.bottom - 60;
+        // اجعل حد نهاية الصفحة أعلى قليلاً ليترك مساحة لتوقيعات الثلاثة في الأسفل
+const bottomLimit = doc.page.height - doc.page.margins.bottom - 75;
 
         rows.forEach((r, index) => {
             if (y > bottomLimit) {
@@ -737,7 +750,7 @@ function drawRow(y, values, opts = {}) {
         doc.text('Prepared by: ____________________', doc.page.margins.left, y);
         doc.text('Approved by (Management): ____________________', doc.page.margins.left + pageWidth / 2, y);
         doc.text(`Generated on: ${new Date().toISOString().slice(0, 19).replace('T', ' ')}`, doc.page.margins.left, y + 24);
-
+drawSignaturesFooter();
         doc.end();
     } catch (error) {
         console.error('exportStaffPayrollPdf:', error);
