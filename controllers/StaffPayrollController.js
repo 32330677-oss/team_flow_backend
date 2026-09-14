@@ -525,6 +525,12 @@ function drawSignaturesFooter() {
 // (Finalized/Paid), full per-staff breakdown, and grand totals.
 // Meant to be handed directly to management.
 // ============================================================
+// ============================================================
+// GET /api/staff-payroll/batch/:batchId/export.pdf
+// Formal one-document PDF report: company logo, period, status
+// (Finalized/Paid), full per-staff breakdown, and grand totals.
+// Meant to be handed directly to management.
+// ============================================================
 async function exportStaffPayrollPdf(req, res) {
     const batchId = Number(req.params.batchId);
     if (!Number.isInteger(batchId) || batchId <= 0) {
@@ -560,7 +566,7 @@ async function exportStaffPayrollPdf(req, res) {
         const dateOnly = (v) => (v instanceof Date ? v.toISOString().slice(0, 10) : String(v || '').slice(0, 10));
         const num = (v) => Number(v || 0);
         const fmt = (v, digits = 2) => num(v).toFixed(digits);
-const money = (v) => `$${num(v).toFixed(2)}`;
+        const money = (v) => `$${num(v).toFixed(2)}`;
 
         const isFinalized = batch.is_finalized === 1 || batch.is_finalized === true;
         const statusText = batch.status === 'Superseded' ? 'SUPERSEDED'
@@ -591,23 +597,23 @@ const money = (v) => `$${num(v).toFixed(2)}`;
         const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
 
         // ==================== Column layout ====================
-const columns = [
-    { key: 'no', label: 'No.', width: 25 },
-    { key: 'staff_id', label: 'Staff ID', width: 52 },
-    { key: 'full_name', label: 'Full Name', width: 115 },
-    { key: 'position', label: 'Position', width: 82 },
-    { key: 'monthly_salary', label: 'Monthly Salary', width: 62 },
-    { key: 'present_days', label: 'Present Days', width: 53 },
-    { key: 'paid_leave_days', label: 'Paid Leave', width: 45 },
-    { key: 'mgmt_paid_days', label: 'Mgmt-Paid Absence', width: 58 },
-    { key: 'unpaid_absence_days', label: 'Unpaid Absence', width: 55 },
-    { key: 'required_hours', label: 'Required Hrs', width: 55 },
-    { key: 'ot_earned_hours', label: 'OT Earned', width: 45 },
-    { key: 'ot_used_hours', label: 'OT Used', width: 42 },
-    { key: 'shortage_hours', label: 'Shortage Hrs', width: 53 },
-    { key: 'net_salary', label: 'Net Salary', width: 52 },
-];
-const tableWidth = columns.reduce((s, c) => s + c.width, 0);
+        const columns = [
+            { key: 'no', label: 'No.', width: 25 },
+            { key: 'staff_id', label: 'Staff ID', width: 52 },
+            { key: 'full_name', label: 'Full Name', width: 115 },
+            { key: 'position', label: 'Position', width: 82 },
+            { key: 'monthly_salary', label: 'Monthly Salary', width: 62 },
+            { key: 'present_days', label: 'Present Days', width: 53 },
+            { key: 'paid_leave_days', label: 'Paid Leave', width: 45 },
+            { key: 'mgmt_paid_days', label: 'Mgmt-Paid Absence', width: 58 },
+            { key: 'unpaid_absence_days', label: 'Unpaid Absence', width: 55 },
+            { key: 'required_hours', label: 'Required Hrs', width: 55 },
+            { key: 'ot_earned_hours', label: 'OT Earned', width: 45 },
+            { key: 'ot_used_hours', label: 'OT Used', width: 42 },
+            { key: 'shortage_hours', label: 'Shortage Hrs', width: 53 },
+            { key: 'net_salary', label: 'Net Salary', width: 52 },
+        ];
+        const tableWidth = columns.reduce((s, c) => s + c.width, 0);
         const startX = doc.page.margins.left + (pageWidth - tableWidth) / 2;
 
         function drawHeader() {
@@ -659,7 +665,7 @@ const tableWidth = columns.reduce((s, c) => s + c.width, 0);
             const summaryText =
                 `Total Staff: ${rows.length}    |    ` +
                 `Total OT Earned: ${fmt(totalOtEarned)}h    |    ` +
-                 `TOTAL NET SALARY: ${money(totalNet)}`;
+                `TOTAL NET SALARY: ${money(totalNet)}`;
             doc.text(summaryText, doc.page.margins.left + 10, cursorY + 6, { width: pageWidth - 20 });
             doc.fillColor('black');
             cursorY += 34;
@@ -667,41 +673,79 @@ const tableWidth = columns.reduce((s, c) => s + c.width, 0);
             return cursorY;
         }
 
-     drawTableHeaderRow
+        function drawTableHeaderRow(y) {
+            const rowHeight = 24;
+            let x = startX;
+            doc.rect(startX, y, tableWidth, rowHeight).fill('#1a2a6c');
+            doc.fillColor('white').font('Helvetica-Bold').fontSize(7.2);
 
-function drawRow(y, values, opts = {}) {
-    const rowHeight = 24;
-    let x = startX;
+            columns.forEach((col) => {
+                doc.rect(x, y, col.width, rowHeight).stroke('#1a2a6c');
+                doc.text(col.label, x + 2, y + 6, {
+                    width: col.width - 4,
+                    align: 'center',
+                    lineBreak: false,
+                });
+                x += col.width;
+            });
 
-    if (opts.zebra) {
-        doc.rect(startX, y, tableWidth, rowHeight).fill('#f7f9fc');
-        doc.fillColor('black');
-    }
+            doc.fillColor('black');
+            return y + rowHeight;
+        }
 
-    doc.font(opts.bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(7.2);
+        function drawRow(y, values, opts = {}) {
+            const rowHeight = 24;
+            let x = startX;
 
-    columns.forEach((col) => {
-        doc.rect(x, y, col.width, rowHeight).stroke('#dfe3e8');
+            if (opts.zebra) {
+                doc.rect(startX, y, tableWidth, rowHeight).fill('#f7f9fc');
+                doc.fillColor('black');
+            }
 
-        doc.text(String(values[col.key] ?? ''), x + 3, y + 6, {
-            width: col.width - 6,
-            align: col.key === 'full_name' || col.key === 'position'
-                ? 'left'
-                : 'center',
-            lineBreak: false,
-        });
+            doc.font(opts.bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(7.2);
 
-        x += col.width;
-    });
+            columns.forEach((col) => {
+                doc.rect(x, y, col.width, rowHeight).stroke('#dfe3e8');
 
-    return y + rowHeight;
-}
+                doc.text(String(values[col.key] ?? ''), x + 3, y + 6, {
+                    width: col.width - 6,
+                    align: col.key === 'full_name' || col.key === 'position'
+                        ? 'left'
+                        : 'center',
+                    lineBreak: false,
+                });
+
+                x += col.width;
+            });
+
+            return y + rowHeight;
+        }
+
+        // دالة التوقيعات الثلاثية داخل النطاق الصحيح
+        function drawSignaturesFooter() {
+            const footerY = doc.page.height - doc.page.margins.bottom - 45;
+            doc.font('Helvetica').fontSize(8);
+            
+            const sectionWidth = pageWidth / 3;
+            const signaturesData = [
+                { title: 'Prepared by', name: batch.generated_by || '-' },
+                { title: 'Verified by', name: '-' },
+                { title: 'Approved by', name: batch.finalized_by || '-' }
+            ];
+
+            signaturesData.forEach((sig, index) => {
+                const startXPos = doc.page.margins.left + (index * sectionWidth);
+                doc.font('Helvetica-Bold').text(`${sig.title}:`, startXPos, footerY, { width: sectionWidth - 20 });
+                doc.font('Helvetica').text(`Name: ${sig.name}`, startXPos, footerY + 12, { width: sectionWidth - 20 });
+                doc.text('Signature: ___________________', startXPos, footerY + 24, { width: sectionWidth - 20 });
+                doc.text(`Date: ____ / ____ / ________`, startXPos, footerY + 36, { width: sectionWidth - 20 });
+            });
+        }
 
         let y = drawHeader();
         y = drawTableHeaderRow(y);
 
-        // اجعل حد نهاية الصفحة أعلى قليلاً ليترك مساحة لتوقيعات الثلاثة في الأسفل
-const bottomLimit = doc.page.height - doc.page.margins.bottom - 75;
+        const bottomLimit = doc.page.height - doc.page.margins.bottom - 75;
 
         rows.forEach((r, index) => {
             if (y > bottomLimit) {
@@ -740,17 +784,15 @@ const bottomLimit = doc.page.height - doc.page.margins.bottom - 75;
             ot_used_hours: '', shortage_hours: '', net_salary: money(totalNet),
         }, { bold: true });
 
-        // Signature footer
+        // Signature footer section
         y += 40;
         if (y > doc.page.height - doc.page.margins.bottom - 20) {
             doc.addPage();
             y = doc.page.margins.top + 20;
         }
-        doc.font('Helvetica').fontSize(9);
-        doc.text('Prepared by: ____________________', doc.page.margins.left, y);
-        doc.text('Approved by (Management): ____________________', doc.page.margins.left + pageWidth / 2, y);
-        doc.text(`Generated on: ${new Date().toISOString().slice(0, 19).replace('T', ' ')}`, doc.page.margins.left, y + 24);
-drawSignaturesFooter();
+        
+        drawSignaturesFooter();
+
         doc.end();
     } catch (error) {
         console.error('exportStaffPayrollPdf:', error);
