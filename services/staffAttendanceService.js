@@ -30,7 +30,25 @@ function countNonFridayDays(startDateStr, endDateStr) {
     }
     return count;
 }
-
+// يرجع array من التواريخ (YYYY-MM-DD) لكل الأيام ما عدا الجمعة بين تاريخين، شاملين الطرفين.
+// هاي هي الأساس الجديد لحساب "الأيام المطلوبة" بدل الاعتماد على عدد السجلات بالجدول.
+function listNonFridayDates(startDateStr, endDateStr) {
+    const start = new Date(`${startDateStr}T00:00:00Z`);
+    const end = new Date(`${endDateStr}T00:00:00Z`);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end < start) return [];
+    const dates = [];
+    const cursor = new Date(start.getTime());
+    while (cursor <= end) {
+        if (cursor.getUTCDay() !== 5) {
+            const y = cursor.getUTCFullYear();
+            const m = String(cursor.getUTCMonth() + 1).padStart(2, '0');
+            const d = String(cursor.getUTCDate()).padStart(2, '0');
+            dates.push(`${y}-${m}-${d}`);
+        }
+        cursor.setUTCDate(cursor.getUTCDate() + 1);
+    }
+    return dates;
+}
 function parseWallClockDateTime(value) {
     if (!value) return null;
     const match = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/.exec(String(value));
@@ -98,6 +116,7 @@ module.exports = {
     isFriday,
     round2,
     countNonFridayDays,
+    listNonFridayDates,   // ← جديد
     parseWallClockDateTime,
     computeLunchDeductionHours,
     calculateStaffShiftHours,

@@ -1,5 +1,5 @@
 const pool = require('../config/db');
-const { countNonFridayDays, isFriday, round2 } = require('../services/staffAttendanceService');
+const { countNonFridayDays, listNonFridayDates, isFriday, round2 } = require('../services/staffAttendanceService');
 
 function isValidDate(value) {
     return /^\d{4}-\d{2}-\d{2}$/.test(String(value || '')) && !Number.isNaN(Date.parse(`${value}T00:00:00`));
@@ -83,80 +83,102 @@ async function generateStaffPayrollBatch(req, res) {
             const paidLeaveTypes = getPaidLeaveTypes(staff);
             const standardDailyHours = Number(staff.standard_daily_hours) > 0 ? Number(staff.standard_daily_hours) : 8;
 
-            // Clamp to this staff member's actual employment window.
-            let effectiveStart = start_date;
-            let effectiveEnd = end_date;
-            if (staff.hire_date) {
-                const hireStr = String(staff.hire_date).slice(0, 10);
-                if (hireStr > effectiveStart) effectiveStart = hireStr;
-            }
-            if (staff.termination_date) {
-                const termStr = String(staff.termination_date).slice(0, 10);
-                if (termStr < effectiveEnd) effectiveEnd = termStr;
-            }
-            if (effectiveStart > effectiveEnd) continue; // not employed at all during this period
+// Clamp to this staff member's actual employment window, and never
+// beyond "today" — future days have no attendance yet and must never
+// be treated as unpaid absences.
+const todayStr = new Date().toISOString().slice(0, 10);
+let effectiveStart = start_date;
+let effectiveEnd = end_date;
+if (staff.hire_date) {
+    const hireStr = String(staff.hire_date).slice(0, 10);
+    if (hireStr > effectiveStart) effectiveStart = hireStr;
+}
+if (staff.termination_date) {
+    const termStr = String(staff.termination_date).slice(0, 10);
+    if (termStr < effectiveEnd) effectiveEnd = termStr;
+}
+if (effectiveEnd > todayStr) effectiveEnd = todayStr;
+if (effectiveStart > effectiveEnd) continue; // not employed, or period entirely in the future
 
-            const [records] = await connection.execute(
-                `SELECT staff_attendance_id, record_date, attendance_status, is_paid,
-                        is_management_paid_absence, regular_hours, overtime_hours, is_friday_worked
-                 FROM staff_attendance
-                 WHERE staff_id = ? AND record_date BETWEEN ? AND ? AND status = 'Approved'`,
-                [staff.staff_id, effectiveStart, effectiveEnd]
-            );
+// ============================================================
+// requiredDays/requiredHours الآن ثابتة ومبنية من التقويم الفعلي
+// (كل يوم غير جمعة بين effectiveStart و effectiveEnd)، وليس من عدد
+// سجلات الحضور الموجودة أو المعتمدة. أي يوم عمل بالتقويم بدون سجل
+// معتمد (Approved) يُعامل تلقائيًا "غياب غير مدفوع" بالأسفل، ولا يُغطى
+// من رصيد الأوفر تايم أبدًا.
+// ============================================================
+const calendarDates = listNonFridayDates(effectiveStart, effectiveEnd);
+const requiredDays = calendarDates.length;
+const requiredHours = round2(requiredDays * standardDailyHours);
+if (requiredHours <= 0) continue; // لا يوجد أي يوم عمل بهالفترة لهالموظف
 
-            let requiredDays = 0;            // أيام إلها سجل فعلي (باستثناء الجمعة)
-            let actualRegularRaw = 0;        // ساعات محسوبة ضمن المطلوب (حضور فعلي + إجازات مدفوعة)
-            let workedDayShortfall = 0;      // نقص فقط بأيام حضر فيها الموظف فعليًا -> هاي وحدها تغطّى بالـ OT
-            let absenceShortfall = 0;        // نقص أيام غياب/إجازة غير مدفوعة كاملة -> ما بتتغطى بالـ OT أبدًا
-            let dailyOtEarned = 0;
-            let presentDaysCount = 0;
-            let paidLeaveDays = 0;
-            let managementPaidDays = 0;
-            let unpaidAbsenceDays = 0;
+const [records] = await connection.execute(
+    `SELECT staff_attendance_id, record_date, attendance_status, is_paid,
+            is_management_paid_absence, regular_hours, overtime_hours, is_friday_worked
+     FROM staff_attendance
+     WHERE staff_id = ? AND record_date BETWEEN ? AND ? AND status = 'Approved'`,
+    [staff.staff_id, effectiveStart, effectiveEnd]
+);
 
-            for (const record of records) {
-                const recordDateStr = String(record.record_date).slice(0, 10);
-                const recordIsFriday = isFriday(recordDateStr);
+const recordsByDate = new Map();
+for (const record of records) {
+    recordsByDate.set(String(record.record_date).slice(0, 10), record);
+}
 
-                if (recordIsFriday) {
-                    // الجمعة ما بتدخل أبدًا على requiredDays / requiredHours.
-                    // إذا اتأكدت (is_friday_worked=1) بتنحسب أوفر تايم صافي كامل.
-                    if (record.attendance_status === 'Present' && Number(record.is_friday_worked) === 1) {
-                        dailyOtEarned += Number(record.regular_hours || 0) + Number(record.overtime_hours || 0);
-                        presentDaysCount += 1;
-                    }
-                    continue;
-                }
+let actualRegularRaw = 0;        // ساعات محسوبة ضمن المطلوب (حضور فعلي + إجازات مدفوعة)
+let workedDayShortfall = 0;      // نقص فقط بأيام حضر فيها الموظف فعليًا -> هاي وحدها تغطّى بالـ OT
+let absenceShortfall = 0;        // نقص أيام غياب/بدون سجل/إجازة غير مدفوعة -> ما بتتغطى بالـ OT أبدًا
+let dailyOtEarned = 0;
+let presentDaysCount = 0;
+let paidLeaveDays = 0;
+let managementPaidDays = 0;
+let unpaidAbsenceDays = 0;
 
-                // أي سجل موجود (غير جمعة) = يوم مطلوب فعلاً من هالموظف
-                requiredDays += 1;
+// الجمعة: خارج requiredDays/requiredHours تمامًا. تُحسب أوفر تايم كامل
+// فقط إذا فيها سجل Present معتمد مع is_friday_worked = 1.
+for (const record of records) {
+    const recordDateStr = String(record.record_date).slice(0, 10);
+    if (isFriday(recordDateStr) && record.attendance_status === 'Present' && Number(record.is_friday_worked) === 1) {
+        dailyOtEarned += Number(record.regular_hours || 0) + Number(record.overtime_hours || 0);
+        presentDaysCount += 1;
+    }
+}
 
-                if (record.attendance_status === 'Present') {
-                    const regHours = Number(record.regular_hours || 0);
-                    workedDayShortfall += Math.max(0, standardDailyHours - regHours);
-                    actualRegularRaw += regHours;
-                    dailyOtEarned += Number(record.overtime_hours || 0);
-                    presentDaysCount += 1;
-                } else if (record.attendance_status === 'Absent') {
-                    if (Number(record.is_management_paid_absence) === 1) {
-                        actualRegularRaw += standardDailyHours;
-                        managementPaidDays += 1;
-                    } else {
-                        absenceShortfall += standardDailyHours;   // ← لا يُغطى من الـ OT
-                        unpaidAbsenceDays += 1;
-                    }
-                } else if (paidLeaveTypes.includes(record.attendance_status) && Number(record.is_paid) === 1) {
-                    actualRegularRaw += standardDailyHours;
-                    paidLeaveDays += 1;
-                } else {
-                    // إجازة من نوع غير مدرج بـ paid_leave_types، أو is_paid = 0
-                    absenceShortfall += standardDailyHours;        // ← لا يُغطى من الـ OT
-                    unpaidAbsenceDays += 1;
-                }
-            }
+for (const dateStr of calendarDates) {
+    const record = recordsByDate.get(dateStr);
 
-            const requiredHours = round2(requiredDays * standardDailyHours);
-            if (requiredHours <= 0) continue; // ما في ولا سجل حضور لهالموظف بهالفترة -> تجاوزه بالكامل
+    if (!record) {
+        // ما في ولا سجل معتمد لهالتاريخ (سواء ما انسجل أصلاً، أو لسا
+        // Submitted/Rejected ومش Approved بعد) -> غياب غير مدفوع تلقائيًا.
+        // لا يُغطى من الأوفر تايم إطلاقًا.
+        absenceShortfall += standardDailyHours;
+        unpaidAbsenceDays += 1;
+        continue;
+    }
+
+    if (record.attendance_status === 'Present') {
+        const regHours = Number(record.regular_hours || 0);
+        workedDayShortfall += Math.max(0, standardDailyHours - regHours);
+        actualRegularRaw += regHours;
+        dailyOtEarned += Number(record.overtime_hours || 0);
+        presentDaysCount += 1;
+    } else if (record.attendance_status === 'Absent') {
+        if (Number(record.is_management_paid_absence) === 1) {
+            actualRegularRaw += standardDailyHours;
+            managementPaidDays += 1;
+        } else {
+            absenceShortfall += standardDailyHours;   // ← لا يُغطى من الـ OT
+            unpaidAbsenceDays += 1;
+        }
+    } else if (paidLeaveTypes.includes(record.attendance_status) && Number(record.is_paid) === 1) {
+        actualRegularRaw += standardDailyHours;
+        paidLeaveDays += 1;
+    } else {
+        // إجازة من نوع غير مدرج بـ paid_leave_types، أو is_paid = 0
+        absenceShortfall += standardDailyHours;        // ← لا يُغطى من الـ OT
+        unpaidAbsenceDays += 1;
+    }
+}
 
             const actualRegularHours   = round2(Math.min(actualRegularRaw, requiredHours));
             const otEarnedHours        = round2(dailyOtEarned);
