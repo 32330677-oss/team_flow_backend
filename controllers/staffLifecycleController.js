@@ -63,16 +63,31 @@ exports.changeStatus = async (req, res) => {
       await connection.rollback();
       return res.status(400).json({ status: 'error', message: `Staff member is already ${new_status}.` });
     }
-    if (current.status === 'Terminated') {
+
+    // Terminated is not a dead end anymore: the ONLY allowed transition out
+    // of Terminated is a reactivation back to Active.
+    // Terminated -> Inactive and Terminated -> Terminated stay blocked.
+    if (current.status === 'Terminated' && new_status !== 'Active') {
       await connection.rollback();
-      return res.status(400).json({ status: 'error', message: 'A terminated staff member cannot change status. Create a new record instead.' });
+      return res.status(400).json({
+        status: 'error',
+        message: 'A terminated staff member can only be reactivated to Active status.'
+      });
     }
+
+    const isReactivation = current.status === 'Terminated' && new_status === 'Active';
 
     await connection.execute(
       `UPDATE staff_members
        SET status = ?, termination_date = ?
        WHERE staff_id = ?`,
-      [new_status, new_status === 'Terminated' ? effective_date : null, staffId]
+      [
+        new_status,
+        // Only a fresh Termination carries a termination_date.
+        // Reactivation clears it (this is no longer "currently terminated").
+        new_status === 'Terminated' ? effective_date : null,
+        staffId
+      ]
     );
 
     await connection.execute(
@@ -82,7 +97,9 @@ exports.changeStatus = async (req, res) => {
       [staffId, current.status, new_status, effective_date, reason.trim(), adminId]
     );
 
-    // Terminating staff automatically closes any open site assignment.
+    // Terminating staff automatically closes any open site AND supervisor
+    // assignment using the termination effective date. (Previously only the
+    // site assignment was closed — the supervisor assignment was missed.)
     if (new_status === 'Terminated') {
       await connection.execute(
         `UPDATE staff_site_assignments
@@ -90,16 +107,40 @@ exports.changeStatus = async (req, res) => {
          WHERE staff_id = ? AND unassigned_date IS NULL`,
         [effective_date, staffId]
       );
+
+      await connection.execute(
+        `UPDATE staff_supervisor_assignments
+         SET unassigned_date = ?
+         WHERE staff_id = ? AND unassigned_date IS NULL`,
+        [effective_date, staffId]
+      );
     }
+
+    // Reactivation (Terminated -> Active) deliberately does NOT reopen any
+    // old site or supervisor assignment. The employee stays unassigned
+    // until an Admin explicitly assigns them again via the existing
+    // staffAssignmentController / staffSupervisorAssignmentController
+    // endpoints, which already refuse to assign a Terminated staff member
+    // and will now happily accept them once they're Active again.
 
     await connection.execute(
       `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
        VALUES ('staff_members', ?, 'STATUS_CHANGED', ?, ?, ?)`,
-      [staffId, adminId, JSON.stringify({ status: current.status }), JSON.stringify({ status: new_status, effective_date, reason })]
+      [
+        staffId,
+        adminId,
+        JSON.stringify({ status: current.status }),
+        JSON.stringify({ status: new_status, effective_date, reason, reactivation: isReactivation })
+      ]
     );
 
     await connection.commit();
-    return res.status(200).json({ status: 'success', message: `Staff status updated to ${new_status}.` });
+    return res.status(200).json({
+      status: 'success',
+      message: isReactivation
+        ? 'Staff member reactivated to Active successfully.'
+        : `Staff status updated to ${new_status}.`
+    });
   } catch (error) {
     await connection.rollback();
     console.error('CHANGE STAFF LIFECYCLE STATUS ERROR:', error);
