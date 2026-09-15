@@ -10,33 +10,60 @@ async function getOverview(req, res) {
     let { start_date, end_date } = req.query;
     if (!isValidDate(end_date)) end_date = today;
     if (!isValidDate(start_date)) {
+      // نافذة افتراضية 14 يوم لرسم الساعات اليومية
       const d = new Date(end_date);
-      d.setDate(d.getDate() - 29);
+      d.setDate(d.getDate() - 13);
       start_date = d.toISOString().slice(0, 10);
     }
 
-    // 1) عدد العمال الكلي + حالتهم اليوم
-    const [[totals]] = await pool.query(
-      `SELECT COUNT(*) AS total_workers,
-              SUM(CASE WHEN status='Active' THEN 1 ELSE 0 END) AS active_workers
-       FROM workers`
+    // 1) عدد العمال الحقيقي: فقط الي معينين فعلياً على موقع Active (مش كل العمال بالجدول)
+    const [[assignedTotals]] = await pool.query(
+      `SELECT COUNT(DISTINCT wsa.worker_id) AS total_assigned
+       FROM workersiteassignments wsa
+       JOIN workers w ON w.worker_id = wsa.worker_id
+       WHERE wsa.unassigned_date IS NULL AND w.status = 'Active'`
     );
+    const totalAssignedWorkers = Number(assignedTotals.total_assigned || 0);
 
+    // 2) لقطة اليوم: كم حاضر / بإجازة / غايب / شغال هلق (check-in بدون check-out)
     const [todayRows] = await pool.execute(
-      `SELECT attendance_status FROM attendance WHERE record_date = ?`,
+      `SELECT attendance_status, check_in_time, check_out_time FROM attendance WHERE record_date = ?`,
       [today]
     );
-    let presentToday = 0, onLeaveToday = 0, absentToday = 0;
+    let presentToday = 0, onLeaveToday = 0, absentToday = 0, currentlyWorkingNow = 0;
     for (const r of todayRows) {
-      if (r.attendance_status === 'Present') presentToday += 1;
-      else if (r.attendance_status === 'Absent') absentToday += 1;
-      else onLeaveToday += 1;
+      if (r.attendance_status === 'Present') {
+        presentToday += 1;
+        if (r.check_in_time && !r.check_out_time) currentlyWorkingNow += 1;
+      } else if (r.attendance_status === 'Absent') {
+        absentToday += 1;
+      } else {
+        onLeaveToday += 1;
+      }
     }
-    const totalWorkers = Number(totals.total_workers || 0);
-    const attendanceRate = totalWorkers > 0 ? Math.round((presentToday / totalWorkers) * 10000) / 100 : 0;
+    const attendanceRate = totalAssignedWorkers > 0
+      ? Math.round((presentToday / totalAssignedWorkers) * 10000) / 100
+      : 0;
 
-    // 2) سلسلة الحضور اليومية ضمن المدى المحدد
-    const [seriesRows] = await pool.query(
+    // 3) حالة كل موقع اليوم: كم شغال هلق، وهل انعمل Submit لليوم أو لا
+    const [siteRows] = await pool.query(
+      `SELECT s.site_id, s.site_name,
+              COUNT(DISTINCT wsa.worker_id) AS assigned_workers,
+              COUNT(DISTINCT CASE WHEN a.check_in_time IS NOT NULL AND a.check_out_time IS NULL THEN a.worker_id END) AS currently_working,
+              COUNT(DISTINCT CASE WHEN a.check_in_time IS NOT NULL THEN a.worker_id END) AS checked_in_today,
+              MAX(CASE WHEN a.status <> 'Draft' THEN 1 ELSE 0 END) AS is_submitted
+       FROM sites s
+       LEFT JOIN workersiteassignments wsa ON wsa.site_id = s.site_id AND wsa.unassigned_date IS NULL
+       LEFT JOIN attendance a ON a.site_id = s.site_id AND a.record_date = ?
+       WHERE s.site_status = 'Active'
+       GROUP BY s.site_id, s.site_name
+       HAVING assigned_workers > 0
+       ORDER BY currently_working DESC, s.site_name`,
+      [today]
+    );
+
+    // 4) اتجاه الحضور اليومي (Present / On Leave / Absent) ضمن المدى
+    const [attendanceSeriesRows] = await pool.query(
       `WITH RECURSIVE date_series AS (
          SELECT DATE(?) AS dt
          UNION ALL
@@ -51,32 +78,75 @@ async function getOverview(req, res) {
        GROUP BY ds.dt ORDER BY ds.dt`,
       [start_date, end_date]
     );
-    const attendanceOverview = seriesRows.map(r => ({
+    const attendanceOverview = attendanceSeriesRows.map(r => ({
       date: String(r.record_date).slice(0, 10),
       present: Number(r.present_count || 0),
       on_leave: Number(r.leave_count || 0),
       absent: Number(r.absent_count || 0),
     }));
 
-    // 3) ساعات العمل ضمن المدى (بيانات حقيقية من attendance)
-    const [[hoursRow]] = await pool.execute(
-      `SELECT
-         COALESCE(SUM(CASE WHEN attendance_status='Present' THEN total_working_hours ELSE 0 END),0) AS regular_hours,
-         COALESCE(SUM(CASE WHEN attendance_status='Present' THEN overtime_hours ELSE 0 END),0) AS overtime_hours,
-         COALESCE(SUM(CASE WHEN attendance_status IN ('Sick','Vacation','Holiday') THEN 1 ELSE 0 END),0) AS paid_leave_days,
-         COALESCE(SUM(CASE WHEN attendance_status='Absent' THEN 1 ELSE 0 END),0) AS absent_days
-       FROM attendance WHERE record_date BETWEEN ? AND ?`,
+    // 5) الساعات العادية مقابل الإضافية يوم عن يوم (هاد يلي بيبني الرسم المتراكم)
+    const [dailyHoursRows] = await pool.query(
+      `WITH RECURSIVE date_series AS (
+         SELECT DATE(?) AS dt
+         UNION ALL
+         SELECT DATE_ADD(dt, INTERVAL 1 DAY) FROM date_series WHERE dt < DATE(?)
+       )
+       SELECT ds.dt AS record_date,
+              COALESCE(SUM(CASE WHEN a.attendance_status='Present' THEN a.total_working_hours ELSE 0 END), 0) AS regular_hours,
+              COALESCE(SUM(CASE WHEN a.attendance_status='Present' THEN a.overtime_hours ELSE 0 END), 0) AS overtime_hours
+       FROM date_series ds
+       LEFT JOIN attendance a ON a.record_date = ds.dt
+       GROUP BY ds.dt ORDER BY ds.dt`,
       [start_date, end_date]
     );
+    const dailyHoursSeries = dailyHoursRows.map(r => ({
+      date: String(r.record_date).slice(0, 10),
+      regular_hours: Number(r.regular_hours || 0),
+      overtime_hours: Number(r.overtime_hours || 0),
+    }));
 
-    // 4) توزيع العمال حسب الوظيفة (بيانات حقيقية من جدول workers)
+    // 6) آخر دفعة رواتب انعملها فعلياً Paid
+    const [lastPaidRows] = await pool.query(
+      `SELECT pb.payroll_batch_id, pb.start_date, pb.end_date, pb.total_amount, pb.total_workers,
+              MAX(p.paid_date) AS paid_date
+       FROM payrollbatches pb
+       JOIN payroll p ON p.payroll_batch_id = pb.payroll_batch_id
+       WHERE pb.status = 'Paid'
+       GROUP BY pb.payroll_batch_id, pb.start_date, pb.end_date, pb.total_amount, pb.total_workers
+       ORDER BY paid_date DESC
+       LIMIT 1`
+    );
+    const lastPaidPayroll = lastPaidRows.length ? {
+      batch_id: lastPaidRows[0].payroll_batch_id,
+      period: `${String(lastPaidRows[0].start_date).slice(0, 10)} - ${String(lastPaidRows[0].end_date).slice(0, 10)}`,
+      total_amount: Number(lastPaidRows[0].total_amount || 0),
+      total_workers: Number(lastPaidRows[0].total_workers || 0),
+      paid_date: lastPaidRows[0].paid_date ? String(lastPaidRows[0].paid_date).slice(0, 10) : null,
+    } : null;
+
+    // 7) آخر باتش انعمل (أي حالة، غير Superseded) — للإشارة إذا في شي معلق مش مدفوع
+    const [latestBatchRows] = await pool.query(
+      `SELECT payroll_batch_id, start_date, end_date, total_workers, status, generated_at, total_amount
+       FROM payrollbatches WHERE status <> 'Superseded'
+       ORDER BY generated_at DESC LIMIT 1`
+    );
+    const latestPayrollBatch = latestBatchRows.length ? {
+      batch_id: latestBatchRows[0].payroll_batch_id,
+      period: `${String(latestBatchRows[0].start_date).slice(0, 10)} - ${String(latestBatchRows[0].end_date).slice(0, 10)}`,
+      total_amount: Number(latestBatchRows[0].total_amount || 0),
+      total_workers: Number(latestBatchRows[0].total_workers || 0),
+      status: latestBatchRows[0].status,
+    } : null;
+
+    // 8) توزيع العمال حسب الوظيفة
     const [positionRows] = await pool.query(
       `SELECT COALESCE(NULLIF(TRIM(job_position),''),'Others') AS position, COUNT(*) AS cnt
        FROM workers WHERE status='Active' GROUP BY position ORDER BY cnt DESC`
     );
 
-    // 5) أكثر المواقع استيعابًا للعمال (تعيينات فعالة فقط)
-    const [siteRows] = await pool.query(
+    // 9) أكثر المواقع استيعاباً للعمال
+    const [topSiteRows] = await pool.query(
       `SELECT s.site_name, COUNT(*) AS worker_count
        FROM workersiteassignments wsa
        JOIN sites s ON s.site_id = wsa.site_id
@@ -86,93 +156,42 @@ async function getOverview(req, res) {
        LIMIT 6`
     );
 
-    // 6) آخر سجلات الحضور
-    const [recentRows] = await pool.query(
-      `SELECT a.record_date, w.full_name, w.job_position, a.check_in_time, a.check_out_time,
-              a.total_working_hours, a.attendance_status
-       FROM attendance a
-       JOIN workers w ON w.worker_id = a.worker_id
-       ORDER BY a.record_date DESC, a.attendance_id DESC
-       LIMIT 8`
+    // 10) عدد سجلات الحضور الي محتاجة مراجعة الأدمن (actionable)
+    const [[pendingRow]] = await pool.execute(
+      `SELECT COUNT(*) AS cnt FROM attendance WHERE status = 'Submitted'`
     );
-
-    // 7) آخر الأنشطة من سجل التدقيق (Audit Log)
-    const [activityRows] = await pool.query(
-      `SELECT al.action_type, al.table_name, al.timestamp, u.full_name AS user_name
-       FROM auditlogs al
-       LEFT JOIN users u ON u.user_id = al.user_id
-       ORDER BY al.timestamp DESC
-       LIMIT 6`
+    const [[rejectedRow]] = await pool.execute(
+      `SELECT COUNT(*) AS cnt FROM attendance WHERE status = 'Rejected'`
     );
-
-    // 8) ملخص آخر دفعة رواتب فعلية
-    const [payrollBatchRows] = await pool.query(
-      `SELECT payroll_batch_id, start_date, end_date, total_workers, status, generated_at
-       FROM payrollbatches WHERE status <> 'Superseded'
-       ORDER BY generated_at DESC LIMIT 1`
-    );
-    let payrollSummary = null;
-    if (payrollBatchRows.length) {
-      const batch = payrollBatchRows[0];
-      const [[payrollAgg]] = await pool.execute(
-        `SELECT COALESCE(SUM(net_salary),0) AS total_net,
-                COALESCE(SUM(deductions_amount),0) AS total_deductions
-         FROM payroll WHERE payroll_batch_id = ?`,
-        [batch.payroll_batch_id]
-      );
-      const [[otAgg]] = await pool.execute(
-        `SELECT COALESCE(SUM(pi.overtime_pay),0) AS total_ot
-         FROM payrollitems pi JOIN payroll p ON p.payroll_id = pi.payroll_id
-         WHERE p.payroll_batch_id = ?`,
-        [batch.payroll_batch_id]
-      );
-      payrollSummary = {
-        batch_id: batch.payroll_batch_id,
-        period: `${String(batch.start_date).slice(0, 10)} - ${String(batch.end_date).slice(0, 10)}`,
-        total_net_salary: Number(payrollAgg.total_net || 0),
-        total_deductions: Number(payrollAgg.total_deductions || 0),
-        total_overtime_paid: Number(otAgg.total_ot || 0),
-        total_employees: Number(batch.total_workers || 0),
-        status: batch.status,
-      };
-    }
 
     return res.json({
       status: 'success',
       data: {
         range: { start_date, end_date },
         kpis: {
-          total_workers: totalWorkers,
+          total_workers: totalAssignedWorkers,
+          currently_working_now: currentlyWorkingNow,
           present_today: presentToday,
           on_leave_today: onLeaveToday,
           absent_today: absentToday,
           attendance_rate: attendanceRate,
+          pending_reviews: Number(pendingRow.cnt || 0),
+          rejected_records: Number(rejectedRow.cnt || 0),
         },
+        live_sites: siteRows.map(r => ({
+          site_id: r.site_id,
+          site_name: r.site_name,
+          assigned_workers: Number(r.assigned_workers || 0),
+          currently_working: Number(r.currently_working || 0),
+          checked_in_today: Number(r.checked_in_today || 0),
+          is_submitted: Number(r.is_submitted || 0) === 1,
+        })),
         attendance_overview: attendanceOverview,
-        hours_overview: {
-          regular_hours: Number(hoursRow.regular_hours || 0),
-          overtime_hours: Number(hoursRow.overtime_hours || 0),
-          paid_leave_days: Number(hoursRow.paid_leave_days || 0),
-          absent_days: Number(hoursRow.absent_days || 0),
-        },
+        daily_hours_series: dailyHoursSeries,
+        last_paid_payroll: lastPaidPayroll,
+        latest_payroll_batch: latestPayrollBatch,
         workers_by_position: positionRows.map(r => ({ position: r.position, count: Number(r.cnt) })),
-        top_sites: siteRows.map(r => ({ site_name: r.site_name, worker_count: Number(r.worker_count) })),
-        recent_attendance: recentRows.map(r => ({
-          date: String(r.record_date).slice(0, 10),
-          full_name: r.full_name,
-          position: r.job_position,
-          check_in: r.check_in_time,
-          check_out: r.check_out_time,
-          total_hours: r.total_working_hours,
-          status: r.attendance_status,
-        })),
-        recent_activity: activityRows.map(r => ({
-          action_type: r.action_type,
-          table_name: r.table_name,
-          timestamp: r.timestamp,
-          user_name: r.user_name,
-        })),
-        payroll_summary: payrollSummary,
+        top_sites: topSiteRows.map(r => ({ site_name: r.site_name, worker_count: Number(r.worker_count) })),
       },
     });
   } catch (error) {
