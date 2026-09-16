@@ -68,14 +68,16 @@ exports.createStaff = async (req, res) => {
             }
         }
 
+         const effectiveHireDate = hire_date || null;
+
         const [staffResult] = await connection.query(
             `INSERT INTO staff_members
                 (staff_unique_id, full_name, phone_number, position, site_id,
-                 hire_date, monthly_salary, standard_daily_hours, paid_leave_types, status)
-             VALUES ('TEMP', ?, ?, ?, ?, ?, ?, ?, ?, 'Active')`,
+                 hire_date, first_hire_date, monthly_salary, standard_daily_hours, paid_leave_types, status)
+             VALUES ('TEMP', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active')`,
             [
                 full_name, phone_number || null, position || null, site_id || null,
-                hire_date || null, numericSalary, numericDailyHours, parsePaidLeaveTypes(paid_leave_types)
+                effectiveHireDate, effectiveHireDate, numericSalary, numericDailyHours, parsePaidLeaveTypes(paid_leave_types)
             ]
         );
 const newStaffId = staffResult.insertId;

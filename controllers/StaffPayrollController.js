@@ -1,6 +1,6 @@
 const pool = require('../config/db');
 const { countNonFridayDays, listNonFridayDates, isFriday, round2 } = require('../services/staffAttendanceService');
-
+const { getActiveSpansOverlapping } = require('../services/staffEmploymentService'); // ← جديد
 function isValidDate(value) {
     return /^\d{4}-\d{2}-\d{2}$/.test(String(value || '')) && !Number.isNaN(Date.parse(`${value}T00:00:00`));
 }
@@ -45,14 +45,17 @@ async function generateStaffPayrollBatch(req, res) {
             return res.status(409).json({ status: 'error', message: 'A payroll batch overlapping with this period already exists' });
         }
 
-        // Staff who were Active for at least part of this period, even if
-        // since Terminated (as long as termination happened on/after start).
+
+        // Terminated حالياً ممكن يكون كان فعلاً Active خلال جزء من
+        // [start_date, end_date] (مثال: توليد/إعادة توليد فترة قديمة
+        // بعد ما صار الموظف Inactive اليوم). الأهلية تُحسم لاحقاً لكل
+        // موظف من تاريخ توظيفه الحقيقي (getActiveSpansOverlapping).
         const [staffList] = await connection.execute(
             `SELECT staff_id, full_name, monthly_salary, paid_leave_types, standard_daily_hours,
-                    hire_date, termination_date, status
+                    hire_date, first_hire_date, termination_date, status
              FROM staff_members
-             WHERE status = 'Active' OR (status = 'Terminated' AND termination_date >= ?)`,
-            [start_date]
+             WHERE hire_date IS NOT NULL AND hire_date <= ?`,
+            [end_date]
         );
         if (!staffList.length) {
             await connection.rollback();
@@ -86,32 +89,23 @@ async function generateStaffPayrollBatch(req, res) {
 // Clamp to this staff member's actual employment window, and never
 // beyond "today" — future days have no attendance yet and must never
 // be treated as unpaid absences.
-const todayStr = new Date().toISOString().slice(0, 10);
-let effectiveStart = start_date;
-let effectiveEnd = end_date;
-if (staff.hire_date) {
-    const hireStr = String(staff.hire_date).slice(0, 10);
-    if (hireStr > effectiveStart) effectiveStart = hireStr;
-}
-if (staff.termination_date) {
-    const termStr = String(staff.termination_date).slice(0, 10);
-    if (termStr < effectiveEnd) effectiveEnd = termStr;
-}
-if (effectiveEnd > todayStr) effectiveEnd = todayStr;
-if (effectiveStart > effectiveEnd) continue; // not employed, or period entirely in the future
+// فترات التوظيف الفعلية المتقاطعة مع هذه الفترة تحديداً، مبنية من
+// staff_status_history — تدعم أكثر من فترة (تعيين -> إنهاء -> إعادة
+// تعيين) بدل الاعتماد على hire_date/termination_date كزوج وحيد.
+const employmentSpans = await getActiveSpansOverlapping(
+    staff.staff_id, start_date, end_date, connection
+);
+if (employmentSpans.length === 0) continue; // غير موظف إطلاقاً خلال هذه الفترة
 
-// ============================================================
-// requiredDays/requiredHours الآن ثابتة ومبنية من التقويم الفعلي
-// (كل يوم غير جمعة بين effectiveStart و effectiveEnd)، وليس من عدد
-// سجلات الحضور الموجودة أو المعتمدة. أي يوم عمل بالتقويم بدون سجل
-// معتمد (Approved) يُعامل تلقائيًا "غياب غير مدفوع" بالأسفل، ولا يُغطى
-// من رصيد الأوفر تايم أبدًا.
-// ============================================================
-const calendarDates = listNonFridayDates(effectiveStart, effectiveEnd);
+const effectiveStart = employmentSpans[0].start;
+const effectiveEnd = employmentSpans[employmentSpans.length - 1].end;
+
+const calendarDates = employmentSpans
+    .flatMap((span) => listNonFridayDates(span.start, span.end))
+    .sort();
 const requiredDays = calendarDates.length;
 const requiredHours = round2(requiredDays * standardDailyHours);
 if (requiredHours <= 0) continue; // لا يوجد أي يوم عمل بهالفترة لهالموظف
-
 const [records] = await connection.execute(
     `SELECT staff_attendance_id, record_date, attendance_status, is_paid,
             is_management_paid_absence, regular_hours, overtime_hours, is_friday_worked
@@ -201,8 +195,8 @@ const hourlyRate       = money(hourlyRateRaw); // هاد بس للعرض/الت�
                      required_hours, ot_earned_hours, ot_used_hours, ot_remaining_hours,
                      shortage_hours, salary_deduction_amount)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [
-                    batchId, staff.staff_id, staff.monthly_salary, countNonFridayDays(effectiveStart, effectiveEnd),
+                             [
+                    batchId, staff.staff_id, staff.monthly_salary, requiredDays,
                     presentDaysCount, paidLeaveDays, managementPaidDays, unpaidAbsenceDays,
                     otEarnedHours, hourlyRate, netSalary,
                     requiredHours, otEarnedHours, otUsedHours, otRemainingHours,

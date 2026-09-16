@@ -12,7 +12,7 @@
 //   router.get('/:id/lifecycle-history', restrictTo('Admin'), staffLifecycleController.getStatusHistory);
 
 const db = require('../config/db');
-
+const { getActiveSpans } = require('../services/staffEmploymentService'); // ← جديد
 const VALID_STATUSES = ['Active', 'Inactive', 'Terminated'];
 
 function isValidDateOnly(value) {
@@ -165,7 +165,15 @@ exports.getStatusHistory = async (req, res) => {
        ORDER BY ssh.effective_date DESC, ssh.status_history_id DESC`,
       [staffId]
     );
-    return res.status(200).json({ status: 'success', data: rows });
+
+    const employmentSpans = await getActiveSpans(staffId);
+
+    return res.status(200).json({
+      status: 'success',
+      data: rows,
+      employment_spans: employmentSpans,          // كل فترات التوظيف الفعلية
+      is_returning_employee: employmentSpans.length > 1, // بادج "موظف قديم رجع"
+    });
   } catch (error) {
     console.error('GET STAFF LIFECYCLE HISTORY ERROR:', error);
     return res.status(500).json({ status: 'error', message: 'Failed to load status history.' });
