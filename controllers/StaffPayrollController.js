@@ -114,6 +114,12 @@ const [records] = await connection.execute(
     [staff.staff_id, effectiveStart, effectiveEnd]
 );
 
+// جديد: إذا ما في ولا سجل حضور معتمد واحد لهذا الموظف بكامل الفترة،
+// يعني ما كان متابَعًا بنظام الحضور إطلاقًا بهالفترة -> لا يُدرج بالراتب نهائيًا.
+// (هذا لا يغيّر شيئًا لأي موظف عنده سجل واحد على الأقل: منطق
+// "اليوم بدون سجل = غياب يُخصم" يبقى كما هو تمامًا لبقية الأيام الناقصة).
+if (records.length === 0) continue;
+
 const recordsByDate = new Map();
 for (const record of records) {
     recordsByDate.set(String(record.record_date).slice(0, 10), record);
