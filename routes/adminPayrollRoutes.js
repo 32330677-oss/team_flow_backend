@@ -11,6 +11,7 @@ router.post('/generate', controller.generatePayrollBatch);
 router.get('/report', controller.getPayrollReport);
 router.get('/batch/:batchId', controller.getPayrollBatchDetails);
 router.get('/batch/:batchId/export.xlsx', controller.exportPayrollExcel);
+router.get('/batch/:batchId/export.pdf', controller.exportPayrollPdf);
 router.get('/daily-attendance/export.xlsx', controller.exportDailyAttendanceExcel);
 router.patch('/batch/:batchId/mark-paid', controller.markBatchAsPaid);
 router.patch('/batch/:batchId/finalize', controller.finalizePayrollBatch);

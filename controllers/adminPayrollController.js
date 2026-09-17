@@ -870,6 +870,379 @@ async function exportPayrollExcel(req, res) {
   }
 }
 
+// ============================================================
+// GET /api/admin/payroll/batch/:batchId/export.pdf
+// Formal PDF report for WORKERS payroll (distinct from staff PDF):
+// - Grouped by SITE (workers of the same site listed together, sites never mixed)
+// - Per-day breakdown: Regular hours / Overtime hours columns for every day
+//   in the batch period
+// - Different color scheme than the staff report (teal/amber instead of navy/red)
+// ============================================================
+async function exportPayrollPdf(req, res) {
+  const batchId = Number(req.params.batchId);
+  if (!Number.isInteger(batchId) || batchId <= 0) {
+    return res.status(400).json({ success: false, message: 'Invalid batch id.' });
+  }
+
+  try {
+    const PDFDocument = require('pdfkit');
+    const path = require('path');
+    const fs = require('fs');
+
+    // ---- Batch header ----
+    const [batches] = await pool.execute(
+      `SELECT payroll_batch_id, start_date, end_date, total_workers, total_amount, status,
+              version_number, is_finalized
+       FROM payrollbatches WHERE payroll_batch_id = ?`,
+      [batchId]
+    );
+    if (!batches.length) return res.status(404).json({ success: false, message: 'Batch not found.' });
+    const batch = batches[0];
+
+    // ---- Per-worker / per-site payroll rows (same shape as Excel export) ----
+    const [rows] = await pool.execute(
+      `SELECT w.full_name AS worker_name, w.worker_unique_id, p.worker_id,
+              s.site_id, s.site_name, pi.pay_type,
+              pi.regular_hours_worked, pi.overtime_hours_worked,
+              pi.hourly_rate_snapshot, pi.overtime_hourly_rate_snapshot,
+              pi.daily_rate_snapshot, pi.days_worked,
+              pi.base_salary, pi.overtime_pay, p.net_salary
+       FROM payroll p
+       JOIN workers w ON w.worker_id = p.worker_id
+       JOIN payrollitems pi ON pi.payroll_id = p.payroll_id
+       LEFT JOIN sites s ON s.site_id = pi.site_id
+       WHERE p.payroll_batch_id = ?
+       ORDER BY s.site_name, w.full_name`,
+      [batchId]
+    );
+    if (!rows.length) return res.status(404).json({ success: false, message: 'No payroll items found for this batch.' });
+
+    // ---- Build the list of dates in the batch period ----
+    const startDate = new Date(`${String(batch.start_date).slice(0, 10)}T00:00:00Z`);
+    const endDate = new Date(`${String(batch.end_date).slice(0, 10)}T00:00:00Z`);
+    const dateList = [];
+    {
+      const cursor = new Date(startDate.getTime());
+      while (cursor <= endDate) {
+        dateList.push(cursor.toISOString().slice(0, 10));
+        cursor.setUTCDate(cursor.getUTCDate() + 1);
+      }
+    }
+    // Safety cap so the PDF doesn't become unusably huge for very long periods.
+    const MAX_DAYS = 62;
+    const truncated = dateList.length > MAX_DAYS;
+    const usedDates = truncated ? dateList.slice(0, MAX_DAYS) : dateList;
+
+    // ---- Daily attendance (Approved only) for every worker/site in this batch ----
+    const workerSitePairs = [...new Set(rows.map(r => `${r.worker_id}|${r.site_id ?? 'null'}`))];
+    const [attRows] = await pool.execute(
+      `SELECT worker_id, site_id, DATE_FORMAT(record_date, '%Y-%m-%d') AS record_date,
+              total_working_hours, overtime_hours
+       FROM attendance
+       WHERE record_date BETWEEN ? AND ?
+         AND status = 'Approved'`,
+      [batch.start_date, batch.end_date]
+    );
+    const dailyMap = new Map(); // `${worker_id}|${site_id}|${date}` -> {reg, ot}
+    for (const a of attRows) {
+      const key = `${a.worker_id}|${a.site_id}|${a.record_date}`;
+      dailyMap.set(key, {
+        reg: Number(a.total_working_hours || 0),
+        ot: Number(a.overtime_hours || 0),
+      });
+    }
+    function getDaily(workerId, siteId, date) {
+      return dailyMap.get(`${workerId}|${siteId}|${date}`) || { reg: 0, ot: 0 };
+    }
+
+    // ---- Group rows by site (workers of the same site stay together, never mixed) ----
+    const bySite = new Map();
+    for (const r of rows) {
+      const key = r.site_id ?? 'unassigned';
+      if (!bySite.has(key)) bySite.set(key, { siteName: r.site_name || 'Unassigned', siteId: r.site_id, rows: [] });
+      bySite.get(key).rows.push(r);
+    }
+
+    const num = (v) => Number(v || 0);
+    const fmt2 = (v) => num(v).toFixed(2);
+    const money = (v) => `${num(v).toFixed(0)} ل.س`;
+
+    // ---- Distinct-worker totals for the summary strip ----
+    const distinctWorkerIds = new Set(rows.map(r => r.worker_id));
+    let grandTotalNet = 0;
+    const netByWorker = new Map();
+    for (const r of rows) if (!netByWorker.has(r.worker_id)) netByWorker.set(r.worker_id, num(r.net_salary));
+    for (const v of netByWorker.values()) grandTotalNet += v;
+
+    // ============================================================
+    // Color scheme — deliberately different from the staff PDF
+    // (staff uses navy #1a2a6c / red). Workers report uses teal/amber.
+    // ============================================================
+    const COLOR_HEADER_BG = '#0b5b52';   // deep teal
+    const COLOR_HEADER_TEXT = '#ffffff';
+    const COLOR_ACCENT = '#0b5b52';
+    const COLOR_SITE_BAND = '#e7f4f1';   // light teal band for site headers
+    const COLOR_SITE_TEXT = '#0b5b52';
+    const COLOR_ZEBRA = '#f7faf9';
+    const COLOR_OT_TEXT = '#b26a00';     // amber for overtime figures
+    const COLOR_GRID = '#dfe3e8';
+    const COLOR_SUMMARY_BG = '#fff4e0';  // warm amber summary strip (vs staff's blue)
+
+    const doc = new PDFDocument({ size: 'A4', layout: 'landscape', margin: 30 });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="payroll_batch_${batchId}.pdf"`);
+    doc.pipe(res);
+
+    const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+    const logoPath = path.join(__dirname, '../assets/logo.png');
+    const hasLogo = fs.existsSync(logoPath);
+
+    const statusText = batch.status === 'Superseded' ? 'SUPERSEDED'
+      : batch.status === 'Paid' ? 'PAID' : 'GENERATED';
+    const isFinalized = batch.is_finalized === 1 || batch.is_finalized === true;
+
+    function drawHeader() {
+      let y = doc.page.margins.top;
+
+      if (hasLogo) doc.image(logoPath, doc.page.margins.left, y, { width: 85, height: 38 });
+
+      doc.font('Helvetica-Bold').fontSize(16)
+        .fillColor('black')
+        .text('WORKERS PAYROLL REPORT', doc.page.margins.left, y + 2, { width: pageWidth, align: 'center' });
+
+      doc.font('Helvetica').fontSize(9)
+        .text('ASIK ENGINEERING CONSTRUCTION', doc.page.margins.left, y + 22, { width: pageWidth, align: 'center' });
+
+      y += 48;
+
+      doc.font('Helvetica-Bold').fontSize(10).fillColor('black');
+      doc.text(`Batch #${batchId}  (Version ${batch.version_number || 1})`, doc.page.margins.left, y);
+      doc.text(
+        `Period: ${String(batch.start_date).slice(0, 10)}   to   ${String(batch.end_date).slice(0, 10)}`,
+        doc.page.margins.left, y, { width: pageWidth, align: 'right' }
+      );
+      y += 15;
+
+      const payColor = statusText === 'PAID' ? '#1a7a3c' : (statusText === 'SUPERSEDED' ? '#888888' : COLOR_OT_TEXT);
+      doc.fillColor(isFinalized ? '#1a7a3c' : '#b21f1f')
+        .text(`Status: ${isFinalized ? 'FINALIZED' : 'NOT FINALIZED'}`, doc.page.margins.left, y);
+      doc.fillColor(payColor).text(`Payment: ${statusText}`, doc.page.margins.left + 170, y);
+      doc.fillColor('black');
+      y += 18;
+
+      if (truncated) {
+        doc.font('Helvetica-Oblique').fontSize(8).fillColor('#b21f1f')
+          .text(`Showing first ${MAX_DAYS} of ${dateList.length} days in this period.`, doc.page.margins.left, y);
+        doc.fillColor('black');
+        y += 12;
+      }
+
+      doc.rect(doc.page.margins.left, y, pageWidth, 20).fill(COLOR_SUMMARY_BG);
+      doc.fillColor(COLOR_ACCENT).font('Helvetica-Bold').fontSize(9);
+      doc.text(
+        `Total Workers: ${distinctWorkerIds.size}    |    Total Sites: ${bySite.size}    |    TOTAL NET: ${money(grandTotalNet)}`,
+        doc.page.margins.left + 8, y + 5, { width: pageWidth - 16 }
+      );
+      doc.fillColor('black');
+      y += 30;
+
+      return y;
+    }
+
+    // Columns: fixed (worker info) + 2 per day (Reg/OT) + totals
+    const fixedCols = [
+      { key: 'no', label: 'No.', width: 22 },
+      { key: 'worker_id', label: 'ID', width: 46 },
+      { key: 'full_name', label: 'Worker Name', width: 100 },
+    ];
+    const dayColWidth = 26;
+    const totalsCols = [
+      { key: 'total_reg', label: 'Tot.Reg', width: 40 },
+      { key: 'total_ot', label: 'Tot.OT', width: 40 },
+      { key: 'daily_wage', label: 'Daily Rate', width: 48 },
+      { key: 'net', label: 'Net Pay', width: 55 },
+    ];
+
+    function dayColumns() {
+      return usedDates.flatMap((d) => ([
+        { key: `${d}_reg`, label: d.slice(5), sub: 'R', width: dayColWidth / 2, isOt: false, date: d },
+        { key: `${d}_ot`, label: '', sub: 'OT', width: dayColWidth / 2, isOt: true, date: d },
+      ]));
+    }
+
+    function drawTableHeader(y) {
+      const rowH1 = 14, rowH2 = 16;
+      let x = doc.page.margins.left;
+
+      // Fixed columns header (spans both header rows)
+      doc.rect(x, y, fixedCols.reduce((s, c) => s + c.width, 0), rowH1 + rowH2).fill(COLOR_HEADER_BG);
+      doc.fillColor(COLOR_HEADER_TEXT).font('Helvetica-Bold').fontSize(7);
+      let fx = x;
+      for (const c of fixedCols) {
+        doc.text(c.label, fx + 2, y + rowH1 / 2 + 3, { width: c.width - 4, align: 'center' });
+        fx += c.width;
+      }
+      x = fx;
+
+      // Day columns — date label spans the pair, R/OT sub-label below
+      doc.font('Helvetica-Bold').fontSize(6.3);
+      let dx = x;
+      for (const d of usedDates) {
+        const pairWidth = dayColWidth;
+        doc.rect(dx, y, pairWidth, rowH1).fill(COLOR_HEADER_BG);
+        doc.fillColor(COLOR_HEADER_TEXT).text(d.slice(5), dx, y + 3, { width: pairWidth, align: 'center' });
+        doc.rect(dx, y + rowH1, pairWidth / 2, rowH2).fill('#0e7568');
+        doc.rect(dx + pairWidth / 2, y + rowH1, pairWidth / 2, rowH2).fill('#b8792a');
+        doc.fillColor(COLOR_HEADER_TEXT).fontSize(6)
+          .text('R', dx, y + rowH1 + 4, { width: pairWidth / 2, align: 'center' })
+          .text('OT', dx + pairWidth / 2, y + rowH1 + 4, { width: pairWidth / 2, align: 'center' });
+        dx += pairWidth;
+      }
+      x = dx;
+
+      // Totals columns
+      doc.font('Helvetica-Bold').fontSize(7);
+      for (const c of totalsCols) {
+        doc.rect(x, y, c.width, rowH1 + rowH2).fill(COLOR_HEADER_BG);
+        doc.fillColor(COLOR_HEADER_TEXT).text(c.label, x + 2, y + rowH1 / 2 + 3, { width: c.width - 4, align: 'center' });
+        x += c.width;
+      }
+
+      doc.fillColor('black');
+      return y + rowH1 + rowH2;
+    }
+
+    function siteHeaderRow(y, siteName, workerCount) {
+      const h = 18;
+      const totalWidth = fixedCols.reduce((s, c) => s + c.width, 0)
+        + usedDates.length * dayColWidth
+        + totalsCols.reduce((s, c) => s + c.width, 0);
+      doc.rect(doc.page.margins.left, y, totalWidth, h).fill(COLOR_SITE_BAND);
+      doc.fillColor(COLOR_SITE_TEXT).font('Helvetica-Bold').fontSize(9)
+        .text(`Site: ${siteName}  (${workerCount} worker${workerCount === 1 ? '' : 's'})`,
+          doc.page.margins.left + 6, y + 4, { width: totalWidth - 12 });
+      doc.fillColor('black');
+      return y + h;
+    }
+
+    function drawDataRow(y, item, opts = {}) {
+      const rowH = 13;
+      let x = doc.page.margins.left;
+
+      if (opts.zebra) {
+        const totalWidth = fixedCols.reduce((s, c) => s + c.width, 0)
+          + usedDates.length * dayColWidth
+          + totalsCols.reduce((s, c) => s + c.width, 0);
+        doc.rect(x, y, totalWidth, rowH).fill(COLOR_ZEBRA);
+        doc.fillColor('black');
+      }
+
+      doc.font(opts.bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(6.5);
+      for (const c of fixedCols) {
+        doc.rect(x, y, c.width, rowH).stroke(COLOR_GRID);
+        doc.fillColor('black').text(String(item[c.key] ?? ''), x + 2, y + 3, {
+          width: c.width - 4,
+          align: c.key === 'full_name' ? 'left' : 'center',
+          lineBreak: false,
+        });
+        x += c.width;
+      }
+
+      for (const d of usedDates) {
+        const daily = item.dailyByDate[d] || { reg: 0, ot: 0 };
+        const half = dayColWidth / 2;
+        doc.rect(x, y, half, rowH).stroke(COLOR_GRID);
+        doc.fillColor('black').text(daily.reg > 0 ? daily.reg.toFixed(1) : '-', x, y + 3, { width: half, align: 'center', lineBreak: false });
+        x += half;
+        doc.rect(x, y, half, rowH).stroke(COLOR_GRID);
+        doc.fillColor(daily.ot > 0 ? COLOR_OT_TEXT : 'black')
+          .text(daily.ot > 0 ? daily.ot.toFixed(1) : '-', x, y + 3, { width: half, align: 'center', lineBreak: false });
+        x += half;
+      }
+
+      doc.font(opts.bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(6.5);
+      for (const c of totalsCols) {
+        doc.rect(x, y, c.width, rowH).stroke(COLOR_GRID);
+        doc.fillColor(c.key === 'total_ot' ? COLOR_OT_TEXT : 'black')
+          .text(String(item[c.key] ?? ''), x + 2, y + 3, { width: c.width - 4, align: 'center', lineBreak: false });
+        x += c.width;
+      }
+      doc.fillColor('black');
+
+      return y + rowH;
+    }
+
+    let y = drawHeader();
+    y = drawTableHeader(y);
+
+    const bottomLimit = doc.page.height - doc.page.margins.bottom - 20;
+
+    // Sites sorted by name; workers within a site stay grouped, never interleaved.
+    const sortedSites = [...bySite.values()].sort((a, b) => (a.siteName || '').localeCompare(b.siteName || ''));
+
+    for (const siteGroup of sortedSites) {
+      if (y + 18 > bottomLimit) {
+        doc.addPage();
+        y = doc.page.margins.top;
+        y = drawTableHeader(y);
+      }
+      y = siteHeaderRow(y, siteGroup.siteName, siteGroup.rows.length);
+
+      siteGroup.rows.forEach((r, idx) => {
+        if (y + 13 > bottomLimit) {
+          doc.addPage();
+          y = doc.page.margins.top;
+          y = drawTableHeader(y);
+        }
+
+        const dailyByDate = {};
+        let totalReg = 0, totalOt = 0;
+        for (const d of usedDates) {
+          const v = getDaily(r.worker_id, r.site_id, d);
+          dailyByDate[d] = v;
+          totalReg += v.reg;
+          totalOt += v.ot;
+        }
+
+        const isDaily = r.pay_type === 'Daily';
+        const dailyWageLabel = isDaily
+          ? money(r.daily_rate_snapshot)
+          : `${money(r.hourly_rate_snapshot)}/h`;
+
+        y = drawDataRow(y, {
+          no: idx + 1,
+          worker_id: r.worker_unique_id,
+          full_name: r.worker_name,
+          total_reg: fmt2(totalReg),
+          total_ot: fmt2(totalOt),
+          daily_wage: dailyWageLabel,
+          net: money(r.net_salary),
+          dailyByDate,
+        }, { zebra: idx % 2 === 1 });
+      });
+    }
+
+    // Grand total row
+    if (y + 14 > bottomLimit) {
+      doc.addPage();
+      y = doc.page.margins.top;
+      y = drawTableHeader(y);
+    }
+    doc.font('Helvetica-Bold').fontSize(8).fillColor(COLOR_ACCENT)
+      .text(`GRAND TOTAL NET: ${money(grandTotalNet)}`, doc.page.margins.left, y + 6);
+    doc.fillColor('black');
+
+    doc.end();
+  } catch (error) {
+    console.error('exportPayrollPdf:', error);
+    if (!res.headersSent) {
+      return res.status(500).json({ success: false, message: 'Failed to export workers payroll PDF report.' });
+    }
+  }
+}
+
+
+
 async function exportDailyAttendanceExcel(req, res) {
   const { date, site_id } = req.query || {};
 
@@ -993,5 +1366,6 @@ module.exports = {
   markBatchAsPaid,
   getLastBatchEndDate,
   exportPayrollExcel,
+  exportPayrollPdf,           // ← جديد
   exportDailyAttendanceExcel,
 };
