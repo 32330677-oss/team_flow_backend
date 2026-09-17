@@ -878,6 +878,26 @@ async function exportPayrollExcel(req, res) {
 //   in the batch period
 // - Different color scheme than the staff report (teal/amber instead of navy/red)
 // ============================================================
+// ============================================================
+// REPLACEMENT for: controllers/adminPayrollController.js
+// Function: exportPayrollPdf
+//
+// Paste this whole function in place of the existing
+// `async function exportPayrollPdf(req, res) { ... }` block.
+// Everything else in adminPayrollController.js stays as-is
+// (module.exports already exports exportPayrollPdf).
+//
+// REQUIRED SETUP before this works correctly:
+//   1) npm install arabic-reshaper
+//   2) Download a Unicode Arabic font (e.g. "Noto Naskh Arabic"
+//      from Google Fonts, or Cairo/Amiri) and place it at:
+//        backend/assets/fonts/NotoNaskhArabic-Regular.ttf
+//      (If the file isn't found, the code still runs — Arabic
+//      text will fall back to plain Latin currency "SYP" and
+//      Arabic names, but names will still render incorrectly
+//      until the font file exists.)
+// ============================================================
+
 async function exportPayrollPdf(req, res) {
   const batchId = Number(req.params.batchId);
   if (!Number.isInteger(batchId) || batchId <= 0) {
@@ -889,17 +909,71 @@ async function exportPayrollPdf(req, res) {
     const path = require('path');
     const fs = require('fs');
 
-    // ---- Batch header ----
+    // ---------------------------------------------------------------
+    // Arabic text support. PDFKit's built-in fonts (Helvetica, etc.)
+    // have NO Arabic glyphs, and PDFKit does not shape/reorder Arabic
+    // text by itself (no BiDi, no letter-joining). We fix this by:
+    //   1) embedding a Unicode font that actually has Arabic glyphs
+    //   2) reshaping Arabic runs into their correct joined letterforms
+    //   3) reversing Arabic runs into correct right-to-left visual order
+    // Non-Arabic runs (numbers, "1,500", Latin site names, etc.) are
+    // left completely untouched so digits never get scrambled.
+    // ---------------------------------------------------------------
+    let ArabicReshaper = null;
+    try { ArabicReshaper = require('arabic-reshaper'); } catch (_) { ArabicReshaper = null; }
+
+    const ARABIC_FONT_PATH = path.join(__dirname, '../assets/fonts/NotoNaskhArabic-Regular.ttf');
+    const hasArabicFont = fs.existsSync(ARABIC_FONT_PATH);
+
+    function isArabicText(str) {
+      return /[\u0600-\u06FF]/.test(String(str || ''));
+    }
+
+    // Reshapes+reverses ONLY the Arabic-containing runs of a string,
+    // e.g. in "1,500 ل.س" only "ل.س" gets touched — "1,500" stays as-is.
+    function shapeArabicAware(str) {
+      const text = String(str ?? '');
+      if (!isArabicText(text) || !hasArabicFont) return text;
+      const tokens = text.match(/[\u0600-\u06FF\s.,،]+|[^\u0600-\u06FF]+/g) || [text];
+      return tokens
+        .map((tok) => {
+          if (!isArabicText(tok)) return tok;
+          if (!ArabicReshaper) return tok; // no shaping lib installed: font still switches below
+          try {
+            const reshaped = ArabicReshaper.convertArabic(tok);
+            return reshaped.split('').reverse().join('');
+          } catch (_) {
+            return tok;
+          }
+        })
+        .join('');
+    }
+
+    function fontNameFor(str, bold) {
+      if (hasArabicFont && isArabicText(str)) return 'Arabic';
+      return bold ? 'Helvetica-Bold' : 'Helvetica';
+    }
+
+    // Falls back to plain "SYP" if no Arabic font is installed yet, so the
+    // report never shows garbled currency text.
+    const CURRENCY_LABEL = hasArabicFont ? shapeArabicAware('ل.س') : 'SYP';
+
+    // ---- Batch header (now also fetches generated_by / finalized_by
+    //      names, needed for the signature footer at the bottom) ----
     const [batches] = await pool.execute(
-      `SELECT payroll_batch_id, start_date, end_date, total_workers, total_amount, status,
-              version_number, is_finalized
-       FROM payrollbatches WHERE payroll_batch_id = ?`,
+      `SELECT pb.payroll_batch_id, pb.start_date, pb.end_date, pb.total_workers, pb.total_amount, pb.status,
+              pb.version_number, pb.is_finalized,
+              u.full_name AS generated_by, fu.full_name AS finalized_by
+       FROM payrollbatches pb
+       JOIN users u ON u.user_id = pb.generated_by_user_id
+       LEFT JOIN users fu ON fu.user_id = pb.finalized_by_user_id
+       WHERE pb.payroll_batch_id = ?`,
       [batchId]
     );
     if (!batches.length) return res.status(404).json({ success: false, message: 'Batch not found.' });
     const batch = batches[0];
 
-    // ---- Per-worker / per-site payroll rows (same shape as Excel export) ----
+    // ---- Per-worker / per-site payroll rows ----
     const [rows] = await pool.execute(
       `SELECT w.full_name AS worker_name, w.worker_unique_id, p.worker_id,
               s.site_id, s.site_name, pi.pay_type,
@@ -917,6 +991,11 @@ async function exportPayrollPdf(req, res) {
     );
     if (!rows.length) return res.status(404).json({ success: false, message: 'No payroll items found for this batch.' });
 
+    const num = (v) => Number(v || 0);
+    const fmt2 = (v) => num(v).toFixed(2);
+    // Matches the app's formatSyp(): comma-grouped number + " ل.س"
+    const money = (v) => `${Math.round(num(v)).toLocaleString('en-US')} ${CURRENCY_LABEL}`;
+
     // ---- Build the list of dates in the batch period ----
     const startDate = new Date(`${String(batch.start_date).slice(0, 10)}T00:00:00Z`);
     const endDate = new Date(`${String(batch.end_date).slice(0, 10)}T00:00:00Z`);
@@ -928,13 +1007,11 @@ async function exportPayrollPdf(req, res) {
         cursor.setUTCDate(cursor.getUTCDate() + 1);
       }
     }
-    // Safety cap so the PDF doesn't become unusably huge for very long periods.
     const MAX_DAYS = 62;
     const truncated = dateList.length > MAX_DAYS;
     const usedDates = truncated ? dateList.slice(0, MAX_DAYS) : dateList;
 
-    // ---- Daily attendance (Approved only) for every worker/site in this batch ----
-    const workerSitePairs = [...new Set(rows.map(r => `${r.worker_id}|${r.site_id ?? 'null'}`))];
+    // ---- Daily attendance (Approved only) ----
     const [attRows] = await pool.execute(
       `SELECT worker_id, site_id, DATE_FORMAT(record_date, '%Y-%m-%d') AS record_date,
               total_working_hours, overtime_hours
@@ -943,52 +1020,45 @@ async function exportPayrollPdf(req, res) {
          AND status = 'Approved'`,
       [batch.start_date, batch.end_date]
     );
-    const dailyMap = new Map(); // `${worker_id}|${site_id}|${date}` -> {reg, ot}
+    const dailyMap = new Map();
     for (const a of attRows) {
       const key = `${a.worker_id}|${a.site_id}|${a.record_date}`;
-      dailyMap.set(key, {
-        reg: Number(a.total_working_hours || 0),
-        ot: Number(a.overtime_hours || 0),
-      });
+      dailyMap.set(key, { reg: Number(a.total_working_hours || 0), ot: Number(a.overtime_hours || 0) });
     }
     function getDaily(workerId, siteId, date) {
       return dailyMap.get(`${workerId}|${siteId}|${date}`) || { reg: 0, ot: 0 };
     }
 
-    // ---- Group rows by site (workers of the same site stay together, never mixed) ----
-    const bySite = new Map();
-    for (const r of rows) {
-      const key = r.site_id ?? 'unassigned';
-      if (!bySite.has(key)) bySite.set(key, { siteName: r.site_name || 'Unassigned', siteId: r.site_id, rows: [] });
-      bySite.get(key).rows.push(r);
-    }
+    // ---------------------------------------------------------------
+    // Workers stay grouped by site through SORT ORDER only (same-site
+    // workers land on consecutive rows) — there is no separate
+    // section/banner per site anymore. A "Site" column right after the
+    // worker's name shows which site each row belongs to.
+    // ---------------------------------------------------------------
+    const sortedRows = [...rows].sort((a, b) => {
+      const bySite = (a.site_name || 'Unassigned').localeCompare(b.site_name || 'Unassigned');
+      if (bySite !== 0) return bySite;
+      return (a.worker_name || '').localeCompare(b.worker_name || '');
+    });
 
-    const num = (v) => Number(v || 0);
-    const fmt2 = (v) => num(v).toFixed(2);
-    const money = (v) => `${num(v).toFixed(0)} ل.س`;
-
-    // ---- Distinct-worker totals for the summary strip ----
-    const distinctWorkerIds = new Set(rows.map(r => r.worker_id));
+    const distinctWorkerIds = new Set(rows.map((r) => r.worker_id));
+    const distinctSites = new Set(rows.map((r) => r.site_name || 'Unassigned'));
     let grandTotalNet = 0;
     const netByWorker = new Map();
     for (const r of rows) if (!netByWorker.has(r.worker_id)) netByWorker.set(r.worker_id, num(r.net_salary));
     for (const v of netByWorker.values()) grandTotalNet += v;
 
-    // ============================================================
-    // Color scheme — deliberately different from the staff PDF
-    // (staff uses navy #1a2a6c / red). Workers report uses teal/amber.
-    // ============================================================
-    const COLOR_HEADER_BG = '#0b5b52';   // deep teal
+    const COLOR_HEADER_BG = '#0b5b52';
     const COLOR_HEADER_TEXT = '#ffffff';
     const COLOR_ACCENT = '#0b5b52';
-    const COLOR_SITE_BAND = '#e7f4f1';   // light teal band for site headers
-    const COLOR_SITE_TEXT = '#0b5b52';
     const COLOR_ZEBRA = '#f7faf9';
-    const COLOR_OT_TEXT = '#b26a00';     // amber for overtime figures
+    const COLOR_OT_TEXT = '#b26a00';
     const COLOR_GRID = '#dfe3e8';
-    const COLOR_SUMMARY_BG = '#fff4e0';  // warm amber summary strip (vs staff's blue)
+    const COLOR_SUMMARY_BG = '#fff4e0';
 
     const doc = new PDFDocument({ size: 'A4', layout: 'landscape', margin: 30 });
+    if (hasArabicFont) doc.registerFont('Arabic', ARABIC_FONT_PATH);
+
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="payroll_batch_${batchId}.pdf"`);
     doc.pipe(res);
@@ -997,35 +1067,27 @@ async function exportPayrollPdf(req, res) {
     const logoPath = path.join(__dirname, '../assets/logo.png');
     const hasLogo = fs.existsSync(logoPath);
 
-    const statusText = batch.status === 'Superseded' ? 'SUPERSEDED'
-      : batch.status === 'Paid' ? 'PAID' : 'GENERATED';
+    const statusText = batch.status === 'Superseded' ? 'SUPERSEDED' : batch.status === 'Paid' ? 'PAID' : 'GENERATED';
     const isFinalized = batch.is_finalized === 1 || batch.is_finalized === true;
 
     function drawHeader() {
       let y = doc.page.margins.top;
-
       if (hasLogo) doc.image(logoPath, doc.page.margins.left, y, { width: 85, height: 38 });
 
-      doc.font('Helvetica-Bold').fontSize(16)
-        .fillColor('black')
+      doc.font('Helvetica-Bold').fontSize(16).fillColor('black')
         .text('WORKERS PAYROLL REPORT', doc.page.margins.left, y + 2, { width: pageWidth, align: 'center' });
-
       doc.font('Helvetica').fontSize(9)
         .text('ASIK ENGINEERING CONSTRUCTION', doc.page.margins.left, y + 22, { width: pageWidth, align: 'center' });
 
       y += 48;
-
       doc.font('Helvetica-Bold').fontSize(10).fillColor('black');
       doc.text(`Batch #${batchId}  (Version ${batch.version_number || 1})`, doc.page.margins.left, y);
-      doc.text(
-        `Period: ${String(batch.start_date).slice(0, 10)}   to   ${String(batch.end_date).slice(0, 10)}`,
-        doc.page.margins.left, y, { width: pageWidth, align: 'right' }
-      );
+      doc.text(`Period: ${String(batch.start_date).slice(0, 10)}   to   ${String(batch.end_date).slice(0, 10)}`,
+        doc.page.margins.left, y, { width: pageWidth, align: 'right' });
       y += 15;
 
-      const payColor = statusText === 'PAID' ? '#1a7a3c' : (statusText === 'SUPERSEDED' ? '#888888' : COLOR_OT_TEXT);
-      doc.fillColor(isFinalized ? '#1a7a3c' : '#b21f1f')
-        .text(`Status: ${isFinalized ? 'FINALIZED' : 'NOT FINALIZED'}`, doc.page.margins.left, y);
+      const payColor = statusText === 'PAID' ? '#1a7a3c' : statusText === 'SUPERSEDED' ? '#888888' : COLOR_OT_TEXT;
+      doc.fillColor(isFinalized ? '#1a7a3c' : '#b21f1f').text(`Status: ${isFinalized ? 'FINALIZED' : 'NOT FINALIZED'}`, doc.page.margins.left, y);
       doc.fillColor(payColor).text(`Payment: ${statusText}`, doc.page.margins.left + 170, y);
       doc.fillColor('black');
       y += 18;
@@ -1040,41 +1102,37 @@ async function exportPayrollPdf(req, res) {
       doc.rect(doc.page.margins.left, y, pageWidth, 20).fill(COLOR_SUMMARY_BG);
       doc.fillColor(COLOR_ACCENT).font('Helvetica-Bold').fontSize(9);
       doc.text(
-        `Total Workers: ${distinctWorkerIds.size}    |    Total Sites: ${bySite.size}    |    TOTAL NET: ${money(grandTotalNet)}`,
+        `Total Workers: ${distinctWorkerIds.size}    |    Total Sites: ${distinctSites.size}    |    TOTAL NET: ${money(grandTotalNet)}`,
         doc.page.margins.left + 8, y + 5, { width: pageWidth - 16 }
       );
       doc.fillColor('black');
       y += 30;
-
       return y;
     }
 
-    // Columns: fixed (worker info) + 2 per day (Reg/OT) + totals
+    // ---- Column layout ----
     const fixedCols = [
-      { key: 'no', label: 'No.', width: 22 },
-      { key: 'worker_id', label: 'ID', width: 46 },
-      { key: 'full_name', label: 'Worker Name', width: 100 },
+      { key: 'no', label: 'No.', width: 20 },
+      { key: 'worker_id', label: 'ID', width: 40 },
+      { key: 'full_name', label: 'Worker Name', width: 120 },
+      { key: 'site_name', label: 'Site', width: 82 },
     ];
-    const dayColWidth = 26;
+    const dayColWidth = 24;
     const totalsCols = [
       { key: 'total_reg', label: 'Tot.Reg', width: 40 },
       { key: 'total_ot', label: 'Tot.OT', width: 40 },
-      { key: 'daily_wage', label: 'Daily Rate', width: 48 },
-      { key: 'net', label: 'Net Pay', width: 55 },
+      { key: 'daily_wage', label: 'Rate', width: 66 },
+      { key: 'net', label: 'Net Pay', width: 78 },
     ];
 
-    function dayColumns() {
-      return usedDates.flatMap((d) => ([
-        { key: `${d}_reg`, label: d.slice(5), sub: 'R', width: dayColWidth / 2, isOt: false, date: d },
-        { key: `${d}_ot`, label: '', sub: 'OT', width: dayColWidth / 2, isOt: true, date: d },
-      ]));
-    }
+    const tableTotalWidth = fixedCols.reduce((s, c) => s + c.width, 0)
+      + usedDates.length * dayColWidth
+      + totalsCols.reduce((s, c) => s + c.width, 0);
 
     function drawTableHeader(y) {
       const rowH1 = 14, rowH2 = 16;
       let x = doc.page.margins.left;
 
-      // Fixed columns header (spans both header rows)
       doc.rect(x, y, fixedCols.reduce((s, c) => s + c.width, 0), rowH1 + rowH2).fill(COLOR_HEADER_BG);
       doc.fillColor(COLOR_HEADER_TEXT).font('Helvetica-Bold').fontSize(7);
       let fx = x;
@@ -1084,23 +1142,20 @@ async function exportPayrollPdf(req, res) {
       }
       x = fx;
 
-      // Day columns — date label spans the pair, R/OT sub-label below
       doc.font('Helvetica-Bold').fontSize(6.3);
       let dx = x;
       for (const d of usedDates) {
-        const pairWidth = dayColWidth;
-        doc.rect(dx, y, pairWidth, rowH1).fill(COLOR_HEADER_BG);
-        doc.fillColor(COLOR_HEADER_TEXT).text(d.slice(5), dx, y + 3, { width: pairWidth, align: 'center' });
-        doc.rect(dx, y + rowH1, pairWidth / 2, rowH2).fill('#0e7568');
-        doc.rect(dx + pairWidth / 2, y + rowH1, pairWidth / 2, rowH2).fill('#b8792a');
+        doc.rect(dx, y, dayColWidth, rowH1).fill(COLOR_HEADER_BG);
+        doc.fillColor(COLOR_HEADER_TEXT).text(d.slice(5), dx, y + 3, { width: dayColWidth, align: 'center' });
+        doc.rect(dx, y + rowH1, dayColWidth / 2, rowH2).fill('#0e7568');
+        doc.rect(dx + dayColWidth / 2, y + rowH1, dayColWidth / 2, rowH2).fill('#b8792a');
         doc.fillColor(COLOR_HEADER_TEXT).fontSize(6)
-          .text('R', dx, y + rowH1 + 4, { width: pairWidth / 2, align: 'center' })
-          .text('OT', dx + pairWidth / 2, y + rowH1 + 4, { width: pairWidth / 2, align: 'center' });
-        dx += pairWidth;
+          .text('R', dx, y + rowH1 + 4, { width: dayColWidth / 2, align: 'center' })
+          .text('OT', dx + dayColWidth / 2, y + rowH1 + 4, { width: dayColWidth / 2, align: 'center' });
+        dx += dayColWidth;
       }
       x = dx;
 
-      // Totals columns
       doc.font('Helvetica-Bold').fontSize(7);
       for (const c of totalsCols) {
         doc.rect(x, y, c.width, rowH1 + rowH2).fill(COLOR_HEADER_BG);
@@ -1112,59 +1167,101 @@ async function exportPayrollPdf(req, res) {
       return y + rowH1 + rowH2;
     }
 
-    function siteHeaderRow(y, siteName, workerCount) {
-      const h = 18;
-      const totalWidth = fixedCols.reduce((s, c) => s + c.width, 0)
-        + usedDates.length * dayColWidth
-        + totalsCols.reduce((s, c) => s + c.width, 0);
-      doc.rect(doc.page.margins.left, y, totalWidth, h).fill(COLOR_SITE_BAND);
-      doc.fillColor(COLOR_SITE_TEXT).font('Helvetica-Bold').fontSize(9)
-        .text(`Site: ${siteName}  (${workerCount} worker${workerCount === 1 ? '' : 's'})`,
-          doc.page.margins.left + 6, y + 4, { width: totalWidth - 12 });
-      doc.fillColor('black');
-      return y + h;
+    // Measures how tall a row needs to be so the text-heavy cells
+    // (Name / Site / Rate / Net) NEVER get clipped — they wrap instead.
+    function measureRowHeight(item) {
+      doc.fontSize(6.6);
+
+      doc.font(fontNameFor(item.full_name));
+      const nameH = doc.heightOfString(shapeArabicAware(item.full_name), { width: fixedCols[2].width - 6 });
+
+      doc.font(fontNameFor(item.site_name));
+      const siteH = doc.heightOfString(shapeArabicAware(item.site_name), { width: fixedCols[3].width - 6 });
+
+      doc.font(fontNameFor(item.daily_wage));
+      const rateH = doc.heightOfString(item.daily_wage, { width: totalsCols[2].width - 6 });
+
+      doc.font(fontNameFor(item.net));
+      const netH = doc.heightOfString(item.net, { width: totalsCols[3].width - 6 });
+
+      return Math.max(13, Math.ceil(Math.max(nameH, siteH, rateH, netH)) + 5);
     }
 
     function drawDataRow(y, item, opts = {}) {
-      const rowH = 13;
+      const rowH = opts.rowHeight || 13;
       let x = doc.page.margins.left;
 
       if (opts.zebra) {
-        const totalWidth = fixedCols.reduce((s, c) => s + c.width, 0)
-          + usedDates.length * dayColWidth
-          + totalsCols.reduce((s, c) => s + c.width, 0);
-        doc.rect(x, y, totalWidth, rowH).fill(COLOR_ZEBRA);
+        doc.rect(x, y, tableTotalWidth, rowH).fill(COLOR_ZEBRA);
         doc.fillColor('black');
       }
 
-      doc.font(opts.bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(6.5);
-      for (const c of fixedCols) {
+      // No. / ID — short, fixed, never wraps
+      doc.font(opts.bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(6.6);
+      for (const c of [fixedCols[0], fixedCols[1]]) {
         doc.rect(x, y, c.width, rowH).stroke(COLOR_GRID);
-        doc.fillColor('black').text(String(item[c.key] ?? ''), x + 2, y + 3, {
-          width: c.width - 4,
-          align: c.key === 'full_name' ? 'left' : 'center',
-          lineBreak: false,
+        doc.fillColor('black').text(String(item[c.key] ?? ''), x + 2, y + rowH / 2 - 4, {
+          width: c.width - 4, align: 'center', lineBreak: false,
         });
         x += c.width;
       }
 
+      // Worker Name — Arabic-aware, wraps instead of being cut off
+      {
+        const c = fixedCols[2];
+        doc.rect(x, y, c.width, rowH).stroke(COLOR_GRID);
+        const raw = item.full_name || '';
+        doc.font(fontNameFor(raw, opts.bold));
+        doc.fillColor('black').text(shapeArabicAware(raw), x + 3, y + 3, {
+          width: c.width - 6,
+          align: isArabicText(raw) ? 'right' : 'left',
+          lineBreak: true,
+        });
+        x += c.width;
+      }
+
+      // Site — new column, same wrapping treatment
+      {
+        const c = fixedCols[3];
+        doc.rect(x, y, c.width, rowH).stroke(COLOR_GRID);
+        const raw = item.site_name || '';
+        doc.font(fontNameFor(raw, opts.bold));
+        doc.fillColor('black').text(shapeArabicAware(raw), x + 3, y + 3, {
+          width: c.width - 6,
+          align: isArabicText(raw) ? 'right' : 'left',
+          lineBreak: true,
+        });
+        x += c.width;
+      }
+
+      // Day columns
+      doc.font(opts.bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(6.5);
       for (const d of usedDates) {
         const daily = item.dailyByDate[d] || { reg: 0, ot: 0 };
         const half = dayColWidth / 2;
         doc.rect(x, y, half, rowH).stroke(COLOR_GRID);
-        doc.fillColor('black').text(daily.reg > 0 ? daily.reg.toFixed(1) : '-', x, y + 3, { width: half, align: 'center', lineBreak: false });
+        doc.fillColor('black').text(daily.reg > 0 ? daily.reg.toFixed(1) : '-', x, y + rowH / 2 - 4, { width: half, align: 'center', lineBreak: false });
         x += half;
         doc.rect(x, y, half, rowH).stroke(COLOR_GRID);
         doc.fillColor(daily.ot > 0 ? COLOR_OT_TEXT : 'black')
-          .text(daily.ot > 0 ? daily.ot.toFixed(1) : '-', x, y + 3, { width: half, align: 'center', lineBreak: false });
+          .text(daily.ot > 0 ? daily.ot.toFixed(1) : '-', x, y + rowH / 2 - 4, { width: half, align: 'center', lineBreak: false });
         x += half;
       }
 
-      doc.font(opts.bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(6.5);
-      for (const c of totalsCols) {
+      // Totals — Tot.Reg / Tot.OT never wrap; Rate / Net Pay can
+      doc.font(opts.bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(6.6);
+      for (const c of [totalsCols[0], totalsCols[1]]) {
         doc.rect(x, y, c.width, rowH).stroke(COLOR_GRID);
         doc.fillColor(c.key === 'total_ot' ? COLOR_OT_TEXT : 'black')
-          .text(String(item[c.key] ?? ''), x + 2, y + 3, { width: c.width - 4, align: 'center', lineBreak: false });
+          .text(String(item[c.key] ?? ''), x + 2, y + rowH / 2 - 4, { width: c.width - 4, align: 'center', lineBreak: false });
+        x += c.width;
+      }
+      for (const c of [totalsCols[2], totalsCols[3]]) {
+        doc.rect(x, y, c.width, rowH).stroke(COLOR_GRID);
+        const raw = String(item[c.key] ?? '');
+        doc.font(fontNameFor(raw, opts.bold));
+        doc.fillColor(c.key === 'net' ? COLOR_ACCENT : 'black')
+          .text(shapeArabicAware(raw), x + 3, y + 3, { width: c.width - 6, align: 'center', lineBreak: true });
         x += c.width;
       }
       doc.fillColor('black');
@@ -1174,56 +1271,42 @@ async function exportPayrollPdf(req, res) {
 
     let y = drawHeader();
     y = drawTableHeader(y);
-
     const bottomLimit = doc.page.height - doc.page.margins.bottom - 20;
 
-    // Sites sorted by name; workers within a site stay grouped, never interleaved.
-    const sortedSites = [...bySite.values()].sort((a, b) => (a.siteName || '').localeCompare(b.siteName || ''));
+    sortedRows.forEach((r, idx) => {
+      const dailyByDate = {};
+      let totalReg = 0, totalOt = 0;
+      for (const d of usedDates) {
+        const v = getDaily(r.worker_id, r.site_id, d);
+        dailyByDate[d] = v;
+        totalReg += v.reg;
+        totalOt += v.ot;
+      }
+      const isDaily = r.pay_type === 'Daily';
+      const dailyWageLabel = isDaily ? money(r.daily_rate_snapshot) : `${money(r.hourly_rate_snapshot)}/h`;
 
-    for (const siteGroup of sortedSites) {
-      if (y + 18 > bottomLimit) {
+      const item = {
+        no: idx + 1,
+        worker_id: r.worker_unique_id,
+        full_name: r.worker_name,
+        site_name: r.site_name || 'Unassigned',
+        total_reg: fmt2(totalReg),
+        total_ot: fmt2(totalOt),
+        daily_wage: dailyWageLabel,
+        net: money(r.net_salary),
+        dailyByDate,
+      };
+
+      const rowHeight = measureRowHeight(item);
+      if (y + rowHeight > bottomLimit) {
         doc.addPage();
         y = doc.page.margins.top;
         y = drawTableHeader(y);
       }
-      y = siteHeaderRow(y, siteGroup.siteName, siteGroup.rows.length);
+      y = drawDataRow(y, item, { zebra: idx % 2 === 1, rowHeight });
+    });
 
-      siteGroup.rows.forEach((r, idx) => {
-        if (y + 13 > bottomLimit) {
-          doc.addPage();
-          y = doc.page.margins.top;
-          y = drawTableHeader(y);
-        }
-
-        const dailyByDate = {};
-        let totalReg = 0, totalOt = 0;
-        for (const d of usedDates) {
-          const v = getDaily(r.worker_id, r.site_id, d);
-          dailyByDate[d] = v;
-          totalReg += v.reg;
-          totalOt += v.ot;
-        }
-
-        const isDaily = r.pay_type === 'Daily';
-        const dailyWageLabel = isDaily
-          ? money(r.daily_rate_snapshot)
-          : `${money(r.hourly_rate_snapshot)}/h`;
-
-        y = drawDataRow(y, {
-          no: idx + 1,
-          worker_id: r.worker_unique_id,
-          full_name: r.worker_name,
-          total_reg: fmt2(totalReg),
-          total_ot: fmt2(totalOt),
-          daily_wage: dailyWageLabel,
-          net: money(r.net_salary),
-          dailyByDate,
-        }, { zebra: idx % 2 === 1 });
-      });
-    }
-
-    // Grand total row
-    if (y + 14 > bottomLimit) {
+    if (y + 20 > bottomLimit) {
       doc.addPage();
       y = doc.page.margins.top;
       y = drawTableHeader(y);
@@ -1231,6 +1314,38 @@ async function exportPayrollPdf(req, res) {
     doc.font('Helvetica-Bold').fontSize(8).fillColor(COLOR_ACCENT)
       .text(`GRAND TOTAL NET: ${money(grandTotalNet)}`, doc.page.margins.left, y + 6);
     doc.fillColor('black');
+    y += 26;
+
+    // ---- Signature footer ----
+    function drawSignaturesFooter(currentY) {
+      const footerY = currentY + 15; // مسافة بسيطة بعد الجدول
+
+      // تحقق إذا كانت التواقيع ستنزل خارج الصفحة، إذاً انقلها لصفحة جديدة
+      if (footerY + 50 > doc.page.height - doc.page.margins.bottom) {
+        doc.addPage();
+        return doc.page.margins.top + 20;
+      }
+
+      doc.font('Helvetica').fontSize(8);
+      const sectionWidth = pageWidth / 3;
+      const signaturesData = [
+        { title: 'Prepared by', name: batch.generated_by || '-' },
+        { title: 'Verified by', name: '-' },
+        { title: 'Approved by', name: batch.finalized_by || '-' },
+      ];
+
+      signaturesData.forEach((sig, index) => {
+        const startXPos = doc.page.margins.left + index * sectionWidth;
+        doc.font('Helvetica-Bold').text(`${sig.title}:`, startXPos, footerY, { width: sectionWidth - 20 });
+        doc.font('Helvetica').text(`Name: ${sig.name}`, startXPos, footerY + 12, { width: sectionWidth - 20 });
+        doc.text('Signature: ___________________', startXPos, footerY + 24, { width: sectionWidth - 20 });
+        doc.text(`Date: ____ / ____ / ________`, startXPos, footerY + 36, { width: sectionWidth - 20 });
+      });
+
+      return footerY + 50;
+    }
+
+    drawSignaturesFooter(y);
 
     doc.end();
   } catch (error) {
