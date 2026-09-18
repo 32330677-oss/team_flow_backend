@@ -1087,28 +1087,51 @@ function shapeArabicAware(str) {
         y += 12;
       }
 
-doc.rect(doc.page.margins.left, y, pageWidth, 20).fill(COLOR_SUMMARY_BG);
+      doc.rect(doc.page.margins.left, y, pageWidth, 20).fill(COLOR_SUMMARY_BG);
+     doc.fillColor(COLOR_ACCENT).font('Helvetica-Bold').fontSize(9);
 
-const totalNetText =
-  `Total Workers: ${distinctWorkerIds.size}    |    ` +
-  `Total Sites: ${distinctSites.size}    |    ` +
-  `TOTAL NET: ${money(grandTotalNet)}`;
+const summaryX = doc.page.margins.left + 8;
+const summaryY = y + 5;
 
-doc.font(hasArabicFont ? 'Arabic' : 'Helvetica-Bold')
+const summaryLabel =
+  `Total Workers: ${distinctWorkerIds.size}    |    Total Sites: ${distinctSites.size}    |    TOTAL NET: `;
+
+doc.font('Helvetica-Bold')
   .fontSize(9)
-  .fillColor(COLOR_ACCENT);
-
-doc.text(
-  hasArabicFont ? shapeArabicAware(totalNetText) : totalNetText,
-  doc.page.margins.left + 8,
-  y + 5,
-  {
-    width: pageWidth - 16,
+  .fillColor(COLOR_ACCENT)
+  .text(summaryLabel, summaryX, summaryY, {
     lineBreak: false,
-  }
-);
+  });
 
-doc.fillColor('black');
+let currentX = summaryX + doc.widthOfString(summaryLabel);
+
+const amountOnly = Math.round(num(grandTotalNet)).toLocaleString('en-US');
+
+doc.font('Helvetica-Bold')
+  .fontSize(9)
+  .fillColor(COLOR_ACCENT)
+  .text(amountOnly, currentX, summaryY, {
+    lineBreak: false,
+  });
+
+currentX += doc.widthOfString(amountOnly) + 3;
+
+if (hasArabicFont) {
+  doc.font('Arabic')
+    .fontSize(9)
+    .fillColor(COLOR_ACCENT)
+    .text(shapeArabicAware(CURRENCY_LABEL), currentX, summaryY, {
+      lineBreak: false,
+    });
+} else {
+  doc.font('Helvetica-Bold')
+    .fontSize(9)
+    .fillColor(COLOR_ACCENT)
+    .text('SYP', currentX, summaryY, {
+      lineBreak: false,
+    });
+}
+      doc.fillColor('black');
       y += 30;
       return y;
     }
@@ -1314,19 +1337,46 @@ doc.fillColor('black');
       y = doc.page.margins.top;
       y = drawTableHeader(y);
     }
-const grandTotalText = `GRAND TOTAL NET: ${money(grandTotalNet)}`;
+const grandTotalX = doc.page.margins.left;
+const grandTotalY = y + 6;
 
-doc.font(hasArabicFont ? 'Arabic' : 'Helvetica-Bold')
+const grandTotalLabel = 'GRAND TOTAL NET: ';
+
+doc.font('Helvetica-Bold')
   .fontSize(8)
   .fillColor(COLOR_ACCENT)
-  .text(
-    hasArabicFont ? shapeArabicAware(grandTotalText) : grandTotalText,
-    doc.page.margins.left,
-    y + 6,
-    {
+  .text(grandTotalLabel, grandTotalX, grandTotalY, {
+    lineBreak: false,
+  });
+
+let grandX = grandTotalX + doc.widthOfString(grandTotalLabel);
+
+const grandAmount = Math.round(num(grandTotalNet)).toLocaleString('en-US');
+
+doc.font('Helvetica-Bold')
+  .fontSize(8)
+  .fillColor(COLOR_ACCENT)
+  .text(grandAmount, grandX, grandTotalY, {
+    lineBreak: false,
+  });
+
+grandX += doc.widthOfString(grandAmount) + 3;
+
+if (hasArabicFont) {
+  doc.font('Arabic')
+    .fontSize(8)
+    .fillColor(COLOR_ACCENT)
+    .text(shapeArabicAware(CURRENCY_LABEL), grandX, grandTotalY, {
       lineBreak: false,
-    }
-  );
+    });
+} else {
+  doc.font('Helvetica-Bold')
+    .fontSize(8)
+    .fillColor(COLOR_ACCENT)
+    .text('SYP', grandX, grandTotalY, {
+      lineBreak: false,
+    });
+}
 
 doc.fillColor('black');
     y += 26;
