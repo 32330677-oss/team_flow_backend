@@ -1087,13 +1087,28 @@ function shapeArabicAware(str) {
         y += 12;
       }
 
-      doc.rect(doc.page.margins.left, y, pageWidth, 20).fill(COLOR_SUMMARY_BG);
-      doc.fillColor(COLOR_ACCENT).font('Helvetica-Bold').fontSize(9);
-      doc.text(
-        `Total Workers: ${distinctWorkerIds.size}    |    Total Sites: ${distinctSites.size}    |    TOTAL NET: ${money(grandTotalNet)}`,
-        doc.page.margins.left + 8, y + 5, { width: pageWidth - 16 }
-      );
-      doc.fillColor('black');
+doc.rect(doc.page.margins.left, y, pageWidth, 20).fill(COLOR_SUMMARY_BG);
+
+const totalNetText =
+  `Total Workers: ${distinctWorkerIds.size}    |    ` +
+  `Total Sites: ${distinctSites.size}    |    ` +
+  `TOTAL NET: ${money(grandTotalNet)}`;
+
+doc.font(hasArabicFont ? 'Arabic' : 'Helvetica-Bold')
+  .fontSize(9)
+  .fillColor(COLOR_ACCENT);
+
+doc.text(
+  hasArabicFont ? shapeArabicAware(totalNetText) : totalNetText,
+  doc.page.margins.left + 8,
+  y + 5,
+  {
+    width: pageWidth - 16,
+    lineBreak: false,
+  }
+);
+
+doc.fillColor('black');
       y += 30;
       return y;
     }
@@ -1105,7 +1120,7 @@ function shapeArabicAware(str) {
       { key: 'full_name', label: 'Worker Name', width: 120 },
       { key: 'site_name', label: 'Site', width: 82 },
     ];
-    const dayColWidth = 24;
+    const dayColWidth = 30;
     const totalsCols = [
       { key: 'total_reg', label: 'Tot.Reg', width: 40 },
       { key: 'total_ot', label: 'Tot.OT', width: 40 },
@@ -1299,9 +1314,21 @@ function shapeArabicAware(str) {
       y = doc.page.margins.top;
       y = drawTableHeader(y);
     }
-    doc.font('Helvetica-Bold').fontSize(8).fillColor(COLOR_ACCENT)
-      .text(`GRAND TOTAL NET: ${money(grandTotalNet)}`, doc.page.margins.left, y + 6);
-    doc.fillColor('black');
+const grandTotalText = `GRAND TOTAL NET: ${money(grandTotalNet)}`;
+
+doc.font(hasArabicFont ? 'Arabic' : 'Helvetica-Bold')
+  .fontSize(8)
+  .fillColor(COLOR_ACCENT)
+  .text(
+    hasArabicFont ? shapeArabicAware(grandTotalText) : grandTotalText,
+    doc.page.margins.left,
+    y + 6,
+    {
+      lineBreak: false,
+    }
+  );
+
+doc.fillColor('black');
     y += 26;
 
     // ---- Signature footer ----
