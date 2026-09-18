@@ -1120,9 +1120,9 @@ if (hasArabicFont) {
   doc.font('Arabic')
     .fontSize(9)
     .fillColor(COLOR_ACCENT)
-    .text(shapeArabicAware(CURRENCY_LABEL), currentX, summaryY, {
-      lineBreak: false,
-    });
+   .text(shapeArabicAware(CURRENCY_LABEL), currentX, summaryY - 2, {
+  lineBreak: false,
+});
 } else {
   doc.font('Helvetica-Bold')
     .fontSize(9)
@@ -1366,9 +1366,9 @@ if (hasArabicFont) {
   doc.font('Arabic')
     .fontSize(8)
     .fillColor(COLOR_ACCENT)
-    .text(shapeArabicAware(CURRENCY_LABEL), grandX, grandTotalY, {
-      lineBreak: false,
-    });
+  .text(shapeArabicAware(CURRENCY_LABEL), grandX, grandTotalY - 2, {
+  lineBreak: false,
+});
 } else {
   doc.font('Helvetica-Bold')
     .fontSize(8)
