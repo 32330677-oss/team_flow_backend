@@ -908,17 +908,6 @@ async function exportPayrollPdf(req, res) {
     const PDFDocument = require('pdfkit');
     const path = require('path');
     const fs = require('fs');
-
-    // ---------------------------------------------------------------
-    // Arabic text support. PDFKit's built-in fonts (Helvetica, etc.)
-    // have NO Arabic glyphs, and PDFKit does not shape/reorder Arabic
-    // text by itself (no BiDi, no letter-joining). We fix this by:
-    //   1) embedding a Unicode font that actually has Arabic glyphs
-    //   2) reshaping Arabic runs into their correct joined letterforms
-    //   3) reversing Arabic runs into correct right-to-left visual order
-    // Non-Arabic runs (numbers, "1,500", Latin site names, etc.) are
-    // left completely untouched so digits never get scrambled.
-    // ---------------------------------------------------------------
     let ArabicReshaper = null;
     try { ArabicReshaper = require('arabic-reshaper'); } catch (_) { ArabicReshaper = null; }
 
@@ -964,12 +953,7 @@ function shapeArabicAware(str) {
       return bold ? 'Helvetica-Bold' : 'Helvetica';
     }
 
-    // Falls back to plain "SYP" if no Arabic font is installed yet, so the
-    // report never shows garbled currency text.
-    const CURRENCY_LABEL = hasArabicFont ? shapeArabicAware('ل.س') : 'ل.س';
-
-    // ---- Batch header (now also fetches generated_by / finalized_by
-    //      names, needed for the signature footer at the bottom) ----
+    const CURRENCY_LABEL = 'ل.س';
     const [batches] = await pool.execute(
       `SELECT pb.payroll_batch_id, pb.start_date, pb.end_date, pb.total_workers, pb.total_amount, pb.status,
               pb.version_number, pb.is_finalized,
@@ -983,7 +967,6 @@ function shapeArabicAware(str) {
     if (!batches.length) return res.status(404).json({ success: false, message: 'Batch not found.' });
     const batch = batches[0];
 
-    // ---- Per-worker / per-site payroll rows ----
     const [rows] = await pool.execute(
       `SELECT w.full_name AS worker_name, w.worker_unique_id, p.worker_id,
               s.site_id, s.site_name, pi.pay_type,
@@ -1039,12 +1022,7 @@ function shapeArabicAware(str) {
       return dailyMap.get(`${workerId}|${siteId}|${date}`) || { reg: 0, ot: 0 };
     }
 
-    // ---------------------------------------------------------------
-    // Workers stay grouped by site through SORT ORDER only (same-site
-    // workers land on consecutive rows) — there is no separate
-    // section/banner per site anymore. A "Site" column right after the
-    // worker's name shows which site each row belongs to.
-    // ---------------------------------------------------------------
+
     const sortedRows = [...rows].sort((a, b) => {
       const bySite = (a.site_name || 'Unassigned').localeCompare(b.site_name || 'Unassigned');
       if (bySite !== 0) return bySite;
