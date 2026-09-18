@@ -940,8 +940,8 @@ async function exportPayrollPdf(req, res) {
           if (!isArabicText(tok)) return tok;
           if (!ArabicReshaper) return tok; // no shaping lib installed: font still switches below
           try {
-            const reshaped = ArabicReshaper.convertArabic(tok);
-            return reshaped.split('').reverse().join('');
+const reshaped = ArabicReshaper.convertArabic(tok);
+return reshaped;
           } catch (_) {
             return tok;
           }
