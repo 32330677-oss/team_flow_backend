@@ -966,7 +966,7 @@ function shapeArabicAware(str) {
 
     // Falls back to plain "SYP" if no Arabic font is installed yet, so the
     // report never shows garbled currency text.
-    const CURRENCY_LABEL = hasArabicFont ? shapeArabicAware('ل.س') : 'SYP';
+    const CURRENCY_LABEL = hasArabicFont ? shapeArabicAware('ل.س') : 'ل.س';
 
     // ---- Batch header (now also fetches generated_by / finalized_by
     //      names, needed for the signature footer at the bottom) ----
