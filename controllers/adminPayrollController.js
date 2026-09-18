@@ -931,23 +931,33 @@ async function exportPayrollPdf(req, res) {
 
     // Reshapes+reverses ONLY the Arabic-containing runs of a string,
     // e.g. in "1,500 ل.س" only "ل.س" gets touched — "1,500" stays as-is.
-    function shapeArabicAware(str) {
-      const text = String(str ?? '');
-      if (!isArabicText(text) || !hasArabicFont) return text;
-      const tokens = text.match(/[\u0600-\u06FF\s.,،]+|[^\u0600-\u06FF]+/g) || [text];
-      return tokens
-        .map((tok) => {
-          if (!isArabicText(tok)) return tok;
-          if (!ArabicReshaper) return tok; // no shaping lib installed: font still switches below
-          try {
-const reshaped = ArabicReshaper.convertArabic(tok);
-return reshaped;
-          } catch (_) {
-            return tok;
-          }
-        })
-        .join('');
-    }
+function shapeArabicAware(str) {
+  const text = String(str ?? '');
+
+  if (!isArabicText(text) || !hasArabicFont) return text;
+
+  const tokens =
+    text.match(/[\u0600-\u06FF\s.,،]+|[^\u0600-\u06FF]+/g) || [text];
+
+  return tokens
+    .map((tok) => {
+      if (!isArabicText(tok)) return tok;
+      if (!ArabicReshaper) return tok;
+
+      try {
+        const reordered = tok
+          .trim()
+          .split(/\s+/)
+          .reverse()
+          .join(' ');
+
+        return ArabicReshaper.convertArabic(reordered);
+      } catch (_) {
+        return tok;
+      }
+    })
+    .join('');
+}
 
     function fontNameFor(str, bold) {
       if (hasArabicFont && isArabicText(str)) return 'Arabic';
