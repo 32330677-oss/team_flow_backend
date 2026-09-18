@@ -711,7 +711,7 @@ async function exportPayrollExcel(req, res) {
       { header: 'Worker Name', key: 'worker_name', width: 28 },
       { header: 'Sites', key: 'sites', width: 32 },
       { header: 'Net Salary', key: 'net_salary', width: 18 },
-      { header: 'Signature', key: 'signature', width: 18 },
+      { header: 'Signature', key: 'signature', width: 30 },
     ];
 
     summarySheet.mergeCells('A1:F1');
@@ -787,7 +787,7 @@ async function exportPayrollExcel(req, res) {
         { header: 'Base Salary', key: 'base_salary', width: 16 },
         { header: 'Overtime Pay', key: 'overtime_pay', width: 16 },
         { header: 'Site Total', key: 'site_total', width: 16 },
-        { header: 'Signature', key: 'signature', width: 18 },
+        { header: 'Signature', key: 'signature', width: 30 },
       ];
 
       const siteWorkerCount = workerCountBySite.get(siteKey)?.size || 0;
