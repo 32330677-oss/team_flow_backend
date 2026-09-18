@@ -1120,7 +1120,7 @@ if (hasArabicFont) {
   doc.font('Arabic')
     .fontSize(9)
     .fillColor(COLOR_ACCENT)
-   .text(shapeArabicAware(CURRENCY_LABEL), currentX, summaryY - 2, {
+   .text(shapeArabicAware(CURRENCY_LABEL), currentX, summaryY - 4, {
   lineBreak: false,
 });
 } else {
@@ -1366,7 +1366,7 @@ if (hasArabicFont) {
   doc.font('Arabic')
     .fontSize(8)
     .fillColor(COLOR_ACCENT)
-  .text(shapeArabicAware(CURRENCY_LABEL), grandX, grandTotalY - 2, {
+  .text(shapeArabicAware(CURRENCY_LABEL), grandX, grandTotalY - 4, {
   lineBreak: false,
 });
 } else {
