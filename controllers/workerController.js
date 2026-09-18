@@ -334,12 +334,15 @@ exports.updateWorker = async (req, res) => {
             const existing = existingRows[0];
 
             // Does this request touch compensation-sensitive fields?
-            const touchesCompensation =
-                payment_type !== undefined ||
-                daily_rate !== undefined ||
-                regular_hourly_rate !== undefined ||
-                overtime_hourly_rate !== undefined ||
-                (job_position !== undefined && job_position !== existing.job_position);
+const touchesCompensation =
+    payment_type !== undefined ||
+    daily_rate !== undefined ||
+    regular_hourly_rate !== undefined ||
+    overtime_hourly_rate !== undefined ||
+    (
+        job_position !== undefined &&
+        (job_position ?? '') !== (existing.job_position ?? '')
+    );
 
             let newPaymentType = existing.payment_type;
             let newComp = {
