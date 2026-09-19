@@ -711,7 +711,7 @@ async function exportPayrollExcel(req, res) {
       { header: 'Worker Name', key: 'worker_name', width: 28 },
       { header: 'Sites', key: 'sites', width: 32 },
       { header: 'Net Salary', key: 'net_salary', width: 18 },
-      { header: 'Signature', key: 'signature', width: 60 },
+      { header: 'Signature', key: 'signature', width: 80 },
     ];
 
     summarySheet.mergeCells('A1:F1');
