@@ -60,11 +60,26 @@ router.delete('/:assignment_id', authMiddleware, restrictTo('Admin'), async (req
 // هذه عملية إدارية حساسة، يجب أن تكون محصورة بـ 'Admin' فقط
 // 2. إضافة التعيين:
 router.post('/', authMiddleware, restrictTo('Admin'), async (req, res) => {
-    const { worker_id, site_id } = req.body;
+    const { worker_id, site_id, assigned_date } = req.body;
     const assigned_by_user_id = req.user.user_id;
 
     if (!worker_id || !site_id) {
-        return res.status(400).json({ status: 'fail', message: 'الحقول الأساسية ناقصة' });
+        return res.status(400).json({ status: 'fail', message: 'Required fields are missing' });
+    }
+
+    // Optional assignment date (backdated) — if not provided, the behavior remains exactly the same as before (CURDATE()).
+    let effectiveAssignedDate = null;
+    if (assigned_date !== undefined && assigned_date !== null && String(assigned_date).trim() !== '') {
+        const raw = String(assigned_date).trim();
+        const isValidDate = /^\d{4}-\d{2}-\d{2}$/.test(raw) && !Number.isNaN(Date.parse(`${raw}T00:00:00`));
+        if (!isValidDate) {
+            return res.status(400).json({ status: 'fail', message: 'Invalid assigned_date format (YYYY-MM-DD).' });
+        }
+        const todayStr = new Date().toISOString().slice(0, 10);
+        if (raw > todayStr) {
+            return res.status(400).json({ status: 'fail', message: 'assigned_date cannot be a future date.' });
+        }
+        effectiveAssignedDate = raw;
     }
 
     try {
@@ -82,20 +97,37 @@ router.post('/', authMiddleware, restrictTo('Admin'), async (req, res) => {
             if (current.site_id === Number(site_id)) {
                 return res.status(400).json({
                     status: 'fail',
-                    message: `هذا العامل معيّن بالفعل في هذا الموقع (${current.current_site_name || 'الموقع الحالي'}).`
+                    message: `This worker is already assigned to this site (${current.current_site_name || 'current site'}).`
                 });
             }
             return res.status(400).json({
                 status: 'fail',
-                message: `هذا العامل معيّن مسبقاً في موقع "${current.current_site_name || 'غير معروف'}". يجب إنهاء تعيينه من هناك أولاً قبل نقله إلى موقع جديد.`,
+                message: `This worker is already assigned to "${current.current_site_name || 'unknown site'}". You must end the current assignment there before transferring the worker to a new site.`,
                 current_site_id: current.site_id,
                 current_site_name: current.current_site_name
             });
         }
 
+        // The assignment date cannot be earlier than the worker's actual hire date (hire_date).
+        if (effectiveAssignedDate) {
+            const [workerRows] = await db.query('SELECT hire_date FROM workers WHERE worker_id = ? LIMIT 1', [worker_id]);
+            if (workerRows.length === 0) {
+                return res.status(404).json({ status: 'fail', message: 'Worker not found.' });
+            }
+            const hireDateStr = workerRows[0].hire_date
+                ? new Date(workerRows[0].hire_date).toISOString().slice(0, 10)
+                : null;
+            if (hireDateStr && effectiveAssignedDate < hireDateStr) {
+                return res.status(400).json({
+                    status: 'fail',
+                    message: `Assignment date (${effectiveAssignedDate}) cannot be earlier than the worker's hire date (${hireDateStr}).`
+                });
+            }
+        }
+
         const [siteData] = await db.query('SELECT contract_id FROM sites WHERE site_id = ? LIMIT 1', [site_id]);
         if (siteData.length === 0) {
-            return res.status(400).json({ status: 'fail', message: 'الموقع غير موجود' });
+            return res.status(400).json({ status: 'fail', message: 'Site not found' });
         }
         const contract_id = siteData[0].contract_id;
 
@@ -104,16 +136,20 @@ router.post('/', authMiddleware, restrictTo('Admin'), async (req, res) => {
             [result] = await db.query(
                 `INSERT INTO workersiteassignments
                  (worker_id, site_id, contract_id, assigned_by_user_id, assigned_date, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, CURDATE(), NOW(), NOW())`,
-                [worker_id, site_id, contract_id, assigned_by_user_id]
+                 VALUES (?, ?, ?, ?, ?, NOW(), NOW())`,
+                [
+                    worker_id,
+                    site_id,
+                    contract_id,
+                    assigned_by_user_id,
+                    effectiveAssignedDate || new Date().toISOString().slice(0, 10),
+                ]
             );
         } catch (insertError) {
             if (insertError.code === 'ER_DUP_ENTRY' || insertError.errno === 1062) {
-                // Two concurrent requests raced past the SELECT above; the
-                // uq_wsa_active_worker partial-unique index catches it here.
                 return res.status(409).json({
                     status: 'fail',
-                    message: 'هذا العامل تم تعيينه للتو بواسطة طلب آخر متزامن. الرجاء تحديث الصفحة.'
+                    message: 'This worker was just assigned by another concurrent request. Please refresh the page.'
                 });
             }
             throw insertError;
@@ -122,7 +158,7 @@ router.post('/', authMiddleware, restrictTo('Admin'), async (req, res) => {
         res.status(201).json({ status: 'success', data: { assignment_id: result.insertId } });
     } catch (err) {
         console.error('CREATE ASSIGNMENT ERROR:', err);
-        res.status(500).json({ status: 'error', message: 'حدث خطأ في السيرفر أثناء حفظ التعيين.' });
+        res.status(500).json({ status: 'error', message: 'An error occurred on the server while saving the assignment.' });
     }
 });
 
