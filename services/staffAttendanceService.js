@@ -59,20 +59,18 @@ function parseWallClockDateTime(value) {
     return date;
 }
 
-// خصم ساعة غداء واحدة إذا الفترة تقاطعت مع نافذة نهارية (12-13) أو ليلية (23-00)
-function computeLunchDeductionHours(checkInDate, checkOutDate) {
-    const HOUR_MS = 60 * 60 * 1000, DAY_MS = 24 * HOUR_MS;
-    const midnight = new Date(Date.UTC(checkInDate.getUTCFullYear(), checkInDate.getUTCMonth(), checkInDate.getUTCDate()));
-    const overlaps = (aS, aE, bS, bE) => aS < bE && bS < aE;
-
-    const dayStart = new Date(midnight.getTime() + 12 * HOUR_MS);
-    const dayEnd = new Date(midnight.getTime() + 13 * HOUR_MS);
-    const nightStart = new Date(midnight.getTime() + 23 * HOUR_MS);
-    const nightEnd = new Date(midnight.getTime() + DAY_MS);
-
-    if (overlaps(checkInDate, checkOutDate, dayStart, dayEnd)) return 1;
-    if (overlaps(checkInDate, checkOutDate, nightStart, nightEnd)) return 1;
-    return 0;
+// The lunch window is entered explicitly (like workers). No implicit
+// 12:00/23:00 rule is applied. The entered window must be inside the shift;
+// the returned deduction is its actual duration in hours.
+function computeLunchDeductionHours(checkInDate, checkOutDate, lunchStartDate, lunchEndDate) {
+    if (!lunchStartDate && !lunchEndDate) return 0;
+    if (!lunchStartDate || !lunchEndDate || lunchEndDate <= lunchStartDate) {
+        throw new Error('Lunch start and end times must be valid and in order.');
+    }
+    if (lunchStartDate < checkInDate || lunchEndDate > checkOutDate) {
+        throw new Error('Lunch window must be completely inside the check-in/check-out shift.');
+    }
+    return round2((lunchEndDate.getTime() - lunchStartDate.getTime()) / 3600000);
 }
 
 /**
@@ -86,7 +84,7 @@ function computeLunchDeductionHours(checkInDate, checkOutDate) {
  * @param {string} params.recordDate   'YYYY-MM-DD' (تاريخ الدخول = تاريخ سجل الحضور)
  * @param {number} params.standardDailyHours
  */
-function calculateStaffShiftHours({ checkInRaw, checkOutRaw, recordDate, standardDailyHours }) {
+function calculateStaffShiftHours({ checkInRaw, checkOutRaw, lunchStartRaw = null, lunchEndRaw = null, recordDate, standardDailyHours }) {
     const checkIn = parseWallClockDateTime(checkInRaw);
     const checkOut = parseWallClockDateTime(checkOutRaw);
     if (!checkIn || !checkOut) throw new Error('Invalid check-in/check-out time.');
@@ -95,7 +93,9 @@ function calculateStaffShiftHours({ checkInRaw, checkOutRaw, recordDate, standar
     const grossHoursRaw = (checkOut.getTime() - checkIn.getTime()) / 3600000;
     if (grossHoursRaw > 24) throw new Error('Shift duration cannot exceed 24 hours.');
 
-    const lunchHours = computeLunchDeductionHours(checkIn, checkOut);
+    const lunchStart = parseWallClockDateTime(lunchStartRaw);
+    const lunchEnd = parseWallClockDateTime(lunchEndRaw);
+    const lunchHours = computeLunchDeductionHours(checkIn, checkOut, lunchStart, lunchEnd);
     const netHours = Math.max(0, grossHoursRaw - lunchHours);
 
     const standard = Number(standardDailyHours) > 0 ? Number(standardDailyHours) : 8;

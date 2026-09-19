@@ -40,6 +40,8 @@ exports.getDayView = async (req, res) => {
       `SELECT sm.staff_id, sm.staff_unique_id, sm.full_name, sm.position, sm.standard_daily_hours,
               sa.staff_attendance_id, sa.attendance_status, sa.check_in_time, sa.check_out_time,
               sa.regular_hours, sa.overtime_hours, sa.lunch_deducted_hours,
+              sa.lunch_start_time, sa.lunch_end_time,
+              COALESCE(sa.standard_minutes_snapshot, ROUND(sm.standard_daily_hours * 60)) AS standard_minutes_snapshot,
               sa.is_friday_worked, sa.status, sa.admin_rejection_notes
        FROM staff_members sm
        LEFT JOIN staff_attendance sa ON sa.staff_id = sm.staff_id AND sa.record_date = ?
@@ -168,15 +170,15 @@ exports.bulkSetAttendance = async (req, res) => {
         continue;
       }
 
-      const standardHours = Number(
-        staffRows[0].standard_daily_hours || 8
-      );
+      const standardHours = Number(staffRows[0].standard_daily_hours || 8);
 
       let regularHours = 0;
       let overtimeHours = 0;
       let lunchHours = 0;
       let checkIn = null;
       let checkOut = null;
+      let lunchStart = null;
+      let lunchEnd = null;
 
       if (status === 'Present') {
         const rawCheckIn = formatToMySqlDateTime(entry.check_in_time);
@@ -191,10 +193,18 @@ exports.bulkSetAttendance = async (req, res) => {
           continue;
         }
 
+        const rawLunchStart = entry.lunch_start_time ? formatToMySqlDateTime(entry.lunch_start_time) : null;
+        const rawLunchEnd = entry.lunch_end_time ? formatToMySqlDateTime(entry.lunch_end_time) : null;
+        if ((entry.lunch_start_time && !rawLunchStart) || (entry.lunch_end_time && !rawLunchEnd)) {
+          results.skipped.push({ staff_id: staffId, reason: 'Invalid lunch start/end time.' });
+          continue;
+        }
         try {
           const shift = calculateStaffShiftHours({
             checkInRaw: rawCheckIn,
             checkOutRaw: rawCheckOut,
+            lunchStartRaw: rawLunchStart,
+            lunchEndRaw: rawLunchEnd,
             recordDate: record_date,
             standardDailyHours: standardHours,
           });
@@ -204,6 +214,8 @@ exports.bulkSetAttendance = async (req, res) => {
           lunchHours = shift.lunchHours;
           checkIn = rawCheckIn;
           checkOut = rawCheckOut;
+          lunchStart = rawLunchStart;
+          lunchEnd = rawLunchEnd;
         } catch (shiftError) {
           results.skipped.push({
             staff_id: staffId,
@@ -226,10 +238,13 @@ exports.bulkSetAttendance = async (req, res) => {
            regular_hours,
            overtime_hours,
            lunch_deducted_hours,
+           lunch_start_time,
+           lunch_end_time,
            is_friday_worked,
            friday_confirmed_by_user_id,
            recorded_by_user_id,
            admin_rejection_notes,
+           standard_minutes_snapshot,
            status
          FROM staff_attendance
          WHERE staff_id = ? AND record_date = ?
@@ -252,22 +267,29 @@ exports.bulkSetAttendance = async (req, res) => {
       if (existing.length > 0) {
         const existingRecord = existing[0];
 
-        if (existingRecord.status === 'Approved') {
+        if (existingRecord.status === 'Approved' || existingRecord.status === 'Submitted') {
           results.skipped.push({
             staff_id: staffId,
-            reason: 'Already approved by Admin; cannot modify.'
+            reason: existingRecord.status === 'Approved'
+              ? 'Already approved by Admin; cannot modify.'
+              : 'Already submitted for review; cannot modify until Admin rejects it.'
           });
           continue;
         }
 
-        // A record that is already waiting for the admin must not silently
-        // disappear from the admin queue by being turned back into a draft.
-        if (isDraftMode && existingRecord.status === 'Submitted') {
-          results.skipped.push({
-            staff_id: staffId,
-            reason: 'Already submitted for review. Use Submit to update it.'
+        const snapshotMinutes = Number(existingRecord.standard_minutes_snapshot) > 0
+          ? Number(existingRecord.standard_minutes_snapshot)
+          : Math.round(standardHours * 60);
+        if (status === 'Present' && checkIn && checkOut && existingRecord.standard_minutes_snapshot) {
+          const historicalShift = calculateStaffShiftHours({
+            checkInRaw: checkIn,
+            checkOutRaw: checkOut,
+            recordDate: record_date,
+            standardDailyHours: snapshotMinutes / 60,
           });
-          continue;
+          regularHours = historicalShift.regularHours;
+          overtimeHours = historicalShift.overtimeHours;
+          lunchHours = historicalShift.lunchHours;
         }
 
         const oldValues = {
@@ -284,8 +306,10 @@ exports.bulkSetAttendance = async (req, res) => {
           is_friday_worked: Number(
             existingRecord.is_friday_worked || 0
           ),
-          friday_confirmed_by_user_id:
-            existingRecord.friday_confirmed_by_user_id,
+          friday_confirmed_by_user_id: existingRecord.friday_confirmed_by_user_id,
+          standard_minutes_snapshot: existingRecord.standard_minutes_snapshot,
+          lunch_start_time: existingRecord.lunch_start_time,
+          lunch_end_time: existingRecord.lunch_end_time,
         };
 
         const newValues = {
@@ -299,11 +323,17 @@ exports.bulkSetAttendance = async (req, res) => {
           lunch_deducted_hours: Number(lunchHours.toFixed(2)),
           is_friday_worked: isFridayWorked,
           friday_confirmed_by_user_id: fridayConfirmedBy,
+          standard_minutes_snapshot: snapshotMinutes,
+          lunch_start_time: lunchStart,
+          lunch_end_time: lunchEnd,
         };
 
         // Audit only when something meaningful changed (data OR workflow status).
         const attendanceChanged =
           oldValues.status !== newValues.status ||
+          Number(oldValues.standard_minutes_snapshot || 0) !== Number(newValues.standard_minutes_snapshot || 0) ||
+          String(oldValues.lunch_start_time || '') !== String(newValues.lunch_start_time || '') ||
+          String(oldValues.lunch_end_time || '') !== String(newValues.lunch_end_time || '') ||
           oldValues.attendance_status !== newValues.attendance_status ||
           String(oldValues.check_in_time || '') !==
             String(newValues.check_in_time || '') ||
@@ -330,7 +360,8 @@ exports.bulkSetAttendance = async (req, res) => {
           `UPDATE staff_attendance
            SET attendance_status = ?, check_in_time = ?, check_out_time = ?,
                regular_hours = ?, overtime_hours = ?, lunch_deducted_hours = ?,
-               is_friday_worked = ?, friday_confirmed_by_user_id = ?,
+               is_friday_worked = ?, friday_confirmed_by_user_id = ?, standard_minutes_snapshot = ?,
+               lunch_start_time = ?, lunch_end_time = ?,
                status = ?, recorded_by_user_id = ?,
                admin_rejection_notes = ?, approved_by_user_id = NULL, approval_date = NULL
            WHERE staff_attendance_id = ?`,
@@ -343,6 +374,9 @@ exports.bulkSetAttendance = async (req, res) => {
             lunchHours.toFixed(2),
             isFridayWorked,
             fridayConfirmedBy,
+            snapshotMinutes,
+            lunchStart,
+            lunchEnd,
             targetStatus,
             supervisorId,
             rejectionNotes,
@@ -388,9 +422,10 @@ exports.bulkSetAttendance = async (req, res) => {
           `INSERT INTO staff_attendance
              (staff_id, record_date, attendance_status, check_in_time, check_out_time,
               regular_hours, overtime_hours, lunch_deducted_hours,
-              is_friday_worked, friday_confirmed_by_user_id,
+              is_friday_worked, friday_confirmed_by_user_id, standard_minutes_snapshot,
+              lunch_start_time, lunch_end_time,
               recorded_by_user_id, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             staffId,
             record_date,
@@ -402,6 +437,9 @@ exports.bulkSetAttendance = async (req, res) => {
             lunchHours.toFixed(2),
             isFridayWorked,
             fridayConfirmedBy,
+            Math.round(standardHours * 60),
+            lunchStart,
+            lunchEnd,
             supervisorId,
             targetStatus,
           ]

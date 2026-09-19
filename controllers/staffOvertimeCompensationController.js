@@ -140,7 +140,8 @@ exports.grantCompensation = async (req, res) => {
 
     const [targetRows] = await connection.execute(
       `SELECT sa.staff_attendance_id, sa.staff_id, sa.record_date, sa.attendance_status,
-              sa.status, sa.regular_hours, sm.standard_daily_hours
+              sa.status, sa.regular_hours,
+              COALESCE(sa.standard_minutes_snapshot, ROUND(sm.standard_daily_hours * 60)) AS standard_minutes_snapshot
        FROM staff_attendance sa
        JOIN staff_members sm ON sm.staff_id = sa.staff_id
        WHERE sa.staff_attendance_id = ? FOR UPDATE`,
@@ -159,7 +160,9 @@ exports.grantCompensation = async (req, res) => {
 
     const recordDateStr = String(target.record_date).slice(0, 10);
     const payrollMonth = recordDateStr.slice(0, 7);
-    const standardHours = Number(target.standard_daily_hours) > 0 ? Number(target.standard_daily_hours) : 8;
+    const standardHours = Number(target.standard_minutes_snapshot) > 0
+      ? Number(target.standard_minutes_snapshot) / 60
+      : 8;
     const dayShortfall = Math.max(0, standardHours - Number(target.regular_hours || 0));
 
     if (dayShortfall <= 0) {
@@ -291,7 +294,8 @@ exports.getShortfallDays = async (req, res) => {
   try {
     const { start, end } = monthBounds(month);
     const [rows] = await db.execute(
-      `SELECT sa.staff_attendance_id, sa.record_date, sa.regular_hours, sm.standard_daily_hours
+      `SELECT sa.staff_attendance_id, sa.record_date, sa.regular_hours,
+              COALESCE(sa.standard_minutes_snapshot, ROUND(sm.standard_daily_hours * 60)) AS standard_minutes_snapshot
        FROM staff_attendance sa
        JOIN staff_members sm ON sm.staff_id = sa.staff_id
        WHERE sa.staff_id = ? AND sa.status = 'Approved' AND sa.attendance_status = 'Present'
@@ -310,7 +314,9 @@ exports.getShortfallDays = async (req, res) => {
     const data = rows
       .filter((r) => !isFriday(r.record_date))
       .map((r) => {
-        const standard = Number(r.standard_daily_hours) > 0 ? Number(r.standard_daily_hours) : 8;
+        const standard = Number(r.standard_minutes_snapshot) > 0
+          ? Number(r.standard_minutes_snapshot) / 60
+          : 8;
         const shortfall = Math.max(0, standard - Number(r.regular_hours || 0));
         const used = usedMap.get(r.staff_attendance_id) || 0;
         return {

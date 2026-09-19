@@ -104,11 +104,11 @@ const calendarDates = employmentSpans
     .flatMap((span) => listNonFridayDates(span.start, span.end))
     .sort();
 const requiredDays = calendarDates.length;
-const requiredHours = round2(requiredDays * standardDailyHours);
-if (requiredHours <= 0) continue; // لا يوجد أي يوم عمل بهالفترة لهالموظف
+if (requiredDays <= 0) continue; // لا يوجد أي يوم عمل بهالفترة لهالموظف
 const [records] = await connection.execute(
     `SELECT staff_attendance_id, record_date, attendance_status, is_paid,
-            is_management_paid_absence, regular_hours, overtime_hours, is_friday_worked
+            is_management_paid_absence, regular_hours, overtime_hours, is_friday_worked,
+            standard_minutes_snapshot
      FROM staff_attendance
      WHERE staff_id = ? AND record_date BETWEEN ? AND ? AND status = 'Approved'`,
     [staff.staff_id, effectiveStart, effectiveEnd]
@@ -124,6 +124,22 @@ const recordsByDate = new Map();
 for (const record of records) {
     recordsByDate.set(String(record.record_date).slice(0, 10), record);
 }
+// Each attendance row carries the required-hours rule used when it was
+// recorded. This prevents a later profile edit from changing old payroll
+// calculations. Missing/legacy rows safely fall back to the current profile.
+const standardHoursByDate = new Map();
+for (const dateStr of calendarDates) {
+    const record = recordsByDate.get(dateStr);
+    const snapshotMinutes = Number(record?.standard_minutes_snapshot);
+    standardHoursByDate.set(
+        dateStr,
+        snapshotMinutes > 0 ? snapshotMinutes / 60 : standardDailyHours
+    );
+}
+const requiredHours = round2(
+    calendarDates.reduce((sum, dateStr) => sum + standardHoursByDate.get(dateStr), 0)
+);
+if (requiredHours <= 0) continue;
 
 let actualRegularRaw = 0;        // ساعات محسوبة ضمن المطلوب (حضور فعلي + إجازات مدفوعة)
 let workedDayShortfall = 0;      // نقص فقط بأيام حضر فيها الموظف فعليًا -> هاي وحدها تغطّى بالـ OT
@@ -146,36 +162,37 @@ for (const record of records) {
 
 for (const dateStr of calendarDates) {
     const record = recordsByDate.get(dateStr);
+    const dailyStandardHours = standardHoursByDate.get(dateStr) || standardDailyHours;
 
     if (!record) {
         // ما في ولا سجل معتمد لهالتاريخ (سواء ما انسجل أصلاً، أو لسا
         // Submitted/Rejected ومش Approved بعد) -> غياب غير مدفوع تلقائيًا.
         // لا يُغطى من الأوفر تايم إطلاقًا.
-        absenceShortfall += standardDailyHours;
+        absenceShortfall += dailyStandardHours;
         unpaidAbsenceDays += 1;
         continue;
     }
 
     if (record.attendance_status === 'Present') {
         const regHours = Number(record.regular_hours || 0);
-        workedDayShortfall += Math.max(0, standardDailyHours - regHours);
+        workedDayShortfall += Math.max(0, dailyStandardHours - regHours);
         actualRegularRaw += regHours;
         dailyOtEarned += Number(record.overtime_hours || 0);
         presentDaysCount += 1;
     } else if (record.attendance_status === 'Absent') {
         if (Number(record.is_management_paid_absence) === 1) {
-            actualRegularRaw += standardDailyHours;
+            actualRegularRaw += dailyStandardHours;
             managementPaidDays += 1;
         } else {
-            absenceShortfall += standardDailyHours;   // ← لا يُغطى من الـ OT
+            absenceShortfall += dailyStandardHours;   // ← لا يُغطى من الـ OT
             unpaidAbsenceDays += 1;
         }
     } else if (paidLeaveTypes.includes(record.attendance_status) && Number(record.is_paid) === 1) {
-        actualRegularRaw += standardDailyHours;
+        actualRegularRaw += dailyStandardHours;
         paidLeaveDays += 1;
     } else {
         // إجازة من نوع غير مدرج بـ paid_leave_types، أو is_paid = 0
-        absenceShortfall += standardDailyHours;        // ← لا يُغطى من الـ OT
+        absenceShortfall += dailyStandardHours;        // ← لا يُغطى من الـ OT
         unpaidAbsenceDays += 1;
     }
 }
