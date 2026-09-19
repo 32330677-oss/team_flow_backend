@@ -711,7 +711,7 @@ async function exportPayrollExcel(req, res) {
       { header: 'Worker Name', key: 'worker_name', width: 28 },
       { header: 'Sites', key: 'sites', width: 32 },
       { header: 'Net Salary', key: 'net_salary', width: 18 },
-      { header: 'Signature', key: 'signature', width: 30 },
+      { header: 'Signature', key: 'signature', width: 60 },
     ];
 
     summarySheet.mergeCells('A1:F1');
@@ -734,18 +734,19 @@ async function exportPayrollExcel(req, res) {
 
     let grandTotalNet = 0;
     let idx = 0;
-    for (const worker of byWorker.values()) {
-      idx += 1;
-      summarySheet.addRow({
+ for (const worker of byWorker.values()) {
+    idx += 1;
+    const row = summarySheet.addRow({
         number: idx,
         worker_id: worker.worker_unique_id,
         worker_name: worker.worker_name,
         sites: [...worker.sites].join(', '),
         net_salary: worker.net_salary,
         signature: '',
-      });
-      grandTotalNet += worker.net_salary;
-    }
+    });
+    row.height = 40; // مساحة كافية لبصمة إصبع بدل الارتفاع الافتراضي الصغير
+    grandTotalNet += worker.net_salary;
+}
     const summaryTotalRow = summarySheet.addRow({
       worker_name: 'GRAND TOTAL',
       net_salary: Math.round(grandTotalNet * 100) / 100,
@@ -758,7 +759,16 @@ async function exportPayrollExcel(req, res) {
       summarySheet.getCell(r, 5).numFmt = '#,##0 "ل.س"';
     }
     summarySheet.views = [{ state: 'frozen', ySplit: 5 }];
-
+for (let r = 6; r <= summarySheet.rowCount; r += 1) {
+    summarySheet.getCell(r, 6).alignment = { vertical: 'middle', horizontal: 'center' };
+    // حد سفلي/علوي للخلية يعطي إحساس بصندوق التوقيع
+    summarySheet.getCell(r, 6).border = {
+        top: { style: 'thin', color: { argb: 'FFDDDDDD' } },
+        bottom: { style: 'thin', color: { argb: 'FFDDDDDD' } },
+        left: { style: 'thin', color: { argb: 'FFDDDDDD' } },
+        right: { style: 'thin', color: { argb: 'FFDDDDDD' } },
+    };
+}
     // ---------------- One worksheet per site ----------------
     const usedNames = new Set(['Summary']);
     for (const [siteKey, { siteName, rows: siteRows }] of bySite.entries()) {
