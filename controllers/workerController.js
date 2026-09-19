@@ -221,7 +221,6 @@ exports.bulkUpdateCompensation = async (req, res) => {
 
 
 
-// 2. إضافة عامل جديد (مع الراتب من أول يوم)
 exports.createWorker = async (req, res) => {
     const {
         full_name, phone_number, nationality, job_position, hire_date, notes,
@@ -247,6 +246,23 @@ exports.createWorker = async (req, res) => {
     const connection = await db.getConnection();
     try {
         await connection.beginTransaction();
+
+        // 🔒 حماية ضد الضغط المزدوج / إعادة الإرسال: إذا فيه عامل بنفس
+        // الاسم ورقم الهاتف انضاف خلال آخر 15 ثانية، ارفض الطلب الثاني.
+        const [dupRows] = await connection.execute(
+            `SELECT worker_id FROM workers
+             WHERE full_name = ? AND phone_number <=> ?
+               AND created_at >= (NOW() - INTERVAL 15 SECOND)
+             LIMIT 1 FOR UPDATE`,
+            [full_name, phone_number || null]
+        );
+        if (dupRows.length > 0) {
+            await connection.rollback();
+            return res.status(409).json({
+                status: 'error',
+                message: 'يبدو أن هذا العامل تمت إضافته للتو. تحقق من قائمة العمال قبل إعادة المحاولة.'
+            });
+        }
 
         const [result] = await connection.execute(
             `INSERT INTO workers (
