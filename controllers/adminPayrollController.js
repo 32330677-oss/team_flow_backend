@@ -744,7 +744,7 @@ async function exportPayrollExcel(req, res) {
         net_salary: worker.net_salary,
         signature: '',
     });
-    row.height = 40; // مساحة كافية لبصمة إصبع بدل الارتفاع الافتراضي الصغير
+    row.height = 65; // مساحة كافية لبصمة إصبع بدل الارتفاع الافتراضي الصغير
     grandTotalNet += worker.net_salary;
 }
     const summaryTotalRow = summarySheet.addRow({
