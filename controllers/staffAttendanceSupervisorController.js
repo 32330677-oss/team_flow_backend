@@ -6,6 +6,12 @@ const {
   calculateStaffShiftHours,
 } = require('../services/staffAttendanceService');
 
+const ATTENDANCE_STATUSES = ['Present', 'Absent', 'Sick', 'Vacation', 'Holiday'];
+
+// 'draft'  -> saved in DB with status 'Draft' (invisible to admin, ignored by payroll)
+// 'submit' -> status 'Submitted' (goes to the admin review queue) — the ORIGINAL behavior
+const SAVE_MODES = ['draft', 'submit'];
+
 function formatToMySqlDateTime(value) {
   if (!value) return null;
   const match = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?$/.exec(String(value));
@@ -16,6 +22,8 @@ function formatToMySqlDateTime(value) {
 }
 
 // GET /api/staff-attendance/supervisor/day?date=YYYY-MM-DD
+// Returns every assigned active staff member with their record (if any) for that
+// date, including Draft records, so the supervisor sees what was saved earlier.
 exports.getDayView = async (req, res) => {
   const { date } = req.query;
   if (!isValidDateOnly(date)) {
@@ -51,12 +59,24 @@ exports.getDayView = async (req, res) => {
 };
 
 // POST /api/staff-attendance/supervisor/bulk-set
-// body: { record_date, entries: [{ staff_id, attendance_status, check_in_time, check_out_time, friday_confirmed }] }
+// body: {
+//   record_date,
+//   mode: 'draft' | 'submit'   (optional, default 'submit' = previous behavior),
+//   entries: [{ staff_id, attendance_status, check_in_time, check_out_time, friday_confirmed }]
+// }
 //
-// friday_confirmed must be explicitly true for any entry with
-// attendance_status = 'Present' when record_date falls on a Friday.
-// This never enables Friday for everyone — it is evaluated per entry, so
-// several staff members can independently be confirmed for the same Friday.
+// Only the staff members listed in `entries` are touched. Everything else that was
+// saved earlier for the same date is left exactly as it is.
+//
+// State rules:
+//   - Approved                -> locked, always skipped.
+//   - mode 'draft'  on Submitted -> skipped (already with the admin; use Submit to update it).
+//   - mode 'draft'  on Draft / Rejected / no record -> saved as Draft.
+//   - mode 'submit' on anything not Approved -> saved as Submitted.
+//
+// friday_confirmed must be explicitly true for any 'Present' entry when
+// record_date falls on a Friday (in BOTH modes, because the flag is stored on the
+// record and payroll depends on it).
 exports.bulkSetAttendance = async (req, res) => {
   const { record_date, entries } = req.body || {};
   const supervisorId = req.user.user_id;
@@ -75,15 +95,26 @@ exports.bulkSetAttendance = async (req, res) => {
     });
   }
 
-  const ATTENDANCE_STATUSES = ['Present', 'Absent', 'Sick', 'Vacation', 'Holiday'];
+  const requestedMode = req.body?.mode;
+  if (requestedMode !== undefined && !SAVE_MODES.includes(requestedMode)) {
+    return res.status(400).json({
+      status: 'error',
+      message: `mode must be one of: ${SAVE_MODES.join(', ')}.`
+    });
+  }
+  const mode = requestedMode || 'submit';
+  const isDraftMode = mode === 'draft';
+  const targetStatus = isDraftMode ? 'Draft' : 'Submitted';
+
   const dayIsFriday = isFriday(record_date);
-  const assignedIds = await getAssignedStaffIdsForSupervisor(supervisorId);
-  const assignedSet = new Set(assignedIds);
 
   const connection = await db.getConnection();
   const results = { updated: [], skipped: [] };
 
   try {
+    const assignedIds = await getAssignedStaffIdsForSupervisor(supervisorId, connection);
+    const assignedSet = new Set(assignedIds);
+
     await connection.beginTransaction();
 
     for (const entry of entries) {
@@ -184,9 +215,7 @@ exports.bulkSetAttendance = async (req, res) => {
 
       /*
        * Get the existing attendance row and lock it.
-       * We keep the old values because they are needed for:
-       * 1. detecting whether anything actually changed
-       * 2. creating an accurate audit record
+       * Old values are kept for change detection and for an accurate audit record.
        */
       const [existing] = await connection.execute(
         `SELECT
@@ -200,6 +229,7 @@ exports.bulkSetAttendance = async (req, res) => {
            is_friday_worked,
            friday_confirmed_by_user_id,
            recorded_by_user_id,
+           admin_rejection_notes,
            status
          FROM staff_attendance
          WHERE staff_id = ? AND record_date = ?
@@ -230,12 +260,19 @@ exports.bulkSetAttendance = async (req, res) => {
           continue;
         }
 
-        /*
-         * Keep the values that matter for attendance history.
-         * We intentionally do NOT audit internal approval fields here.
-         */
+        // A record that is already waiting for the admin must not silently
+        // disappear from the admin queue by being turned back into a draft.
+        if (isDraftMode && existingRecord.status === 'Submitted') {
+          results.skipped.push({
+            staff_id: staffId,
+            reason: 'Already submitted for review. Use Submit to update it.'
+          });
+          continue;
+        }
+
         const oldValues = {
           record_date,
+          status: existingRecord.status,
           attendance_status: existingRecord.attendance_status,
           check_in_time: existingRecord.check_in_time,
           check_out_time: existingRecord.check_out_time,
@@ -253,6 +290,7 @@ exports.bulkSetAttendance = async (req, res) => {
 
         const newValues = {
           record_date,
+          status: targetStatus,
           attendance_status: status,
           check_in_time: checkIn,
           check_out_time: checkOut,
@@ -263,13 +301,9 @@ exports.bulkSetAttendance = async (req, res) => {
           friday_confirmed_by_user_id: fridayConfirmedBy,
         };
 
-        /*
-         * Compare only the attendance values.
-         * If absolutely nothing changed, we still keep the existing
-         * behavior of resubmitting the record, but we DO NOT create
-         * a useless audit record.
-         */
+        // Audit only when something meaningful changed (data OR workflow status).
         const attendanceChanged =
+          oldValues.status !== newValues.status ||
           oldValues.attendance_status !== newValues.attendance_status ||
           String(oldValues.check_in_time || '') !==
             String(newValues.check_in_time || '') ||
@@ -286,13 +320,19 @@ exports.bulkSetAttendance = async (req, res) => {
           Number(oldValues.friday_confirmed_by_user_id || 0) !==
             Number(newValues.friday_confirmed_by_user_id || 0);
 
+        // Submitting clears the old rejection note (original behavior).
+        // Saving a draft keeps it, so the supervisor still sees why it was rejected.
+        const rejectionNotes = isDraftMode
+          ? existingRecord.admin_rejection_notes
+          : null;
+
         await connection.execute(
           `UPDATE staff_attendance
            SET attendance_status = ?, check_in_time = ?, check_out_time = ?,
                regular_hours = ?, overtime_hours = ?, lunch_deducted_hours = ?,
                is_friday_worked = ?, friday_confirmed_by_user_id = ?,
-               status = 'Submitted', recorded_by_user_id = ?,
-               admin_rejection_notes = NULL, approved_by_user_id = NULL, approval_date = NULL
+               status = ?, recorded_by_user_id = ?,
+               admin_rejection_notes = ?, approved_by_user_id = NULL, approval_date = NULL
            WHERE staff_attendance_id = ?`,
           [
             status,
@@ -303,22 +343,31 @@ exports.bulkSetAttendance = async (req, res) => {
             lunchHours.toFixed(2),
             isFridayWorked,
             fridayConfirmedBy,
+            targetStatus,
             supervisorId,
+            rejectionNotes,
             existingRecord.staff_attendance_id,
           ]
         );
 
-        /*
-         * Create an audit record ONLY when attendance data actually changed.
-         */
         if (attendanceChanged) {
+          let actionType;
+          if (isDraftMode) {
+            actionType = 'SUPERVISOR_ATTENDANCE_DRAFT_SAVED';
+          } else if (existingRecord.status === 'Draft') {
+            actionType = 'SUPERVISOR_ATTENDANCE_SUBMITTED';
+          } else {
+            actionType = 'SUPERVISOR_ATTENDANCE_UPDATED';
+          }
+
           await connection.execute(
             `INSERT INTO auditlogs
                (table_name, record_id, action_type, user_id, old_values, new_values)
              VALUES
-               ('staff_attendance', ?, 'SUPERVISOR_ATTENDANCE_UPDATED', ?, ?, ?)`,
+               ('staff_attendance', ?, ?, ?, ?, ?)`,
             [
               existingRecord.staff_attendance_id,
+              actionType,
               supervisorId,
               JSON.stringify(oldValues),
               JSON.stringify(newValues),
@@ -341,7 +390,7 @@ exports.bulkSetAttendance = async (req, res) => {
               regular_hours, overtime_hours, lunch_deducted_hours,
               is_friday_worked, friday_confirmed_by_user_id,
               recorded_by_user_id, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Submitted')`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             staffId,
             record_date,
@@ -354,26 +403,27 @@ exports.bulkSetAttendance = async (req, res) => {
             isFridayWorked,
             fridayConfirmedBy,
             supervisorId,
+            targetStatus,
           ]
         );
 
         const staffAttendanceId = insertResult.insertId;
 
-        /*
-         * New attendance gets its own audit record.
-         * old_values = NULL because there was no previous record.
-         */
         await connection.execute(
           `INSERT INTO auditlogs
              (table_name, record_id, action_type, user_id, old_values, new_values)
            VALUES
-             ('staff_attendance', ?, 'SUPERVISOR_ATTENDANCE_CREATED', ?, NULL, ?)`,
+             ('staff_attendance', ?, ?, ?, NULL, ?)`,
           [
             staffAttendanceId,
+            isDraftMode
+              ? 'SUPERVISOR_ATTENDANCE_DRAFT_SAVED'
+              : 'SUPERVISOR_ATTENDANCE_CREATED',
             supervisorId,
             JSON.stringify({
               staff_id: staffId,
               record_date,
+              status: targetStatus,
               attendance_status: status,
               check_in_time: checkIn,
               check_out_time: checkOut,
@@ -394,11 +444,14 @@ exports.bulkSetAttendance = async (req, res) => {
 
     res.status(200).json({
       status: 'success',
-      message: `${results.updated.length} record(s) submitted for review.`,
+      mode,
+      message: isDraftMode
+        ? `${results.updated.length} record(s) saved as draft.`
+        : `${results.updated.length} record(s) submitted for review.`,
       data: results
     });
   } catch (error) {
-    await connection.rollback();
+    try { await connection.rollback(); } catch (_) {}
 
     console.error(
       'SUPERVISOR BULK SET STAFF ATTENDANCE ERROR:',
@@ -407,7 +460,135 @@ exports.bulkSetAttendance = async (req, res) => {
 
     res.status(500).json({
       status: 'error',
-      message: 'Failed to submit staff attendance.'
+      message: isDraftMode
+        ? 'Failed to save staff attendance draft.'
+        : 'Failed to submit staff attendance.'
+    });
+  } finally {
+    connection.release();
+  }
+};
+
+// POST /api/staff-attendance/supervisor/submit-drafts
+// body: { record_date, staff_ids?: number[] }
+//
+// Turns every Draft record of the given date (for staff assigned to this supervisor)
+// into 'Submitted' so it enters the admin review queue. If staff_ids is provided,
+// only those staff members are submitted. Records that are not Draft are never touched.
+exports.submitDrafts = async (req, res) => {
+  const { record_date, staff_ids } = req.body || {};
+  const supervisorId = req.user.user_id;
+
+  if (!isValidDateOnly(record_date)) {
+    return res.status(400).json({
+      status: 'error',
+      message: 'A valid record_date (YYYY-MM-DD) is required.'
+    });
+  }
+
+  let requestedIds = null;
+  if (staff_ids !== undefined && staff_ids !== null) {
+    if (!Array.isArray(staff_ids)) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'staff_ids must be an array.'
+      });
+    }
+    requestedIds = [...new Set(staff_ids.map(Number))]
+      .filter((id) => Number.isInteger(id) && id > 0);
+    if (requestedIds.length === 0) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'No valid staff ids provided.'
+      });
+    }
+  }
+
+  const connection = await db.getConnection();
+  try {
+    const assignedIds = await getAssignedStaffIdsForSupervisor(supervisorId, connection);
+    const assignedSet = new Set(assignedIds);
+    const targetIds = requestedIds
+      ? requestedIds.filter((id) => assignedSet.has(id))
+      : assignedIds;
+
+    if (targetIds.length === 0) {
+      return res.status(200).json({
+        status: 'success',
+        message: '0 draft(s) submitted for review.',
+        data: { submitted: [] }
+      });
+    }
+
+    await connection.beginTransaction();
+
+    const placeholders = targetIds.map(() => '?').join(',');
+    const [drafts] = await connection.execute(
+      `SELECT staff_attendance_id, staff_id
+       FROM staff_attendance
+       WHERE record_date = ?
+         AND status = 'Draft'
+         AND staff_id IN (${placeholders})
+       FOR UPDATE`,
+      [record_date, ...targetIds]
+    );
+
+    if (drafts.length === 0) {
+      await connection.rollback();
+      return res.status(200).json({
+        status: 'success',
+        message: '0 draft(s) submitted for review.',
+        data: { submitted: [] }
+      });
+    }
+
+    const attendanceIds = drafts.map((d) => d.staff_attendance_id);
+    const idPlaceholders = attendanceIds.map(() => '?').join(',');
+
+    await connection.execute(
+      `UPDATE staff_attendance
+       SET status = 'Submitted',
+           admin_rejection_notes = NULL,
+           approved_by_user_id = NULL,
+           approval_date = NULL
+       WHERE staff_attendance_id IN (${idPlaceholders})
+         AND status = 'Draft'`,
+      attendanceIds
+    );
+
+    for (const draft of drafts) {
+      await connection.execute(
+        `INSERT INTO auditlogs
+           (table_name, record_id, action_type, user_id, old_values, new_values)
+         VALUES
+           ('staff_attendance', ?, 'SUPERVISOR_ATTENDANCE_SUBMITTED', ?, ?, ?)`,
+        [
+          draft.staff_attendance_id,
+          supervisorId,
+          JSON.stringify({ status: 'Draft' }),
+          JSON.stringify({
+            status: 'Submitted',
+            staff_id: draft.staff_id,
+            record_date,
+            source: 'submit_drafts',
+          }),
+        ]
+      );
+    }
+
+    await connection.commit();
+
+    return res.status(200).json({
+      status: 'success',
+      message: `${drafts.length} draft(s) submitted for review.`,
+      data: { submitted: drafts.map((d) => d.staff_id) }
+    });
+  } catch (error) {
+    try { await connection.rollback(); } catch (_) {}
+    console.error('SUBMIT STAFF ATTENDANCE DRAFTS ERROR:', error);
+    return res.status(500).json({
+      status: 'error',
+      message: 'Failed to submit staff attendance drafts.'
     });
   } finally {
     connection.release();
