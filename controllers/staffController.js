@@ -1,4 +1,5 @@
 const db = require('../config/db');
+const { acquireCreateLock, releaseCreateLock } = require('../middleware/duplicateGuard');
 
 const DEFAULT_DAILY_HOURS = 8.00;
 
@@ -34,7 +35,7 @@ exports.getAllStaff = async (req, res) => {
     }
 };
 
-// 2. Create a new staff member
+
 exports.createStaff = async (req, res) => {
     const {
         full_name, phone_number, position,
@@ -58,7 +59,17 @@ exports.createStaff = async (req, res) => {
     }
 
     const connection = await db.getConnection();
+    const lockKey = `create_staff:${full_name}:${phone_number || ''}`;
+
     try {
+        const locked = await acquireCreateLock(connection, lockKey, 5);
+        if (!locked) {
+            return res.status(409).json({
+                status: 'error',
+                message: 'A similar request is already being processed. Please check the staff list before retrying.'
+            });
+        }
+
         await connection.beginTransaction();
 
         if (site_id) {
@@ -68,7 +79,21 @@ exports.createStaff = async (req, res) => {
             }
         }
 
-         const effectiveHireDate = hire_date || null;
+        const [dupRows] = await connection.execute(
+            `SELECT staff_id FROM staff_members
+             WHERE full_name = ? AND phone_number <=> ?
+               AND created_at >= (NOW() - INTERVAL 15 SECOND)
+             LIMIT 1`,
+            [full_name, phone_number || null]
+        );
+        if (dupRows.length > 0) {
+            throw Object.assign(
+                new Error('This staff member appears to have just been added. Check the staff list before retrying.'),
+                { isOperational: true, statusCode: 409 }
+            );
+        }
+
+        const effectiveHireDate = hire_date || null;
 
         const [staffResult] = await connection.query(
             `INSERT INTO staff_members
@@ -80,9 +105,9 @@ exports.createStaff = async (req, res) => {
                 effectiveHireDate, effectiveHireDate, numericSalary, numericDailyHours, parsePaidLeaveTypes(paid_leave_types)
             ]
         );
-const newStaffId = staffResult.insertId;
-const staffUniqueId = `STF-${10000 + newStaffId}`;
-await connection.query('UPDATE staff_members SET staff_unique_id = ? WHERE staff_id = ?', [staffUniqueId, newStaffId]);
+        const newStaffId = staffResult.insertId;
+        const staffUniqueId = `STF-${10000 + newStaffId}`;
+        await connection.query('UPDATE staff_members SET staff_unique_id = ? WHERE staff_id = ?', [staffUniqueId, newStaffId]);
 
         await connection.commit();
 
@@ -94,12 +119,13 @@ await connection.query('UPDATE staff_members SET staff_unique_id = ? WHERE staff
     } catch (error) {
         await connection.rollback();
         console.error('CREATE STAFF ERROR:', error);
-        const status = error.isOperational ? 400 : 500;
+        const status = error.statusCode || (error.isOperational ? 400 : 500);
         return res.status(status).json({
             status: 'error',
             message: error.isOperational ? error.message : 'Server error while adding the staff member'
         });
     } finally {
+        await releaseCreateLock(connection, lockKey);
         connection.release();
     }
 };

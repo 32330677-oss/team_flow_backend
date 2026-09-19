@@ -27,21 +27,35 @@ exports.createTransferRequest = async (req, res) => {
             }
         }
 
-        const [existing] = await db.query(
-            `SELECT request_id FROM worker_transfer_requests WHERE worker_id = ? AND status = 'Pending'`,
-            [worker_id]
-        );
-        if (existing.length > 0) {
-            return res.status(400).json({ status: 'error', message: 'A pending transfer request already exists for this worker.' });
-        }
+const [existing] = await db.query(
+    `SELECT request_id FROM worker_transfer_requests WHERE worker_id = ? AND status = 'Pending'`,
+    [worker_id]
+);
+if (existing.length > 0) {
+    return res.status(400).json({ status: 'error', message: 'A pending transfer request already exists for this worker.' });
+}
 
-        const [result] = await db.query(
-            `INSERT INTO worker_transfer_requests
-             (worker_id, current_site_id, target_site_id, requested_by_user_id, status, admin_notes, created_at, updated_at)
-             VALUES (?, ?, ?, ?, 'Pending', ?, NOW(), NOW())`,
-            [worker_id, current_site_id, target_site_id, requested_by_user_id, transfer_reason || null]
-        );
-        const requestId = result.insertId;
+let result;
+try {
+    [result] = await db.query(
+        `INSERT INTO worker_transfer_requests
+         (worker_id, current_site_id, target_site_id, requested_by_user_id, status, admin_notes, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'Pending', ?, NOW(), NOW())`,
+        [worker_id, current_site_id, target_site_id, requested_by_user_id, transfer_reason || null]
+    );
+} catch (insertError) {
+    if (insertError.code === 'ER_DUP_ENTRY' || insertError.errno === 1062) {
+        // Two concurrent requests raced past the SELECT above; the new
+        // uq_wtr_pending_worker partial-unique index catches it here.
+        return res.status(409).json({
+            status: 'error',
+            message: 'A pending transfer request already exists for this worker (created by a concurrent request).'
+        });
+    }
+    throw insertError;
+}
+const requestId = result.insertId;
+// ...rest unchanged (docx generation, response, etc.)
 
         // --- Generate the official Word document (best-effort; never blocks the electronic request) ---
         let documentPath = null;

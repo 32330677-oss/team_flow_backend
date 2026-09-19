@@ -1,4 +1,5 @@
 const db = require('../config/db');
+const { acquireCreateLock, releaseCreateLock } = require('../middleware/duplicateGuard');
 
 // 1. جلب جميع المشاريع من جدول projects
 exports.getAllProjects = async (req, res) => {
@@ -15,19 +16,38 @@ exports.getAllProjects = async (req, res) => {
     }
 };
 
-// 2. إنشاء مشروع جديد بناءً على الـ Schema الرسمي
+
 exports.createProject = async (req, res) => {
-    // السحب متوافق تماماً مع حقول جدولك
     const { project_name, client_name, location } = req.body;
 
-    // التحقق من الحقل الإجباري الوحيد في جدولك وهو الاسم
     if (!project_name) {
         return res.status(400).json({ status: 'error', message: 'اسم المشروع حقل مطلوب إجبارياً' });
     }
 
+    const connection = await db.getConnection();
+    const lockKey = `create_project:${project_name}`;
+
     try {
-        const query = 'INSERT INTO projects (project_name, client_name, location) VALUES (?, ?, ?)';
-        const [result] = await db.query(query, [project_name, client_name || null, location || null]);
+        const locked = await acquireCreateLock(connection, lockKey, 5);
+        if (!locked) {
+            return res.status(409).json({ status: 'error', message: 'طلب مشابه قيد المعالجة حالياً، الرجاء المحاولة لاحقاً' });
+        }
+
+        const [dupRows] = await connection.query(
+            `SELECT project_id FROM projects
+             WHERE project_name = ? AND client_name <=> ?
+               AND created_at >= (NOW() - INTERVAL 10 SECOND)
+             LIMIT 1`,
+            [project_name, client_name || null]
+        );
+        if (dupRows.length > 0) {
+            return res.status(409).json({ status: 'error', message: 'يبدو أن هذا المشروع تمت إضافته للتو.' });
+        }
+
+        const [result] = await connection.query(
+            'INSERT INTO projects (project_name, client_name, location) VALUES (?, ?, ?)',
+            [project_name, client_name || null, location || null]
+        );
 
         return res.status(201).json({
             status: 'success',
@@ -37,6 +57,9 @@ exports.createProject = async (req, res) => {
     } catch (error) {
         console.error(error);
         return res.status(500).json({ status: 'error', message: 'حدث خطأ أثناء إضافة المشروع الجديد' });
+    } finally {
+        await releaseCreateLock(connection, lockKey);
+        connection.release();
     }
 };
 

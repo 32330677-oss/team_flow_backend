@@ -44,60 +44,46 @@ exports.createSupervisor = async (req, res) => {
         });
     }
 
-    try {
-        const [existingUser] = await db.query('SELECT user_id FROM users WHERE username = ?', [username]);
-        if (existingUser.length > 0) {
-            return res.status(400).json({
-                status: 'fail',
-                message: 'This username is already in use'
-            });
+try {
+    const [existingUser] = await db.query('SELECT user_id FROM users WHERE username = ?', [username]);
+    if (existingUser.length > 0) {
+        return res.status(400).json({ status: 'fail', message: 'This username is already in use' });
+    }
+
+    const normalizedEmail = email && String(email).trim() ? email.trim() : null;
+    if (normalizedEmail) {
+        const [existingEmail] = await db.query('SELECT user_id FROM users WHERE email = ?', [normalizedEmail]);
+        if (existingEmail.length > 0) {
+            return res.status(400).json({ status: 'fail', message: 'This email is already in use by another account' });
         }
+    }
 
-        const normalizedEmail = email && String(email).trim() ? email.trim() : null;
-        if (normalizedEmail) {
-            const [existingEmail] = await db.query('SELECT user_id FROM users WHERE email = ?', [normalizedEmail]);
-            if (existingEmail.length > 0) {
-                return res.status(400).json({
-                    status: 'fail',
-                    message: 'This email is already in use by another account'
-                });
-            }
-        }
+    const hashedPassword = await bcrypt.hash(password, 10);
 
-        const hashedPassword = await bcrypt.hash(password, 10);
+    const insertQuery = `
+        INSERT INTO users (full_name, username, password_hash, email, role, status)
+        VALUES (?, ?, ?, ?, ?, 'Active')
+    `;
 
-        const insertQuery = `
-            INSERT INTO users (full_name, username, password_hash, email, role, status) 
-            VALUES (?, ?, ?, ?, ?, 'Active')
-        `;
+    const [result] = await db.query(insertQuery, [full_name, username, hashedPassword, normalizedEmail, targetRole]);
 
-        const [result] = await db.query(insertQuery, [
-            full_name,
-            username,
-            hashedPassword,
-            normalizedEmail,
-            targetRole
-        ]);
-
-        res.status(201).json({
-            status: 'success',
-            message: 'Supervisor registered successfully in the system',
-            data: {
-                user_id: result.insertId,
-                full_name,
-                username,
-                email: normalizedEmail,
-                role: targetRole,
-                status: 'Active'
-            }
-        });
-    } catch (err) {
-        console.error("🚨 Error creating supervisor:", err);
-        res.status(500).json({
-            status: 'error',
-            message: `Failed to insert supervisor: ${err.message}`
+    res.status(201).json({
+        status: 'success',
+        message: 'Supervisor registered successfully in the system',
+        data: { user_id: result.insertId, full_name, username, email: normalizedEmail, role: targetRole, status: 'Active' }
+    });
+} catch (err) {
+    if (err.code === 'ER_DUP_ENTRY' || err.errno === 1062) {
+        // Two concurrent requests raced past the pre-checks above; the new
+        // uq_users_username / uq_users_email indexes catch it here.
+        return res.status(409).json({
+            status: 'fail',
+            message: 'This username or email was just registered by another request.'
         });
     }
+    console.error("🚨 Error creating supervisor:", err);
+    res.status(500).json({ status: 'error', message: `Failed to insert supervisor: ${err.message}` });
+}
 };
 
 // 3. Update supervisor name and details (with email). Works for either supervisor role.

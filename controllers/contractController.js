@@ -1,4 +1,5 @@
 const db = require('../config/db');
+const { acquireCreateLock, releaseCreateLock } = require('../middleware/duplicateGuard');
 
 // 1. Get contracts by project ID
 exports.getContractsByProject = async (req, res) => {
@@ -16,28 +17,45 @@ exports.getContractsByProject = async (req, res) => {
 };
 
 // 2. Create a new contract
+
 exports.createContract = async (req, res) => {
-    const { 
-        contract_name, description, start_date, end_date, 
-        project_id, hourly_rate, overtime_hourly_rate 
+    const {
+        contract_name, description, start_date, end_date,
+        project_id, hourly_rate, overtime_hourly_rate
     } = req.body;
 
-    const admin_id = req.user.user_id; 
+    const admin_id = req.user.user_id;
 
     if (!contract_name || !project_id || !hourly_rate || !overtime_hourly_rate) {
         return res.status(400).json({ status: 'error', message: 'Please fill in all required fields and rates' });
     }
 
+    const connection = await db.getConnection();
+    const lockKey = `create_contract:${project_id}:${contract_name}`;
+
     try {
-        const query = `
-            INSERT INTO contracts 
-            (contract_name, description, start_date, end_date, project_id, hourly_rate, overtime_hourly_rate, admin_id) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `;
-        const [result] = await db.query(query, [
-            contract_name, description || null, start_date || null, end_date || null, 
-            project_id, hourly_rate, overtime_hourly_rate, admin_id
-        ]);
+        const locked = await acquireCreateLock(connection, lockKey, 5);
+        if (!locked) {
+            return res.status(409).json({ status: 'error', message: 'A similar request is already being processed.' });
+        }
+
+        const [dupRows] = await connection.query(
+            `SELECT contract_id FROM contracts
+             WHERE project_id = ? AND contract_name = ?
+               AND created_at >= (NOW() - INTERVAL 10 SECOND)
+             LIMIT 1`,
+            [project_id, contract_name]
+        );
+        if (dupRows.length > 0) {
+            return res.status(409).json({ status: 'error', message: 'This contract appears to have just been created.' });
+        }
+
+        const [result] = await connection.query(
+            `INSERT INTO contracts
+                (contract_name, description, start_date, end_date, project_id, hourly_rate, overtime_hourly_rate, admin_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [contract_name, description || null, start_date || null, end_date || null, project_id, hourly_rate, overtime_hourly_rate, admin_id]
+        );
 
         return res.status(201).json({
             status: 'success',
@@ -47,6 +65,9 @@ exports.createContract = async (req, res) => {
     } catch (error) {
         console.error(error);
         return res.status(500).json({ status: 'error', message: 'Server error while creating contract' });
+    } finally {
+        await releaseCreateLock(connection, lockKey);
+        connection.release();
     }
 };
 

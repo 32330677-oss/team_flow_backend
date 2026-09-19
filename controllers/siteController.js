@@ -1,4 +1,5 @@
 const db = require('../config/db');
+const { acquireCreateLock, releaseCreateLock } = require('../middleware/duplicateGuard');
 
 // Get sites by contract ID
 exports.getSitesByContract = async (req, res) => {
@@ -19,7 +20,7 @@ exports.getSitesByContract = async (req, res) => {
     }
 };
 
-// Create a new site
+
 exports.createSite = async (req, res) => {
     const { site_name, location, contract_id, supervisor_id } = req.body;
 
@@ -27,16 +28,39 @@ exports.createSite = async (req, res) => {
         return res.status(400).json({ status: 'error', message: 'Please provide site name and contract ID' });
     }
 
+    const connection = await db.getConnection();
+    const lockKey = `create_site:${contract_id}:${site_name}`;
+
     try {
-        const query = `
-            INSERT INTO sites (site_name, location, contract_id, supervisor_id, site_status) 
-            VALUES (?, ?, ?, ?, 'Active')
-        `;
-        const [result] = await db.query(query, [site_name, location || null, contract_id, supervisor_id || null]);
+        const locked = await acquireCreateLock(connection, lockKey, 5);
+        if (!locked) {
+            return res.status(409).json({ status: 'error', message: 'A similar request is already being processed.' });
+        }
+
+        const [dupRows] = await connection.query(
+            `SELECT site_id FROM sites
+             WHERE contract_id = ? AND site_name = ?
+               AND created_at >= (NOW() - INTERVAL 10 SECOND)
+             LIMIT 1`,
+            [contract_id, site_name]
+        );
+        if (dupRows.length > 0) {
+            return res.status(409).json({ status: 'error', message: 'This site appears to have just been created.' });
+        }
+
+        const [result] = await connection.query(
+            `INSERT INTO sites (site_name, location, contract_id, supervisor_id, site_status)
+             VALUES (?, ?, ?, ?, 'Active')`,
+            [site_name, location || null, contract_id, supervisor_id || null]
+        );
+
         return res.status(201).json({ status: 'success', message: 'Site created successfully', site_id: result.insertId });
     } catch (error) {
         console.error("🚨 DATABASE ERROR:", error);
         return res.status(500).json({ status: 'error', message: 'Server error while creating site' });
+    } finally {
+        await releaseCreateLock(connection, lockKey);
+        connection.release();
     }
 };
 

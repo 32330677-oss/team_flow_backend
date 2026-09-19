@@ -1,6 +1,7 @@
 const db = require('../config/db');
 const multer = require('multer');
 const path = require('path');
+const { acquireCreateLock, releaseCreateLock } = require('../middleware/duplicateGuard');
 
 const storage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, 'uploads/'),
@@ -221,6 +222,7 @@ exports.bulkUpdateCompensation = async (req, res) => {
 
 
 
+
 exports.createWorker = async (req, res) => {
     const {
         full_name, phone_number, nationality, job_position, hire_date, notes,
@@ -238,22 +240,31 @@ exports.createWorker = async (req, res) => {
     }
 
     const comp = normalizedCompensationValues(payment_type, daily_rate, regular_hourly_rate, overtime_hourly_rate);
-
     const personalPhotoPath = req.files && req.files['personal_photo'] ? req.files['personal_photo'][0].path : null;
     const idPhotoPath = req.files && req.files['id_photo'] ? req.files['id_photo'][0].path : null;
     const effectiveHireDate = hire_date || new Date().toISOString().split('T')[0];
 
     const connection = await db.getConnection();
+    const lockKey = `create_worker:${full_name}:${phone_number || ''}`;
+
     try {
+        const locked = await acquireCreateLock(connection, lockKey, 5);
+        if (!locked) {
+            return res.status(409).json({
+                status: 'error',
+                message: 'A similar request is already being processed. Please check the workers list before retrying.'
+            });
+        }
+
         await connection.beginTransaction();
 
-        // 🔒 حماية ضد الضغط المزدوج / إعادة الإرسال: إذا فيه عامل بنفس
-        // الاسم ورقم الهاتف انضاف خلال آخر 15 ثانية، ارفض الطلب الثاني.
+        // Race-free now: concurrent identical requests are serialized by the
+        // lock above, so the second one will see the first's committed row.
         const [dupRows] = await connection.execute(
             `SELECT worker_id FROM workers
              WHERE full_name = ? AND phone_number <=> ?
                AND created_at >= (NOW() - INTERVAL 15 SECOND)
-             LIMIT 1 FOR UPDATE`,
+             LIMIT 1`,
             [full_name, phone_number || null]
         );
         if (dupRows.length > 0) {
@@ -283,7 +294,6 @@ exports.createWorker = async (req, res) => {
         const worker_unique_id = `W-${newId}`;
         await connection.execute('UPDATE workers SET worker_unique_id = ? WHERE worker_id = ?', [worker_unique_id, newId]);
 
-        // First compensation history row
         await connection.execute(
             `INSERT INTO workercompensationhistory
                 (worker_id, payment_type, daily_rate, regular_hourly_rate, overtime_hourly_rate,
@@ -311,6 +321,7 @@ exports.createWorker = async (req, res) => {
         console.error("🚨 CREATE WORKER ERROR:", error);
         return res.status(500).json({ status: 'error', message: 'Server error occurred while adding the worker' });
     } finally {
+        await releaseCreateLock(connection, lockKey);
         connection.release();
     }
 };

@@ -68,12 +68,10 @@ router.post('/', authMiddleware, restrictTo('Admin'), async (req, res) => {
     }
 
     try {
-        // التحقق الشامل: هل العامل معيّن حالياً في أي موقع نشط؟
-        // JOIN مع sites لجلب اسم الموقع الحالي واستخدامه داخل رسالة الخطأ
         const [activeAssignment] = await db.query(
             `SELECT wsa.assignment_id, wsa.site_id, s.site_name AS current_site_name
              FROM workersiteassignments wsa
-             LEFT JOIN sites s ON wsa.site_id = s.site_id
+             LEFT JOIN sites s ON s.site_id = wsa.site_id
              WHERE wsa.worker_id = ? AND wsa.unassigned_date IS NULL
              LIMIT 1`,
             [worker_id]
@@ -81,14 +79,12 @@ router.post('/', authMiddleware, restrictTo('Admin'), async (req, res) => {
 
         if (activeAssignment.length > 0) {
             const current = activeAssignment[0];
-
             if (current.site_id === Number(site_id)) {
                 return res.status(400).json({
                     status: 'fail',
                     message: `هذا العامل معيّن بالفعل في هذا الموقع (${current.current_site_name || 'الموقع الحالي'}).`
                 });
             }
-
             return res.status(400).json({
                 status: 'fail',
                 message: `هذا العامل معيّن مسبقاً في موقع "${current.current_site_name || 'غير معروف'}". يجب إنهاء تعيينه من هناك أولاً قبل نقله إلى موقع جديد.`,
@@ -101,15 +97,27 @@ router.post('/', authMiddleware, restrictTo('Admin'), async (req, res) => {
         if (siteData.length === 0) {
             return res.status(400).json({ status: 'fail', message: 'الموقع غير موجود' });
         }
-
         const contract_id = siteData[0].contract_id;
 
-        const query = `
-            INSERT INTO workersiteassignments 
-            (worker_id, site_id, contract_id, assigned_by_user_id, assigned_date, created_at, updated_at) 
-            VALUES (?, ?, ?, ?, CURDATE(), NOW(), NOW())
-        `;
-        const [result] = await db.query(query, [worker_id, site_id, contract_id, assigned_by_user_id]);
+        let result;
+        try {
+            [result] = await db.query(
+                `INSERT INTO workersiteassignments
+                 (worker_id, site_id, contract_id, assigned_by_user_id, assigned_date, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, CURDATE(), NOW(), NOW())`,
+                [worker_id, site_id, contract_id, assigned_by_user_id]
+            );
+        } catch (insertError) {
+            if (insertError.code === 'ER_DUP_ENTRY' || insertError.errno === 1062) {
+                // Two concurrent requests raced past the SELECT above; the
+                // uq_wsa_active_worker partial-unique index catches it here.
+                return res.status(409).json({
+                    status: 'fail',
+                    message: 'هذا العامل تم تعيينه للتو بواسطة طلب آخر متزامن. الرجاء تحديث الصفحة.'
+                });
+            }
+            throw insertError;
+        }
 
         res.status(201).json({ status: 'success', data: { assignment_id: result.insertId } });
     } catch (err) {
