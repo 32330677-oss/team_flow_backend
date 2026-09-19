@@ -280,13 +280,15 @@ exports.bulkSetAttendance = async (req, res) => {
         const snapshotMinutes = Number(existingRecord.standard_minutes_snapshot) > 0
           ? Number(existingRecord.standard_minutes_snapshot)
           : Math.round(standardHours * 60);
-        if (status === 'Present' && checkIn && checkOut && existingRecord.standard_minutes_snapshot) {
-          const historicalShift = calculateStaffShiftHours({
-            checkInRaw: checkIn,
-            checkOutRaw: checkOut,
-            recordDate: record_date,
-            standardDailyHours: snapshotMinutes / 60,
-          });
+      if (status === 'Present' && checkIn && checkOut && existingRecord.standard_minutes_snapshot) {
+  const historicalShift = calculateStaffShiftHours({
+    checkInRaw: checkIn,
+    checkOutRaw: checkOut,
+    lunchStartRaw: lunchStart,   // ✅ إضافة
+    lunchEndRaw: lunchEnd,       // ✅ إضافة
+    recordDate: record_date,
+    standardDailyHours: snapshotMinutes / 60,
+  });
           regularHours = historicalShift.regularHours;
           overtimeHours = historicalShift.overtimeHours;
           lunchHours = historicalShift.lunchHours;
