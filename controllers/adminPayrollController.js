@@ -657,14 +657,18 @@ async function exportPayrollExcel(req, res) {
     const dateOnly = (v) => (v instanceof Date ? v.toISOString().slice(0, 10) : String(v || '').slice(0, 10));
     const logoPath = path.join(__dirname, '../assets/logo.png');
 
-    function addLogo(sheet, worksheetWorkbook) {
-      try {
+function addLogo(sheet, worksheetWorkbook) {
+    try {
         const logoId = worksheetWorkbook.addImage({ filename: logoPath, extension: 'png' });
-        sheet.addImage(logoId, { tl: { col: 0.1, row: 0.1 }, ext: { width: 130, height: 45 } });
-      } catch (e) {
+        sheet.addImage(logoId, {
+            tl: { col: 0.15, row: 0.15 },
+            ext: { width: 150, height: 55 }, // مساحة أكبر ومحسوبة تحفظ التناسب
+            editAs: 'oneCell', // ما يتحرك أو يتمدد مع تغيير الأعمدة/الصفوف
+        });
+    } catch (e) {
         console.warn('Logo not added:', e.message);
-      }
     }
+}
 
     const workbook = new ExcelJS.Workbook();
 
@@ -706,6 +710,8 @@ async function exportPayrollExcel(req, res) {
     addLogo(summarySheet, workbook);
 
     summarySheet.columns = [
+          { header: '', key: 'logo_gap', width: 4 },   // عمود فاضي تحت اللوغو
+    { header: '', key: 'logo_gap2', width: 10 },
       { header: 'No.', key: 'number', width: 6 },
       { header: 'Worker ID', key: 'worker_id', width: 16 },
       { header: 'Worker Name', key: 'worker_name', width: 28 },
@@ -714,23 +720,21 @@ async function exportPayrollExcel(req, res) {
       { header: 'Signature', key: 'signature', width: 80 },
     ];
 
-    summarySheet.mergeCells('A1:F1');
-    summarySheet.getCell('A1').value = `Payroll Batch #${batchId} (v${batch.version_number}${batch.is_finalized ? ' - Finalized' : ''})`;
-    summarySheet.mergeCells('A2:F2');
-    summarySheet.getCell('A2').value = `Period: ${dateOnly(batch.start_date)} - ${dateOnly(batch.end_date)}`;
-    summarySheet.mergeCells('A3:F3');
-    summarySheet.getCell('A3').value = `Currency: Syrian Pound (ل.س)`;
+summarySheet.mergeCells('C1:H1');
+summarySheet.getCell('C1').value = `Payroll Batch #${batchId} (v${batch.version_number}${batch.is_finalized ? ' - Finalized' : ''})`;
+summarySheet.mergeCells('C2:H2');
+summarySheet.getCell('C2').value = `Period: ${dateOnly(batch.start_date)} - ${dateOnly(batch.end_date)}`;
+summarySheet.mergeCells('C3:H3');
+summarySheet.getCell('C3').value = `Currency: Syrian Pound (ل.س)`;
+summarySheet.mergeCells('C4:H4');
+summarySheet.getCell('C4').value = `Total Workers Paid: ${totalWorkerCount}`;
+summarySheet.getCell('C4').font = { bold: true };
 
-    // NEW: total worker count line (uses the row previously left blank as a spacer)
-    summarySheet.mergeCells('A4:F4');
-    summarySheet.getCell('A4').value = `Total Workers Paid: ${totalWorkerCount}`;
-    summarySheet.getCell('A4').font = { bold: true };
-
-    summarySheet.getRow(1).height = 25;
-    summarySheet.getRow(2).height = 25;
-    summarySheet.getRow(3).height = 25;
-    summarySheet.getRow(4).height = 22;
-    summarySheet.getRow(5).values = summarySheet.columns.map((c) => c.header);
+    summarySheet.getRow(1).height = 28;
+    summarySheet.getRow(2).height = 28;
+    summarySheet.getRow(3).height = 28;
+    summarySheet.getRow(4).height = 28;
+    summarySheet.getRow(5).values = ['', '', ...summarySheet.columns.slice(2).map((c) => c.header)];
 
     let grandTotalNet = 0;
     let idx = 0;
