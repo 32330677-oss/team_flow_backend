@@ -29,8 +29,11 @@ function formatToMySqlDateTime(value) {
 }
 
 // GET /api/staff-attendance/supervisor/day?date=YYYY-MM-DD
-// Returns every assigned active staff member with their record (if any) for that
-// date, including Draft records, so the supervisor sees what was saved earlier.
+// Returns every assigned staff member (Active, plus Inactive ones who still
+// have an attendance record on this historical date) with their record (if
+// any) for that date, including Draft records, so the supervisor sees what
+// was saved earlier. Terminated staff are excluded implicitly because
+// termination closes the supervisor assignment (see staffLifecycleController).
 exports.getDayView = async (req, res) => {
   const { date } = req.query;
   if (!isValidDateOnly(date)) {
@@ -45,6 +48,7 @@ exports.getDayView = async (req, res) => {
     const placeholders = assignedIds.map(() => '?').join(',');
     const [rows] = await db.execute(
       `SELECT sm.staff_id, sm.staff_unique_id, sm.full_name, sm.position, sm.standard_daily_hours,
+              sm.status AS staff_current_status,
               sa.staff_attendance_id, sa.attendance_status, sa.check_in_time, sa.check_out_time,
               sa.regular_hours, sa.overtime_hours, sa.lunch_deducted_hours,
               sa.lunch_start_time, sa.lunch_end_time,
@@ -52,7 +56,8 @@ exports.getDayView = async (req, res) => {
               sa.is_friday_worked, sa.status, sa.admin_rejection_notes
        FROM staff_members sm
        LEFT JOIN staff_attendance sa ON sa.staff_id = sm.staff_id AND sa.record_date = ?
-       WHERE sm.status = 'Active' AND sm.staff_id IN (${placeholders})
+       WHERE sm.staff_id IN (${placeholders})
+         AND (sm.status = 'Active' OR sa.staff_attendance_id IS NOT NULL)
        ORDER BY sm.full_name`,
       [date, ...assignedIds]
     );
