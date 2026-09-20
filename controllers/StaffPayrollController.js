@@ -73,11 +73,21 @@ async function generateStaffPayrollBatch(req, res) {
         // spans months, the ledger is keyed to the start month).
         const payrollMonth = start_date.slice(0, 7);
 
-        const [batchResult] = await connection.execute(
-            `INSERT INTO staff_payroll_batches (start_date, end_date, generated_by_user_id, status)
-             VALUES (?, ?, ?, 'Generated')`,
-            [start_date, end_date, userId]
-        );
+const [prev] = await connection.execute(
+  `SELECT staff_payroll_batch_id, version_number FROM staff_payroll_batches
+   WHERE start_date = ? AND end_date = ?
+   ORDER BY version_number DESC LIMIT 1`,
+  [start_date, end_date]
+);
+const nextVersion = prev.length ? prev[0].version_number + 1 : 1;
+const supersedesId = prev.length ? prev[0].staff_payroll_batch_id : null;
+
+const [batchResult] = await connection.execute(
+  `INSERT INTO staff_payroll_batches
+     (start_date, end_date, generated_by_user_id, status, version_number, supersedes_batch_id)
+   VALUES (?, ?, ?, 'Generated', ?, ?)`,
+  [start_date, end_date, userId, nextVersion, supersedesId]
+);
         const batchId = batchResult.insertId;
         let totalStaff = 0;
         let totalAmount = 0;

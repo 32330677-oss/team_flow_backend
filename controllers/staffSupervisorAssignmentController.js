@@ -265,8 +265,10 @@ exports.bulkAssignSupervisor = async (req, res) => {
 // Shared helper — used by staffAttendanceController.js for scope filtering.
 exports.getAssignedStaffIdsForSupervisor = async (supervisorUserId, executor = db) => {
   const [rows] = await executor.execute(
-    `SELECT staff_id FROM staff_supervisor_assignments
-     WHERE supervisor_user_id = ? AND unassigned_date IS NULL`,
+   `SELECT staff_id FROM staff_supervisor_assignments
+ WHERE supervisor_user_id = ?
+   AND assigned_date <= CURDATE()
+   AND (unassigned_date IS NULL OR unassigned_date > CURDATE())`,
     [supervisorUserId]
   );
   return rows.map((r) => r.staff_id);
@@ -282,7 +284,9 @@ exports.getMyAssignedStaff = async (req, res) => {
               sm.standard_daily_hours, sm.status
        FROM staff_supervisor_assignments ssa
        JOIN staff_members sm ON sm.staff_id = ssa.staff_id
-       WHERE ssa.supervisor_user_id = ? AND ssa.unassigned_date IS NULL
+       WHERE ssa.supervisor_user_id = ?
+         AND ssa.assigned_date <= CURDATE()
+         AND (ssa.unassigned_date IS NULL OR ssa.unassigned_date > CURDATE())
          AND sm.status = 'Active'
        ORDER BY sm.full_name`,
       [supervisorId]

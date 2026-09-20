@@ -89,6 +89,11 @@ exports.bulkSetAttendance = async (req, res) => {
       message: 'A valid record_date (YYYY-MM-DD) is required.'
     });
   }
+const maxAllowed = new Date(Date.now() + 24 * 3600 * 1000).toISOString().slice(0, 10);
+if (record_date > maxAllowed) {
+  return res.status(400).json({ status: 'error', message: 'Attendance date cannot be in the future.' });
+}
+
 
   if (!Array.isArray(entries) || entries.length === 0) {
     return res.status(400).json({
@@ -180,18 +185,27 @@ exports.bulkSetAttendance = async (req, res) => {
       let lunchStart = null;
       let lunchEnd = null;
 
-      if (status === 'Present') {
-        const rawCheckIn = formatToMySqlDateTime(entry.check_in_time);
-        const rawCheckOut = formatToMySqlDateTime(entry.check_out_time);
+if (status === 'Present') {
+  const rawCheckIn = formatToMySqlDateTime(entry.check_in_time);
+  const rawCheckOut = formatToMySqlDateTime(entry.check_out_time);
 
-        if (!rawCheckIn || !rawCheckOut) {
-          results.skipped.push({
-            staff_id: staffId,
-            reason:
-              'Check-in and check-out times are required for Present status.'
-          });
-          continue;
-        }
+  if (!rawCheckIn || !rawCheckOut) {
+    results.skipped.push({
+      staff_id: staffId,
+      reason:
+        'Check-in and check-out times are required for Present status.'
+    });
+    continue;
+  }
+
+  // Check-in date must match the attendance record date.
+  if (rawCheckIn.slice(0, 10) !== record_date) {
+    results.skipped.push({
+      staff_id: staffId,
+      reason: 'Check-in date must match the attendance date.'
+    });
+    continue;
+  }
 
         const rawLunchStart = entry.lunch_start_time ? formatToMySqlDateTime(entry.lunch_start_time) : null;
         const rawLunchEnd = entry.lunch_end_time ? formatToMySqlDateTime(entry.lunch_end_time) : null;

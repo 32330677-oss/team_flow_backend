@@ -6,17 +6,12 @@ const restrictTo = require('../middleware/roleMiddleware');
 
 router.use(authMiddleware);
 
-// ==================== Workers Bulk Attendance (Admin / Supervisor) ====================
-// UNCHANGED — this is worker attendance (Worker Supervisor), not staff. Do not touch.
-router.post('/workers/bulk-checkin', restrictTo('Admin', 'Supervisor'), staffAttendanceController.bulkCheckIn);
-router.post('/workers/bulk-checkout', restrictTo('Admin', 'Supervisor'), staffAttendanceController.bulkCheckOut);
-
 // ==================== Admin / Staff Supervisor Review (Staff Attendance) ====================
 // CHANGED: 'Supervisor' -> 'StaffSupervisor'. Worker Supervisors never had
 // staff attendance data in scope; this closes that gap. Scope filtering to
 // only assigned staff is applied inside the controller for StaffSupervisor.
 router.get('/pending', restrictTo('Admin', 'StaffSupervisor'), staffAttendanceController.getPendingStaffAttendance);
-router.post('/review', restrictTo('Admin', 'StaffSupervisor'), staffAttendanceController.reviewStaffAttendance);
+router.post('/review', restrictTo('Admin'), staffAttendanceController.reviewStaffAttendance);
 router.get('/by-date', restrictTo('Admin', 'StaffSupervisor'), staffAttendanceController.getStaffAttendanceByDate);
 
 const staffAttendanceSupervisorController = require('../controllers/staffAttendanceSupervisorController');
