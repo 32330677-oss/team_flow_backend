@@ -12,6 +12,13 @@ const ATTENDANCE_STATUSES = ['Present', 'Absent', 'Sick', 'Vacation', 'Holiday']
 // 'submit' -> status 'Submitted' (goes to the admin review queue) — the ORIGINAL behavior
 const SAVE_MODES = ['draft', 'submit'];
 
+class AppError extends Error {
+  constructor(message) {
+    super(message);
+    this.isOperational = true;
+  }
+}
+
 function formatToMySqlDateTime(value) {
   if (!value) return null;
   const match = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?$/.exec(String(value));
@@ -81,6 +88,7 @@ exports.getDayView = async (req, res) => {
 // record and payroll depends on it).
 exports.bulkSetAttendance = async (req, res) => {
   const { record_date, entries } = req.body || {};
+  const isResubmit = req.body?.resubmit_rejected === true;
   const supervisorId = req.user.user_id;
 
   if (!isValidDateOnly(record_date)) {
@@ -96,10 +104,10 @@ if (record_date > maxAllowed) {
 }
 
 
-  if (!Array.isArray(entries) || entries.length === 0) {
+  if (!Array.isArray(entries) || (entries.length === 0 && (req.body?.mode || 'submit') === 'draft')) {
     return res.status(400).json({
       status: 'error',
-      message: 'At least one attendance entry is required.'
+      message: 'At least one attendance entry is required when saving a draft.'
     });
   }
 
@@ -112,6 +120,13 @@ if (record_date > maxAllowed) {
   }
   const mode = requestedMode || 'submit';
   const isDraftMode = mode === 'draft';
+
+  if (isResubmit && (isDraftMode || entries.length !== 1)) {
+    return res.status(400).json({
+      status: 'error',
+      message: 'A rejected resubmission must contain exactly one attendance entry.'
+    });
+  }
   const targetStatus = isDraftMode ? 'Draft' : 'Submitted';
 
   const dayIsFriday = isFriday(record_date);
@@ -121,9 +136,55 @@ if (record_date > maxAllowed) {
 
   try {
     const assignedIds = await getAssignedStaffIdsForSupervisor(supervisorId, connection);
+    if (assignedIds.length === 0) {
+      throw new AppError('No active staff members are assigned to this supervisor.');
+    }
     const assignedSet = new Set(assignedIds);
 
     await connection.beginTransaction();
+
+    if (isResubmit) {
+      const staffId = Number(entries[0]?.staff_id);
+      const [[rejected]] = await connection.execute(
+        `SELECT staff_attendance_id, staff_id, status
+         FROM staff_attendance
+         WHERE staff_id = ? AND record_date = ?
+         LIMIT 1 FOR UPDATE`,
+        [staffId, record_date]
+      );
+      if (!rejected || rejected.status !== 'Rejected') {
+        throw new AppError('Only an attendance record currently marked Rejected can be resubmitted.');
+      }
+    }
+
+    // Day submission is all-or-nothing: validate every active employee in the
+    // current supervisor assignment scope before changing any workflow state.
+    if (mode === 'submit' && !isResubmit) {
+      const [requiredRows] = await connection.execute(
+        `SELECT sm.staff_id, sm.full_name, sa.attendance_status
+         FROM staff_members sm
+         LEFT JOIN staff_attendance sa
+           ON sa.staff_id = sm.staff_id AND sa.record_date = ?
+         WHERE sm.status = 'Active' AND sm.staff_id IN (${assignedIds.map(() => '?').join(',')})
+         ORDER BY sm.full_name`,
+        [record_date, ...assignedIds]
+      );
+      const entriesByStaffId = new Map(
+        entries.map((entry) => [Number(entry.staff_id), entry.attendance_status])
+      );
+      const missing = requiredRows.filter((row) => {
+        const status = entriesByStaffId.has(row.staff_id)
+          ? entriesByStaffId.get(row.staff_id)
+          : row.attendance_status;
+        return !ATTENDANCE_STATUSES.includes(status);
+      });
+      if (missing.length > 0) {
+        const names = missing.map((row) => row.full_name).join(', ');
+        throw new AppError(
+          `Cannot submit attendance. The following staff members have no attendance status: ${names}`
+        );
+      }
+    }
 
     for (const entry of entries) {
       const staffId = Number(entry.staff_id);
@@ -282,7 +343,7 @@ if (status === 'Present') {
       if (existing.length > 0) {
         const existingRecord = existing[0];
 
-        if (existingRecord.status === 'Approved' || existingRecord.status === 'Submitted') {
+        if (existingRecord.status === 'Approved' || existingRecord.status === 'Submitted' || (existingRecord.status === 'Rejected' && !isResubmit)) {
           results.skipped.push({
             staff_id: staffId,
             reason: existingRecord.status === 'Approved'
@@ -495,6 +556,50 @@ if (status === 'Present') {
       }
     }
 
+    if (mode === 'submit' && !isResubmit) {
+      // Promote only Draft rows for this date. Rejected, Submitted, and
+      // Approved rows are deliberately excluded from this day submission.
+      const [drafts] = await connection.execute(
+        `SELECT staff_attendance_id, staff_id
+         FROM staff_attendance
+         WHERE record_date = ? AND status = 'Draft'
+           AND staff_id IN (${assignedIds.map(() => '?').join(',')})
+         FOR UPDATE`,
+        [record_date, ...assignedIds]
+      );
+      for (const draft of drafts) {
+        await connection.execute(
+          `UPDATE staff_attendance
+           SET status = 'Submitted', admin_rejection_notes = NULL,
+               approved_by_user_id = NULL, approval_date = NULL
+           WHERE staff_attendance_id = ? AND status = 'Draft'`,
+          [draft.staff_attendance_id]
+        );
+        results.updated.push(draft.staff_id);
+        await connection.execute(
+          `INSERT INTO auditlogs
+             (table_name, record_id, action_type, user_id, old_values, new_values)
+           VALUES ('staff_attendance', ?, 'SUPERVISOR_ATTENDANCE_SUBMITTED', ?, ?, ?)`,
+          [
+            draft.staff_attendance_id,
+            supervisorId,
+            JSON.stringify({ status: 'Draft' }),
+            JSON.stringify({ status: 'Submitted', staff_id: draft.staff_id, record_date })
+          ]
+        );
+      }
+    }
+
+    if (mode === 'submit' && !isResubmit && results.skipped.some((item) =>
+      !['Already approved by Admin; cannot modify.',
+        'Already submitted for review; cannot modify until Admin rejects it.',
+        'Rejected records must be resubmitted individually.'].includes(item.reason)
+    )) {
+      throw new AppError(
+        `Attendance submission failed: ${results.skipped.map((item) => `staff ${item.staff_id}: ${item.reason}`).join('; ')}`
+      );
+    }
+
     await connection.commit();
 
     res.status(200).json({
@@ -513,139 +618,29 @@ if (status === 'Present') {
       error
     );
 
-    res.status(500).json({
+    if (error.code === 'ER_DUP_ENTRY' || error.errno === 1062) {
+      return res.status(409).json({
+        status: 'error',
+        message: 'Attendance was created or changed by another request. Refresh the attendance date and try again.'
+      });
+    }
+
+    const httpStatus = error.isOperational ? 400 : 500;
+    res.status(httpStatus).json({
       status: 'error',
-      message: isDraftMode
-        ? 'Failed to save staff attendance draft.'
-        : 'Failed to submit staff attendance.'
+      message: error.isOperational
+        ? error.message
+        : (isDraftMode ? 'Failed to save staff attendance draft.' : 'Failed to submit staff attendance.')
     });
   } finally {
     connection.release();
   }
 };
 
-// POST /api/staff-attendance/supervisor/submit-drafts
-// body: { record_date, staff_ids?: number[] }
-//
-// Turns every Draft record of the given date (for staff assigned to this supervisor)
-// into 'Submitted' so it enters the admin review queue. If staff_ids is provided,
-// only those staff members are submitted. Records that are not Draft are never touched.
-exports.submitDrafts = async (req, res) => {
-  const { record_date, staff_ids } = req.body || {};
-  const supervisorId = req.user.user_id;
-
-  if (!isValidDateOnly(record_date)) {
-    return res.status(400).json({
-      status: 'error',
-      message: 'A valid record_date (YYYY-MM-DD) is required.'
-    });
-  }
-
-  let requestedIds = null;
-  if (staff_ids !== undefined && staff_ids !== null) {
-    if (!Array.isArray(staff_ids)) {
-      return res.status(400).json({
-        status: 'error',
-        message: 'staff_ids must be an array.'
-      });
-    }
-    requestedIds = [...new Set(staff_ids.map(Number))]
-      .filter((id) => Number.isInteger(id) && id > 0);
-    if (requestedIds.length === 0) {
-      return res.status(400).json({
-        status: 'error',
-        message: 'No valid staff ids provided.'
-      });
-    }
-  }
-
-  const connection = await db.getConnection();
-  try {
-    const assignedIds = await getAssignedStaffIdsForSupervisor(supervisorId, connection);
-    const assignedSet = new Set(assignedIds);
-    const targetIds = requestedIds
-      ? requestedIds.filter((id) => assignedSet.has(id))
-      : assignedIds;
-
-    if (targetIds.length === 0) {
-      return res.status(200).json({
-        status: 'success',
-        message: '0 draft(s) submitted for review.',
-        data: { submitted: [] }
-      });
-    }
-
-    await connection.beginTransaction();
-
-    const placeholders = targetIds.map(() => '?').join(',');
-    const [drafts] = await connection.execute(
-      `SELECT staff_attendance_id, staff_id
-       FROM staff_attendance
-       WHERE record_date = ?
-         AND status = 'Draft'
-         AND staff_id IN (${placeholders})
-       FOR UPDATE`,
-      [record_date, ...targetIds]
-    );
-
-    if (drafts.length === 0) {
-      await connection.rollback();
-      return res.status(200).json({
-        status: 'success',
-        message: '0 draft(s) submitted for review.',
-        data: { submitted: [] }
-      });
-    }
-
-    const attendanceIds = drafts.map((d) => d.staff_attendance_id);
-    const idPlaceholders = attendanceIds.map(() => '?').join(',');
-
-    await connection.execute(
-      `UPDATE staff_attendance
-       SET status = 'Submitted',
-           admin_rejection_notes = NULL,
-           approved_by_user_id = NULL,
-           approval_date = NULL
-       WHERE staff_attendance_id IN (${idPlaceholders})
-         AND status = 'Draft'`,
-      attendanceIds
-    );
-
-    for (const draft of drafts) {
-      await connection.execute(
-        `INSERT INTO auditlogs
-           (table_name, record_id, action_type, user_id, old_values, new_values)
-         VALUES
-           ('staff_attendance', ?, 'SUPERVISOR_ATTENDANCE_SUBMITTED', ?, ?, ?)`,
-        [
-          draft.staff_attendance_id,
-          supervisorId,
-          JSON.stringify({ status: 'Draft' }),
-          JSON.stringify({
-            status: 'Submitted',
-            staff_id: draft.staff_id,
-            record_date,
-            source: 'submit_drafts',
-          }),
-        ]
-      );
-    }
-
-    await connection.commit();
-
-    return res.status(200).json({
-      status: 'success',
-      message: `${drafts.length} draft(s) submitted for review.`,
-      data: { submitted: drafts.map((d) => d.staff_id) }
-    });
-  } catch (error) {
-    try { await connection.rollback(); } catch (_) {}
-    console.error('SUBMIT STAFF ATTENDANCE DRAFTS ERROR:', error);
-    return res.status(500).json({
-      status: 'error',
-      message: 'Failed to submit staff attendance drafts.'
-    });
-  } finally {
-    connection.release();
-  }
+// POST /api/staff-attendance/supervisor/resubmit-rejected
+// Resubmits exactly one rejected staff/date record through the same validated
+// save path; it never promotes other Draft records for the day.
+exports.resubmitRejected = async (req, res) => {
+  req.body = { ...(req.body || {}), mode: 'submit', resubmit_rejected: true };
+  return exports.bulkSetAttendance(req, res);
 };

@@ -17,7 +17,7 @@ router.get('/by-date', restrictTo('Admin', 'StaffSupervisor'), staffAttendanceCo
 const staffAttendanceSupervisorController = require('../controllers/staffAttendanceSupervisorController');
 router.get('/supervisor/day', restrictTo('StaffSupervisor'), staffAttendanceSupervisorController.getDayView);
 router.post('/supervisor/bulk-set', restrictTo('StaffSupervisor'), staffAttendanceSupervisorController.bulkSetAttendance);
-router.post('/supervisor/submit-drafts', restrictTo('StaffSupervisor'), staffAttendanceSupervisorController.submitDrafts);
+router.post('/supervisor/resubmit-rejected', restrictTo('StaffSupervisor'), staffAttendanceSupervisorController.resubmitRejected);
 
 // ==================== Pre-payroll: Management-Paid Absences ====================
 const staffAbsenceController = require('../controllers/staffAbsenceController');
