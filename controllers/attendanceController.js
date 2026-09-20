@@ -327,7 +327,15 @@ async function runBulkAttendance(req, res, mode) {
                 throw new AppError(`Bulk ${mode} aborted: worker ${workerId} is not active or not assigned to this site. No changes were saved.`);
             }
 
-            if (mode === 'checkin') {
+                       if (mode === 'checkin') {
+                // NEW: same guard as the single check-in — refuse to open a
+                // new shift if a previous day's shift is still unclosed.
+                const openShiftId = await getAttendanceId(workerId, site_id, record_date, connection, true);
+                if (openShiftId) {
+                    failedWorker = { worker_id: workerId, message: 'Worker has a previous open shift that must be closed first.' };
+                    throw new AppError(`Bulk check-in aborted: worker ${workerId} has an unclosed previous shift. No changes were saved.`);
+                }
+
                 const [rows] = await connection.execute(
                     `SELECT attendance_id, attendance_status, check_in_time, check_out_time, status
                      FROM attendance
