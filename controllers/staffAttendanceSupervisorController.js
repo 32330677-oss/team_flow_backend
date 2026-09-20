@@ -89,7 +89,8 @@ exports.bulkSetAttendance = async (req, res) => {
       message: 'A valid record_date (YYYY-MM-DD) is required.'
     });
   }
-const maxAllowed = new Date(Date.now() + 24 * 3600 * 1000).toISOString().slice(0, 10);
+const maxAllowed = new Date().toISOString().slice(0, 10);
+
 if (record_date > maxAllowed) {
   return res.status(400).json({ status: 'error', message: 'Attendance date cannot be in the future.' });
 }
