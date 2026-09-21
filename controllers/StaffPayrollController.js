@@ -1,6 +1,6 @@
 const pool = require('../config/db');
 const { countNonFridayDays, listNonFridayDates, isFriday, round2 } = require('../services/staffAttendanceService');
-const { getActiveSpansOverlapping } = require('../services/staffEmploymentService'); // ← جديد
+const { getActiveSpansOverlapping } = require('../services/staffEmploymentService');
 function isValidDate(value) {
     return /^\d{4}-\d{2}-\d{2}$/.test(String(value || '')) && !Number.isNaN(Date.parse(`${value}T00:00:00`));
 }
@@ -21,7 +21,8 @@ function getPaidLeaveTypes(staff) {
 }
 
 async function generateStaffPayrollBatch(req, res) {
-    const { start_date, end_date } = req.body || {};
+    const { start_date, end_date, acknowledge_pending } = req.body || {};
+    const acknowledgePending = acknowledge_pending === true;
     const userId = req.user?.user_id;
 
     if (!userId) return res.status(401).json({ status: 'error', message: 'Unable to determine user identity' });
@@ -54,7 +55,8 @@ async function generateStaffPayrollBatch(req, res) {
             `SELECT staff_id, full_name, monthly_salary, paid_leave_types, standard_daily_hours,
                     hire_date, first_hire_date, termination_date, status
              FROM staff_members
-             WHERE hire_date IS NOT NULL AND hire_date <= ?`,
+             WHERE COALESCE(first_hire_date, hire_date) IS NOT NULL
+               AND COALESCE(first_hire_date, hire_date) <= ?`,
             [end_date]
         );
         if (!staffList.length) {
@@ -91,6 +93,7 @@ const [batchResult] = await connection.execute(
         const batchId = batchResult.insertId;
         let totalStaff = 0;
         let totalAmount = 0;
+        const pendingAttendance = [];
 
         for (const staff of staffList) {
             const paidLeaveTypes = getPaidLeaveTypes(staff);
@@ -102,10 +105,37 @@ const [batchResult] = await connection.execute(
 // فترات التوظيف الفعلية المتقاطعة مع هذه الفترة تحديداً، مبنية من
 // staff_status_history — تدعم أكثر من فترة (تعيين -> إنهاء -> إعادة
 // تعيين) بدل الاعتماد على hire_date/termination_date كزوج وحيد.
-const employmentSpans = await getActiveSpansOverlapping(
-    staff.staff_id, start_date, end_date, connection
-);
-if (employmentSpans.length === 0) continue; // غير موظف إطلاقاً خلال هذه الفترة
+            const employmentSpans = await getActiveSpansOverlapping(
+                staff.staff_id, start_date, end_date, connection
+            );
+            if (employmentSpans.length === 0) continue; // غير موظف إطلاقاً خلال هذه الفترة
+
+            const isDateInEmployment = (dateStr) => employmentSpans.some((span) =>
+                dateStr >= span.start && (!span.end || dateStr <= span.end)
+            );
+
+            if (!acknowledgePending) {
+                const [pendingRows] = await connection.execute(
+                    `SELECT record_date, status
+                     FROM staff_attendance
+                     WHERE staff_id = ?
+                       AND record_date BETWEEN ? AND ?
+                       AND status IN ('Draft', 'Submitted', 'Rejected')
+                     ORDER BY record_date ASC`,
+                    [staff.staff_id, start_date, end_date]
+                );
+                for (const pending of pendingRows) {
+                    const recordDate = String(pending.record_date).slice(0, 10);
+                    if (isDateInEmployment(recordDate)) {
+                        pendingAttendance.push({
+                            staff_id: staff.staff_id,
+                            full_name: staff.full_name,
+                            record_date: recordDate,
+                            status: pending.status,
+                        });
+                    }
+                }
+            }
 
 const effectiveStart = employmentSpans[0].start;
 const effectiveEnd = employmentSpans[employmentSpans.length - 1].end;
@@ -113,6 +143,7 @@ const effectiveEnd = employmentSpans[employmentSpans.length - 1].end;
 const calendarDates = employmentSpans
     .flatMap((span) => listNonFridayDates(span.start, span.end))
     .sort();
+const calendarDateSet = new Set(calendarDates);
 const requiredDays = calendarDates.length;
 if (requiredDays <= 0) continue; // لا يوجد أي يوم عمل بهالفترة لهالموظف
 const [records] = await connection.execute(
@@ -124,11 +155,15 @@ const [records] = await connection.execute(
     [staff.staff_id, effectiveStart, effectiveEnd]
 );
 
-// جديد: إذا ما في ولا سجل حضور معتمد واحد لهذا الموظف بكامل الفترة،
+const relevantRecords = records.filter((record) =>
+    calendarDateSet.has(String(record.record_date).slice(0, 10))
+);
+
+// إذا ما في ولا سجل حضور معتمد واحد لهذا الموظف بكامل الفترة،
 // يعني ما كان متابَعًا بنظام الحضور إطلاقًا بهالفترة -> لا يُدرج بالراتب نهائيًا.
 // (هذا لا يغيّر شيئًا لأي موظف عنده سجل واحد على الأقل: منطق
 // "اليوم بدون سجل = غياب يُخصم" يبقى كما هو تمامًا لبقية الأيام الناقصة).
-if (records.length === 0) continue;
+if (relevantRecords.length === 0) continue;
 
 const recordsByDate = new Map();
 for (const record of records) {
@@ -162,7 +197,7 @@ let unpaidAbsenceDays = 0;
 
 // الجمعة: خارج requiredDays/requiredHours تمامًا. تُحسب أوفر تايم كامل
 // فقط إذا فيها سجل Present معتمد مع is_friday_worked = 1.
-for (const record of records) {
+for (const record of relevantRecords) {
     const recordDateStr = String(record.record_date).slice(0, 10);
     if (isFriday(recordDateStr) && record.attendance_status === 'Present' && Number(record.is_friday_worked) === 1) {
         dailyOtEarned += Number(record.regular_hours || 0) + Number(record.overtime_hours || 0);
@@ -215,9 +250,14 @@ for (const dateStr of calendarDates) {
             const shortageHours        = round2(workedDayShortfall + absenceShortfall);       // للعرض فقط
             const uncoveredShortageHours = round2(uncoveredWorked + absenceShortfall);
 
-const hourlyRateRaw   = Number(staff.monthly_salary) / requiredHours; // بدون تقريب وسطي
+const periodRequiredHours = round2(batchNonFridayDays * standardDailyHours);
+const prorationRatio = periodRequiredHours > 0
+    ? Math.min(1, Math.max(0, requiredHours / periodRequiredHours))
+    : 0;
+const proratedBaseSalary = money(Number(staff.monthly_salary) * prorationRatio);
+const hourlyRateRaw   = requiredHours > 0 ? proratedBaseSalary / requiredHours : 0;
 const salaryDeduction = money(uncoveredShortageHours * hourlyRateRaw);
-const netSalary        = money(Number(staff.monthly_salary) - salaryDeduction);
+const netSalary        = money(proratedBaseSalary - salaryDeduction);
 const hourlyRate       = money(hourlyRateRaw); // هاد بس للعرض/التخزين بالتقرير
 
             const [payrollResult] = await connection.execute(
@@ -226,14 +266,16 @@ const hourlyRate       = money(hourlyRateRaw); // هاد بس للعرض/الت�
                      present_days, paid_leave_days, management_paid_days, unpaid_absence_days,
                      overtime_hours, daily_rate, net_salary,
                      required_hours, ot_earned_hours, ot_used_hours, ot_remaining_hours,
-                     shortage_hours, salary_deduction_amount)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                     shortage_hours, salary_deduction_amount,
+                     employed_from, employed_to, prorated_base_salary, period_required_hours)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                              [
                     batchId, staff.staff_id, staff.monthly_salary, requiredDays,
                     presentDaysCount, paidLeaveDays, managementPaidDays, unpaidAbsenceDays,
                     otEarnedHours, hourlyRate, netSalary,
                     requiredHours, otEarnedHours, otUsedHours, otRemainingHours,
                     shortageHours, salaryDeduction,
+                    effectiveStart, effectiveEnd, proratedBaseSalary, periodRequiredHours,
                 ]
             );
             if (!payrollResult.insertId) continue;
@@ -270,6 +312,16 @@ const hourlyRate       = money(hourlyRateRaw); // هاد بس للعرض/الت�
 
             totalStaff += 1;
             totalAmount = money(totalAmount + netSalary);
+        }
+
+        if (pendingAttendance.length > 0 && !acknowledgePending) {
+            await connection.rollback();
+            return res.status(409).json({
+                status: 'error',
+                code: 'PENDING_ATTENDANCE',
+                message: 'Payroll cannot be generated while unresolved attendance exists in the employment period.',
+                pending_attendance: pendingAttendance,
+            });
         }
 
         if (!totalStaff) {
@@ -471,7 +523,7 @@ sheet.columns = [
                 staff_id: r.staff_unique_id,
                 full_name: r.full_name,
                 position: r.position || '-',
-                monthly_salary: Number(r.monthly_salary_snapshot || 0),
+                monthly_salary: Number(r.prorated_base_salary ?? r.monthly_salary_snapshot ?? 0),
                 working_days: r.working_days_in_period,
                 present_days: Number(r.present_days || 0),
                 paid_leave_days: Number(r.paid_leave_days || 0),
@@ -794,7 +846,7 @@ async function exportStaffPayrollPdf(req, res) {
                 staff_id: r.staff_unique_id,
                 full_name: r.full_name,
                 position: r.position || '-',
-                monthly_salary: money(r.monthly_salary_snapshot),
+                monthly_salary: money(r.prorated_base_salary ?? r.monthly_salary_snapshot),
                 present_days: fmt(r.present_days, 1),
                 paid_leave_days: fmt(r.paid_leave_days, 1),
                 mgmt_paid_days: fmt(r.management_paid_days || 0, 1),

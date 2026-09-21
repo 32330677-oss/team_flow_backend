@@ -1,19 +1,26 @@
 // services/staffEmploymentService.js
 //
-// يعيد بناء فترات التوظيف الفعلية (Active spans) لموظف الإداري من
-// staff_status_history بدل الاعتماد على زوج hire_date/termination_date
-// الوحيد. هذا يحل مشكلتين:
-// 1) تعليم موظف "Inactive" كان يخفيه من أي توليد/إعادة توليد لرواتب
-//    فترات قديمة كان فيها فعلاً شغال ومعتمد له حضور.
-// 2) إنهاء ثم إعادة تفعيل (Terminated -> Active) كان يفقد النظام معرفة
-//    أن هذا موظف قديم رجع، وقد يُحسب راتب فترة تقع داخل فجوة الانقطاع
-//    وكأنه كان موظفاً طوال الوقت.
+// The single source of truth for whether a staff member was employed on a
+// calendar date. Active spans are reconstructed from the original hire anchor
+// plus staff_status_history. Existing date semantics are preserved:
+// a status change effective on D starts/ends eligibility at the history
+// boundary, and a termination is effective for payroll/attendance from D
+// onward (therefore the active span ends on D - 1).
 
 const db = require('../config/db');
 
 function toDateOnly(value) {
     if (!value) return null;
     return String(value).slice(0, 10);
+}
+
+function isValidDateOnly(value) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))) return false;
+    const [year, month, day] = String(value).split('-').map(Number);
+    const date = new Date(Date.UTC(year, month - 1, day));
+    return date.getUTCFullYear() === year
+        && date.getUTCMonth() === month - 1
+        && date.getUTCDate() === day;
 }
 
 function subtractOneDay(dateStr) {
@@ -23,20 +30,22 @@ function subtractOneDay(dateStr) {
 }
 
 /**
- * يبني قائمة فترات "Active" الكاملة لموظف معيّن، بالترتيب الزمني.
- * end === null تعني أن الفترة ما زالت مستمرة حتى الآن.
+ * Builds all complete Active spans for one staff member in chronological order.
+ * end === null means the span is open-ended.
  */
 async function getActiveSpans(staffId, executor = db) {
     const [staffRows] = await executor.execute(
-        `SELECT hire_date, first_hire_date FROM staff_members WHERE staff_id = ? LIMIT 1`,
+        `SELECT hire_date, first_hire_date, termination_date, status
+         FROM staff_members WHERE staff_id = ? LIMIT 1`,
         [staffId]
     );
     if (staffRows.length === 0) return [];
 
-    // first_hire_date هو المرساة الثابتة؛ hire_date احتياطي للموظفين
-    // القدامى الذين أُنشئوا قبل إضافة هذا العمود.
-    const anchor = toDateOnly(staffRows[0].first_hire_date) || toDateOnly(staffRows[0].hire_date);
-    if (!anchor) return [];
+    const staff = staffRows[0];
+    // first_hire_date is the immutable anchor when present; hire_date is the
+    // verified legacy fallback for rows created before that column was used.
+    const anchor = toDateOnly(staff.first_hire_date) || toDateOnly(staff.hire_date);
+    if (!anchor || !isValidDateOnly(anchor)) return [];
 
     const [history] = await executor.execute(
         `SELECT new_status, effective_date
@@ -46,13 +55,18 @@ async function getActiveSpans(staffId, executor = db) {
         [staffId]
     );
 
+    // A legacy Inactive row without a status-history boundary or explicit
+    // termination date is ambiguous. Do not guess an end date or treat it as
+    // currently employed; diagnostics identify these rows for review.
+    if (history.length === 0 && staff.status !== 'Active' && !staff.termination_date) return [];
+
     const spans = [];
     let cursorDate = anchor;
-    let cursorStatus = 'Active'; // كل موظف يبدأ Active عند التوظيف
+    let cursorStatus = 'Active';
 
     for (const row of history) {
         const rowDate = toDateOnly(row.effective_date);
-        if (!rowDate) continue;
+        if (!rowDate || !isValidDateOnly(rowDate)) continue;
 
         if (cursorStatus === 'Active') {
             const lastActiveDay = subtractOneDay(rowDate);
@@ -60,22 +74,36 @@ async function getActiveSpans(staffId, executor = db) {
                 spans.push({ start: cursorDate, end: lastActiveDay });
             }
         }
+
         cursorStatus = row.new_status;
         cursorDate = rowDate;
     }
 
     if (cursorStatus === 'Active') {
-        spans.push({ start: cursorDate, end: null }); // ما زال Active الآن
+        spans.push({ start: cursorDate, end: null });
+    } else if (spans.length === 0 && staff.status !== 'Active' && staff.termination_date) {
+        // Legacy terminated rows may have no status-history rows. Use only the
+        // explicit stored termination date; never manufacture one.
+        const terminationDate = toDateOnly(staff.termination_date);
+        const lastActiveDay = terminationDate && isValidDateOnly(terminationDate)
+            ? subtractOneDay(terminationDate)
+            : null;
+        if (lastActiveDay && lastActiveDay >= anchor) {
+            spans.push({ start: anchor, end: lastActiveDay });
+        }
     }
 
     return spans;
 }
 
 /**
- * يرجّع فترات Active المتقاطعة فقط مع [periodStart, periodEnd]، مقصوصة
- * على حدود الفترة المطلوبة (وأبداً بعد اليوم الحالي).
+ * Returns Active spans intersecting [periodStart, periodEnd], clipped to the
+ * requested period and never beyond the current date (the established payroll
+ * behavior: future days cannot become automatic absences).
  */
 async function getActiveSpansOverlapping(staffId, periodStart, periodEnd, executor = db) {
+    if (!isValidDateOnly(periodStart) || !isValidDateOnly(periodEnd) || periodStart > periodEnd) return [];
+
     const todayStr = new Date().toISOString().slice(0, 10);
     const clampedPeriodEnd = periodEnd > todayStr ? todayStr : periodEnd;
     if (periodStart > clampedPeriodEnd) return [];
@@ -94,10 +122,19 @@ async function getActiveSpansOverlapping(staffId, periodStart, periodEnd, execut
     return overlapping;
 }
 
-/** true إذا كان للموظف أكثر من فترة Active واحدة (أي انتهى ثم رجع). */
+async function isEmployedOnDate(staffId, date, executor = db) {
+    const spans = await getActiveSpansOverlapping(staffId, date, date, executor);
+    return spans.length > 0;
+}
+
 async function isReturningEmployee(staffId, executor = db) {
     const spans = await getActiveSpans(staffId, executor);
     return spans.length > 1;
 }
 
-module.exports = { getActiveSpans, getActiveSpansOverlapping, isReturningEmployee };
+module.exports = {
+    getActiveSpans,
+    getActiveSpansOverlapping,
+    isEmployedOnDate,
+    isReturningEmployee,
+};

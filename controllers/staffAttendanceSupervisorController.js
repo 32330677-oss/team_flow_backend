@@ -5,6 +5,7 @@ const {
   isFriday,
   calculateStaffShiftHours,
 } = require('../services/staffAttendanceService');
+const { getActiveSpansOverlapping } = require('../services/staffEmploymentService');
 
 const ATTENDANCE_STATUSES = ['Present', 'Absent', 'Sick', 'Vacation', 'Holiday'];
 
@@ -61,9 +62,15 @@ exports.getDayView = async (req, res) => {
        ORDER BY sm.full_name`,
       [date, ...assignedIds]
     );
+    const eligibleRows = [];
+    for (const row of rows) {
+      const spans = await getActiveSpansOverlapping(row.staff_id, date, date);
+      if (spans.length > 0) eligibleRows.push(row);
+    }
+
     res.status(200).json({
       status: 'success',
-      data: rows,
+      data: eligibleRows,
       is_friday: isFriday(date), // lets the frontend show the confirmation banner
     });
   } catch (error) {
@@ -174,10 +181,15 @@ if (record_date > maxAllowed) {
          ORDER BY sm.full_name`,
         [record_date, ...assignedIds]
       );
+      const eligibleRequiredRows = [];
+      for (const row of requiredRows) {
+        const spans = await getActiveSpansOverlapping(row.staff_id, record_date, record_date, connection);
+        if (spans.length > 0) eligibleRequiredRows.push(row);
+      }
       const entriesByStaffId = new Map(
         entries.map((entry) => [Number(entry.staff_id), entry.attendance_status])
       );
-      const missing = requiredRows.filter((row) => {
+      const missing = eligibleRequiredRows.filter((row) => {
         const status = entriesByStaffId.has(row.staff_id)
           ? entriesByStaffId.get(row.staff_id)
           : row.attendance_status;
@@ -238,6 +250,20 @@ if (record_date > maxAllowed) {
         results.skipped.push({
           staff_id: staffId,
           reason: 'Staff member not found or inactive.'
+        });
+        continue;
+      }
+
+      const employmentSpans = await getActiveSpansOverlapping(
+        staffId,
+        record_date,
+        record_date,
+        connection
+      );
+      if (employmentSpans.length === 0) {
+        results.skipped.push({
+          staff_id: staffId,
+          reason: 'Staff member was not employed on this date.'
         });
         continue;
       }

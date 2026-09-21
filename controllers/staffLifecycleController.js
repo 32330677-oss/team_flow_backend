@@ -63,7 +63,22 @@ exports.changeStatus = async (req, res) => {
       await connection.rollback();
       return res.status(400).json({ status: 'error', message: `Staff member is already ${new_status}.` });
     }
+const [[lastHistory]] = await connection.execute(
+  `SELECT effective_date
+   FROM staff_status_history
+   WHERE staff_id = ?
+   ORDER BY effective_date DESC, status_history_id DESC
+   LIMIT 1`,
+  [staffId]
+);
 
+if (lastHistory && effective_date < lastHistory.effective_date) {
+  await connection.rollback();
+  return res.status(400).json({
+    status: 'error',
+    message: 'Effective date cannot be before the last recorded status change.'
+  });
+}
     // Terminated is not a dead end anymore: the ONLY allowed transition out
     // of Terminated is a reactivation back to Active.
     // Terminated -> Inactive and Terminated -> Terminated stay blocked.

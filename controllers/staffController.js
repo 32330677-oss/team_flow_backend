@@ -3,6 +3,15 @@ const { acquireCreateLock, releaseCreateLock } = require('../middleware/duplicat
 
 const DEFAULT_DAILY_HOURS = 8.00;
 
+function isValidDateOnly(value) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))) return false;
+    const [year, month, day] = String(value).split('-').map(Number);
+    const date = new Date(Date.UTC(year, month - 1, day));
+    return date.getUTCFullYear() === year
+        && date.getUTCMonth() === month - 1
+        && date.getUTCDate() === day;
+}
+
 function parsePaidLeaveTypes(value) {
     if (value === undefined || value === null || value === '') return null;
     if (Array.isArray(value)) return JSON.stringify(value);
@@ -22,8 +31,8 @@ exports.getAllStaff = async (req, res) => {
     try {
         const [rows] = await db.query(
             `SELECT sm.staff_id, sm.staff_unique_id, sm.full_name, sm.phone_number, sm.position,
-                    sm.site_id, s.site_name, sm.hire_date, sm.monthly_salary, sm.standard_daily_hours,
-                    sm.paid_leave_types, sm.status, sm.created_at
+                    sm.site_id, s.site_name, sm.hire_date, sm.first_hire_date, sm.termination_date,
+                    sm.monthly_salary, sm.standard_daily_hours, sm.paid_leave_types, sm.status, sm.created_at
              FROM staff_members sm
              LEFT JOIN sites s ON s.site_id = sm.site_id
              ORDER BY sm.created_at DESC`
@@ -44,6 +53,9 @@ exports.createStaff = async (req, res) => {
 
     if (!full_name || monthly_salary === undefined || monthly_salary === null) {
         return res.status(400).json({ status: 'error', message: 'Please provide the full name and monthly salary' });
+    }
+    if (!isValidDateOnly(hire_date)) {
+        return res.status(400).json({ status: 'error', message: 'A valid hire_date (YYYY-MM-DD) is required' });
     }
 
     const numericSalary = Number(monthly_salary);
@@ -93,7 +105,7 @@ exports.createStaff = async (req, res) => {
             );
         }
 
-        const effectiveHireDate = hire_date || null;
+        const effectiveHireDate = hire_date;
 
         const [staffResult] = await connection.query(
             `INSERT INTO staff_members
@@ -148,6 +160,35 @@ exports.updateStaff = async (req, res) => {
         }
         const current = existing[0];
 
+        let effectiveHireDate = current.hire_date;
+        if (hire_date !== undefined) {
+            if (!isValidDateOnly(hire_date)) {
+                throw Object.assign(new Error('A valid hire_date (YYYY-MM-DD) is required'), { isOperational: true });
+            }
+            effectiveHireDate = hire_date;
+        }
+
+        const currentHireDate = current.hire_date
+            ? String(current.hire_date).slice(0, 10)
+            : null;
+        if (effectiveHireDate !== currentHireDate) {
+            const [payrollRows] = await connection.execute(
+                `SELECT sp.staff_payroll_id
+                 FROM staff_payroll sp
+                 JOIN staff_payroll_batches spb
+                   ON spb.staff_payroll_batch_id = sp.staff_payroll_batch_id
+                 WHERE sp.staff_id = ? AND spb.status <> 'Superseded'
+                 LIMIT 1`,
+                [id]
+            );
+            if (payrollRows.length > 0) {
+                throw Object.assign(
+                    new Error('Hire date cannot be changed while this staff member has payroll in a non-superseded batch.'),
+                    { isOperational: true, statusCode: 409 }
+                );
+            }
+        }
+
         if (site_id !== undefined && site_id !== null && site_id !== '') {
             const [siteRows] = await connection.query('SELECT site_id FROM sites WHERE site_id = ? LIMIT 1', [site_id]);
             if (siteRows.length === 0) {
@@ -181,7 +222,7 @@ exports.updateStaff = async (req, res) => {
                 phone_number !== undefined ? phone_number : current.phone_number,
                 position !== undefined ? position : current.position,
                 site_id !== undefined ? (site_id || null) : current.site_id,
-                hire_date !== undefined ? (hire_date || null) : current.hire_date,
+                effectiveHireDate,
                 numericSalary,
                 numericDailyHours,
                 paid_leave_types !== undefined ? parsePaidLeaveTypes(paid_leave_types) : current.paid_leave_types,
@@ -194,7 +235,7 @@ exports.updateStaff = async (req, res) => {
     } catch (error) {
         await connection.rollback();
         console.error('UPDATE STAFF ERROR:', error);
-        const status = error.isOperational ? 400 : 500;
+        const status = error.statusCode || (error.isOperational ? 400 : 500);
         return res.status(status).json({
             status: 'error',
             message: error.isOperational ? error.message : 'An error occurred while updating the staff member'
@@ -203,4 +244,3 @@ exports.updateStaff = async (req, res) => {
         connection.release();
     }
 };
-

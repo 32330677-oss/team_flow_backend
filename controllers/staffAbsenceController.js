@@ -17,6 +17,7 @@
 //   router.post('/admin/absences/unmark-paid', restrictTo('Admin'), staffAbsenceController.unmarkAbsencePaid);
 
 const db = require('../config/db');
+const { getActiveSpansOverlapping } = require('../services/staffEmploymentService');
 
 function isValidDateOnly(value) {
     return /^\d{4}-\d{2}-\d{2}$/.test(String(value || ''));
@@ -58,6 +59,17 @@ exports.getAbsenceSummary = async (req, res) => {
 
         const byStaff = new Map();
         for (const row of rows) {
+            const employedSpans = await getActiveSpansOverlapping(
+                row.staff_id,
+                start_date,
+                end_date
+            );
+            const recordDate = String(row.record_date).slice(0, 10);
+            const employedOnRecordDate = employedSpans.some((span) =>
+                recordDate >= span.start && (!span.end || recordDate <= span.end)
+            );
+            if (!employedOnRecordDate) continue;
+
             if (!byStaff.has(row.staff_id)) {
                 byStaff.set(row.staff_id, {
                     staff_id: row.staff_id,
