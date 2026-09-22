@@ -2060,17 +2060,43 @@ exports.resubmitAttendance = async (req, res) => {
         if (!checkInDate || !checkOutDate || checkOutDate <= checkInDate) {
             throw new AppError('Check-out time must be after check-in time');
         }
+const [resubmitted] = await connection.execute(
+    `UPDATE attendance
+     SET check_in_time = ?,
+         check_out_time = ?,
+         attendance_status = 'Present',
+         remarks = ?,
+         status = 'Submitted',
+         management_leave_hours = 0,
+         updated_at = NOW()
+     WHERE attendance_id = ?
+       AND status = 'Rejected'`,
+    [formattedCheckIn, formattedCheckOut, remarks ?? null, attendance_id]
+);
 
-        const [resubmitted] = await connection.execute(
-            `UPDATE attendance SET check_in_time = ?, check_out_time = ?, attendance_status = 'Present', remarks = ?, status = 'Submitted', updated_at = NOW() WHERE attendance_id = ? AND status = 'Rejected'`,
-            [formattedCheckIn, formattedCheckOut, remarks, attendance_id]
-        );
         if (resubmitted.affectedRows !== 1) throw new AppError('Attendance was changed by another request.');
 
-        await connection.execute(
-            `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values) VALUES (?, ?, ?, ?, ?, ?)`,
-            ['attendance', attendance_id, 'RESUBMIT', supervisor_id, JSON.stringify(oldRecord), JSON.stringify({ check_in_time: formattedCheckIn, check_out_time: formattedCheckOut, remarks, status: 'Submitted' })]
-        );
+      await connection.execute(
+    `INSERT INTO auditlogs
+        (table_name, record_id, action_type, user_id, old_values, new_values)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [
+        'attendance',
+        attendance_id,
+        'RESUBMIT',
+        supervisor_id,
+        JSON.stringify(oldRecord),
+        JSON.stringify({
+            check_in_time: formattedCheckIn,
+            check_out_time: formattedCheckOut,
+            attendance_status: 'Present',
+            remarks: remarks ?? null,
+            status: 'Submitted',
+            management_leave_hours: 0
+        })
+    ]
+);
+
 
         await attendanceService.calculateWorkingHours(attendance_id, connection);
         await connection.commit();
