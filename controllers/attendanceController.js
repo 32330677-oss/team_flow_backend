@@ -225,13 +225,18 @@ exports.checkIn = async (req, res) => {
                 return res.status(409).json({ status: 'error', message: 'Worker already has a finalized attendance record for today.' });
             }
             if (['Absent', 'Sick', 'Vacation', 'Holiday'].includes(existing.attendance_status) && !existing.check_in_time && !existing.check_out_time) {
-                const [revived] = await connection.execute(
-                    `UPDATE attendance
-                     SET check_in_time = ?, attendance_status = 'Present', remarks = NULL
-                     WHERE attendance_id = ? AND status = 'Draft'
-                       AND check_in_time IS NULL AND check_out_time IS NULL`,
-                    [formattedCheckIn, existing.attendance_id]
-                );
+            const [revived] = await connection.execute(
+    `UPDATE attendance
+     SET check_in_time = ?,
+         attendance_status = 'Present',
+         management_leave_hours = 0,
+         total_working_hours = NULL,
+         overtime_hours = 0,
+         remarks = NULL
+     WHERE attendance_id = ? AND status = 'Draft'
+       AND check_in_time IS NULL AND check_out_time IS NULL`,
+    [formattedCheckIn, existing.attendance_id]
+);
                 if (revived.affectedRows !== 1) throw new AppError('Attendance was changed by another request.');
 
                 await connection.execute(
