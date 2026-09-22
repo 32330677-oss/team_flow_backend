@@ -65,6 +65,25 @@ async function generatePayrollBatch(req, res) {
     const scopedSite = isSpecificSite(site_id);
     const scopeSiteId = scopedSite ? Number(site_id) : null;
 
+    const [overlapping] = await connection.execute(
+      `SELECT payroll_batch_id, start_date, end_date, scope_site_id
+       FROM payrollbatches
+       WHERE status <> 'Superseded'
+         AND start_date <= ? AND end_date >= ?
+         AND NOT (start_date = ? AND end_date = ? AND scope_site_id <=> ?)
+         AND (scope_site_id <=> ? OR scope_site_id IS NULL OR ? IS NULL)
+       LIMIT 1
+       FOR UPDATE`,
+      [end_date, start_date, start_date, end_date, scopeSiteId, scopeSiteId, scopeSiteId]
+    );
+    if (overlapping.length) {
+      await connection.rollback();
+      return res.status(409).json({
+        success: false,
+        message: `This period overlaps existing payroll batch #${overlapping[0].payroll_batch_id}. Adjust the dates or supersede/finalize the existing batch first.`
+      });
+    }
+
     // --- find any active batch(es) for this exact period + scope ---
     const [existingBatches] = await connection.execute(
       `SELECT payroll_batch_id, version_number, is_finalized, status
@@ -192,9 +211,10 @@ async function generatePayrollBatch(req, res) {
 
       if (comp.payment_type === 'Daily') {
         let dayFraction;
-        if (rec.attendance_status === 'Absent') {
-          dayFraction = 0;
-        } else if (['Sick', 'Vacation', 'Holiday'].includes(rec.attendance_status)) {
+        const workedHours = Number(rec.total_working_hours || 0);
+        const nonWorkingStatus = ['Absent', 'Sick', 'Vacation', 'Holiday'].includes(rec.attendance_status);
+        const hasManagementHours = workedHours > 0 && nonWorkingStatus;
+        if (nonWorkingStatus && !hasManagementHours) {
           dayFraction = 0;
         } else {
           const standardMinutes = Number(rec.standard_minutes_snapshot) > 0
@@ -202,7 +222,6 @@ async function generatePayrollBatch(req, res) {
             : fallbackStandardMinutes;
 
           const standardHours = standardMinutes / 60;
-          const workedHours = Number(rec.total_working_hours || 0);
 
           dayFraction = standardHours > 0
             ? Math.min(1, workedHours / standardHours)
@@ -550,7 +569,7 @@ async function getPayrollBatchDetails(req, res) {
       return {
         ...p,
         pay_type: sites[0]?.pay_type || 'Hourly',
-        days_worked: sites.reduce((sum, s) => sum + (s.days_worked || 0), 0),
+        days_worked: sites.reduce((sum, s) => sum + Number(s.days_worked || 0), 0),
         regular_hours_worked: sites.reduce((sum, s) => sum + Number(s.regular_hours_worked || 0), 0),
         overtime_hours_worked: sites.reduce((sum, s) => sum + Number(s.overtime_hours_worked || 0), 0),
         daily_rate: sites[0]?.daily_rate_snapshot ?? null,

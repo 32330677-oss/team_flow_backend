@@ -22,6 +22,18 @@ function requireRecordDate(value) {
     return String(value);
 }
 
+function businessTodayDateOnly() {
+    const timeZone = process.env.APP_TIME_ZONE || 'Asia/Beirut';
+    const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+    }).formatToParts(new Date());
+    const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+    return `${values.year}-${values.month}-${values.day}`;
+}
+
 const SUPERVISOR_ALLOWED_LEAVE_TYPES = ['Rest', 'Lunch'];
 function formatToMySqlDateTime(value) {
     if (!value) return null;
@@ -54,11 +66,11 @@ async function getAttendanceId(worker_id, site_id, recordDate, executor = db, fo
     const [rows] = await executor.execute(
         `SELECT attendance_id FROM attendance
          WHERE worker_id = ? AND site_id = ?
-           AND record_date >= DATE_SUB(?, INTERVAL 1 DAY)
+           AND record_date BETWEEN DATE_SUB(?, INTERVAL 1 DAY) AND ?
            AND check_in_time IS NOT NULL AND check_out_time IS NULL
            AND status = 'Draft'
          ORDER BY check_in_time DESC, attendance_id DESC LIMIT 1${lock}`,
-        [worker_id, site_id, recordDate]
+        [worker_id, site_id, recordDate, recordDate]
     );
     return rows.length > 0 ? rows[0].attendance_id : null;
 }
@@ -71,17 +83,19 @@ async function verifySupervisorSite(userId, siteId) {
     return rows.length > 0;
 }
 
-async function verifyWorkerAssignedToSite(workerId, siteId) {
+async function verifyWorkerAssignedToSite(workerId, siteId, recordDate = null) {
+    const effectiveDate = recordDate || businessTodayDateOnly();
     const [rows] = await db.execute(
         `SELECT 1
          FROM workersiteassignments wsa
          JOIN workers w ON w.worker_id = wsa.worker_id
          WHERE wsa.worker_id = ?
            AND wsa.site_id = ?
-           AND wsa.unassigned_date IS NULL
+           AND wsa.assigned_date <= ?
+           AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date > ?)
            AND w.status = 'Active'
          LIMIT 1`,
-        [workerId, siteId]
+        [workerId, siteId, effectiveDate, effectiveDate]
     );
     return rows.length > 0;
 }
@@ -127,16 +141,17 @@ exports.getSiteWorkers = async (req, res) => {
                   AND a2.site_id = ?
                   AND (a2.record_date = ?
                        OR (a2.status = 'Draft' AND a2.check_in_time IS NOT NULL AND a2.check_out_time IS NULL
-                           AND a2.record_date >= DATE_SUB(?, INTERVAL 1 DAY)))
+                           AND a2.record_date = DATE_SUB(?, INTERVAL 1 DAY)))
                 ORDER BY (a2.record_date = ?) DESC, a2.attendance_id DESC
                 LIMIT 1
             )
             WHERE wsa.site_id = ?
-            AND wsa.unassigned_date IS NULL
+            AND wsa.assigned_date <= ?
+            AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date > ?)
             AND w.status = 'Active'
         `;
 
-        const [workers] = await db.execute(query, [siteId, recordDate, recordDate, recordDate, siteId]);
+        const [workers] = await db.execute(query, [siteId, recordDate, recordDate, recordDate, siteId, recordDate, recordDate]);
         res.status(200).json({ status: 'success', data: workers });
     } catch (error) {
         console.error("SQL ERROR:", error);
@@ -160,16 +175,19 @@ exports.checkIn = async (req, res) => {
         return res.status(400).json({ status: 'error', message: 'Invalid check-in time format.' });
     }
 
+    const recordDate = formattedCheckIn.slice(0, 10);
+    if (recordDate > businessTodayDateOnly()) {
+        return res.status(400).json({ status: 'error', message: 'Check-in date cannot be in the future.' });
+    }
+
     if (!(await verifySiteAction(req, site_id))) {
         return res.status(403).json({ status: 'error', message: 'You are not authorized to record attendance at this site.' });
     }
-    if (!(await verifyWorkerAssignedToSite(worker_id, site_id))) {
+    if (!(await verifyWorkerAssignedToSite(worker_id, site_id, recordDate))) {
         return res.status(400).json({ status: 'error', message: 'Worker is not active or is not assigned to this site.' });
     }
 
-    const recordDate = formattedCheckIn.slice(0, 10);
     const connection = await db.getConnection();
-
     try {
         await connection.beginTransaction();
 
@@ -273,16 +291,20 @@ function normalizeWorkerIds(value) {
     return ids;
 }
 
-async function verifyBulkWorkers(workerIds, siteId, executor) {
+async function verifyBulkWorkers(workerIds, siteId, recordDate, executor) {
     const valid = new Set();
     for (const workerId of workerIds) {
         const [rows] = await executor.execute(
-            `SELECT 1 FROM workersiteassignments wsa
+            `SELECT 1
+             FROM workersiteassignments wsa
              JOIN workers w ON w.worker_id = wsa.worker_id
-             WHERE wsa.worker_id = ? AND wsa.site_id = ?
-               AND wsa.unassigned_date IS NULL AND w.status = 'Active'
+             WHERE wsa.worker_id = ?
+               AND wsa.site_id = ?
+               AND wsa.assigned_date <= ?
+               AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date > ?)
+               AND w.status = 'Active'
              LIMIT 1`,
-            [workerId, siteId]
+            [workerId, siteId, recordDate, recordDate]
         );
         if (rows.length > 0) valid.add(workerId);
     }
@@ -310,6 +332,9 @@ async function runBulkAttendance(req, res, mode) {
 
     const formattedTime = formatToMySqlDateTime(rawTime);
     if (!formattedTime) return res.status(400).json({ status: 'error', message: `Invalid ${timeField} format.` });
+    if (mode === 'checkin' && formattedTime.slice(0, 10) > businessTodayDateOnly()) {
+        return res.status(400).json({ status: 'error', message: 'Check-in date cannot be in the future.' });
+    }
     if (!(await verifySiteAction(req, site_id))) {
         return res.status(403).json({ status: 'error', message: 'You are not authorized to manage this site.' });
     }
@@ -319,7 +344,7 @@ async function runBulkAttendance(req, res, mode) {
 
     try {
         await connection.beginTransaction();
-        const validWorkers = await verifyBulkWorkers(workerIds, site_id, connection);
+        const validWorkers = await verifyBulkWorkers(workerIds, site_id, record_date, connection);
 
         for (const workerId of workerIds) {
             if (!validWorkers.has(workerId)) {
@@ -473,7 +498,7 @@ exports.setAttendanceStatus = async (req, res) => {
     if (!(await verifySiteAction(req, site_id))) {
         return res.status(403).json({ status: 'error', message: 'You are not authorized to update this site.' });
     }
-    if (!(await verifyWorkerAssignedToSite(worker_id, site_id))) {
+    if (!(await verifyWorkerAssignedToSite(worker_id, site_id, record_date))) {
         return res.status(400).json({ status: 'error', message: 'Worker is not active or is not assigned to this site.' });
     }
 
@@ -575,6 +600,11 @@ exports.editAttendanceTimes = async (req, res) => {
         if (check_in_time && !newCheckIn) throw new AppError('Invalid check-in time format.');
         if (check_out_time && !newCheckOut) throw new AppError('Invalid check-out time format.');
 
+        const recordDateStr = String(record.record_date).slice(0, 10);
+        if (newCheckIn && newCheckIn.slice(0, 10) !== recordDateStr) {
+            throw new AppError(`Check-in date (${newCheckIn.slice(0, 10)}) must match the attendance record's date (${recordDateStr}).`);
+        }
+
         if (newCheckIn && newCheckOut) {
             const start = parseAttendanceDate(newCheckIn);
             const end = parseAttendanceDate(newCheckOut);
@@ -639,7 +669,7 @@ exports.checkOut = async (req, res) => {
     const formattedCheckOut = formatToMySqlDateTime(check_out_time);
     if (!formattedCheckOut) return res.status(400).json({ status: 'error', message: 'Invalid check-out time format.' });
     if (!(await verifySiteAction(req, site_id))) return res.status(403).json({ status: 'error', message: 'You are not authorized to perform this action at the specified site.' });
-    if (!(await verifyWorkerAssignedToSite(worker_id, site_id))) return res.status(400).json({ status: 'error', message: 'Worker is not active or is not assigned to this site.' });
+    if (!(await verifyWorkerAssignedToSite(worker_id, site_id, record_date))) return res.status(400).json({ status: 'error', message: 'Worker is not active or is not assigned to this site.' });
 
     const connection = await db.getConnection();
     try {
@@ -1089,7 +1119,11 @@ exports.submitDay = async (req, res) => {
                AND a.status = 'Draft'
                AND (
                     a.record_date = ?
-                    OR a.record_date = DATE_SUB(?, INTERVAL 1 DAY)
+                    OR (
+                        a.record_date = DATE_SUB(?, INTERVAL 1 DAY)
+                        AND a.check_out_time IS NOT NULL
+                        AND DATE(a.check_out_time) > a.record_date
+                    )
                )
                AND a.check_in_time IS NOT NULL
                AND a.check_out_time IS NOT NULL
@@ -1120,7 +1154,11 @@ exports.submitDay = async (req, res) => {
                    AND alp.leave_end_time IS NOT NULL
                    AND (
                         a.record_date = ?
-                        OR a.record_date = DATE_SUB(?, INTERVAL 1 DAY)
+                        OR (
+                            a.record_date = DATE_SUB(?, INTERVAL 1 DAY)
+                            AND a.check_out_time IS NOT NULL
+                            AND DATE(a.check_out_time) > a.record_date
+                        )
                    )`,
                 [siteId, record_date, record_date]
             );
@@ -1452,7 +1490,8 @@ exports.submitDay = async (req, res) => {
                ON w.worker_id = wsa.worker_id
               AND w.status = 'Active'
              WHERE wsa.site_id = ?
-               AND wsa.unassigned_date IS NULL
+               AND wsa.assigned_date <= ?
+               AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date > ?)
                AND NOT EXISTS (
                    SELECT 1
                    FROM attendance a
@@ -1464,6 +1503,8 @@ exports.submitDay = async (req, res) => {
                 record_date,
                 req.user.user_id,
                 siteId,
+                record_date,
+                record_date,
                 record_date
             ]
         );
@@ -1478,7 +1519,11 @@ exports.submitDay = async (req, res) => {
              WHERE site_id = ?
                AND (
                     record_date = ?
-                    OR record_date = DATE_SUB(?, INTERVAL 1 DAY)
+                    OR (
+                        record_date = DATE_SUB(?, INTERVAL 1 DAY)
+                        AND check_out_time IS NOT NULL
+                        AND DATE(check_out_time) > record_date
+                    )
                )
                AND status = 'Draft'
                AND check_in_time IS NOT NULL
@@ -1507,7 +1552,11 @@ exports.submitDay = async (req, res) => {
              WHERE site_id = ?
                AND (
                     record_date = ?
-                    OR record_date = DATE_SUB(?, INTERVAL 1 DAY)
+                    OR (
+                        record_date = DATE_SUB(?, INTERVAL 1 DAY)
+                        AND check_out_time IS NOT NULL
+                        AND DATE(check_out_time) > record_date
+                    )
                )
                AND status = 'Draft'`,
             [
@@ -1636,7 +1685,7 @@ exports.startLeave = async (req, res) => {
         if (!(await verifySiteAction(req, site_id))) {
             return res.status(403).json({ status: 'error', message: 'You are not authorized to manage leave at this site.' });
         }
-        if (!(await verifyWorkerAssignedToSite(worker_id, site_id))) {
+        if (!(await verifyWorkerAssignedToSite(worker_id, site_id, record_date))) {
             return res.status(400).json({ status: 'error', message: 'Worker is not active or is not assigned to this site.' });
         }
 
@@ -1720,7 +1769,7 @@ exports.endLeave = async (req, res) => {
         if (!(await verifySiteAction(req, site_id))) {
             return res.status(403).json({ status: 'error', message: 'You are not authorized to manage leave at this site.' });
         }
-        if (!(await verifyWorkerAssignedToSite(worker_id, site_id))) {
+        if (!(await verifyWorkerAssignedToSite(worker_id, site_id, record_date))) {
             return res.status(400).json({ status: 'error', message: 'Worker is not active or is not assigned to this site.' });
         }
 
@@ -1923,7 +1972,7 @@ exports.resubmitAttendance = async (req, res) => {
         if (!(await verifySiteAction(req, oldRecord.site_id))) {
             throw new AppError('You are not authorized to resubmit attendance for this site.');
         }
-        if (!(await verifyWorkerAssignedToSite(oldRecord.worker_id, oldRecord.site_id))) {
+        if (!(await verifyWorkerAssignedToSite(oldRecord.worker_id, oldRecord.site_id, oldRecord.record_date))) {
             throw new AppError('Worker is not active or is not assigned to this site.');
         }
         const [openLeaves] = await connection.execute(
@@ -1936,6 +1985,11 @@ exports.resubmitAttendance = async (req, res) => {
         const formattedCheckOut = formatToMySqlDateTime(check_out_time);
         if (!formattedCheckIn || !formattedCheckOut) {
             throw new AppError('Both check-in and check-out times are required');
+        }
+
+        const recordDateStr = String(oldRecord.record_date).slice(0, 10);
+        if (formattedCheckIn.slice(0, 10) !== recordDateStr) {
+            throw new AppError(`Check-in date (${formattedCheckIn.slice(0, 10)}) must match the attendance record's date (${recordDateStr}).`);
         }
 
         const checkInDate = parseAttendanceDate(formattedCheckIn);
