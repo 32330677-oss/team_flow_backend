@@ -806,19 +806,24 @@ exports.saveLunchBulk = async (req, res) => {
             return res.status(400).json({ status: 'error', message: 'Invalid default lunch time format.' });
         }
 
-        const [records] = await db.execute(
-            `SELECT a.attendance_id, a.worker_id, a.check_in_time, a.check_out_time
-             FROM attendance a
-             JOIN workers w ON w.worker_id = a.worker_id
-             JOIN workersiteassignments wsa ON wsa.worker_id = a.worker_id AND wsa.site_id = a.site_id
-             WHERE a.site_id = ? AND (a.record_date = ? OR
-                    (a.record_date = DATE_SUB(?, INTERVAL 1 DAY)
-                     AND DATE(a.check_out_time) > a.record_date))
-               AND a.status = 'Draft'
-               AND w.status = 'Active' AND wsa.unassigned_date IS NULL
-               AND a.check_in_time IS NOT NULL AND a.check_out_time IS NOT NULL`,
-            [siteId, selectedDate, selectedDate]
-        );
+   const [records] = await db.execute(
+    `SELECT a.attendance_id, a.worker_id, a.check_in_time, a.check_out_time
+     FROM attendance a
+     JOIN workers w ON w.worker_id = a.worker_id
+     JOIN workersiteassignments wsa
+       ON wsa.worker_id = a.worker_id
+      AND wsa.site_id = a.site_id
+      AND wsa.assigned_date <= a.record_date
+      AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date > a.record_date)
+     WHERE a.site_id = ? AND (a.record_date = ? OR
+            (a.record_date = DATE_SUB(?, INTERVAL 1 DAY)
+             AND DATE(a.check_out_time) > a.record_date))
+       AND a.status = 'Draft'
+       AND w.status = 'Active'
+       AND a.check_in_time IS NOT NULL
+       AND a.check_out_time IS NOT NULL`,
+    [siteId, selectedDate, selectedDate]
+);
         if (records.length === 0) {
             return res.status(400).json({ status: 'error', message: 'No completed attendance records found for this date.' });
         }
@@ -1099,7 +1104,57 @@ exports.submitDay = async (req, res) => {
         }
 
         // ========================================================
-        // 3) Find completed workers who have NO Lunch
+        // 3) Prevent Submit when an assigned worker has no record
+        // ========================================================
+        // Every active worker assigned to this site for the selected
+        // date must have an attendance record before the day can be
+        // submitted. This deliberately runs before the existing
+        // automatic-Absent fallback below, so a missing record is
+        // reported to the user instead of being silently inferred.
+        const [missingAttendance] = await connection.execute(
+            `SELECT DISTINCT w.worker_id, w.full_name
+             FROM workersiteassignments wsa
+             JOIN workers w
+               ON w.worker_id = wsa.worker_id
+              AND w.status = 'Active'
+             WHERE wsa.site_id = ?
+               AND wsa.assigned_date <= ?
+               AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date > ?)
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM attendance a
+                   WHERE a.worker_id = w.worker_id
+                     AND a.site_id = wsa.site_id
+                     AND (
+                          a.record_date = ?
+                          OR (
+                              a.record_date = DATE_SUB(?, INTERVAL 1 DAY)
+                              AND a.check_out_time IS NOT NULL
+                              AND DATE(a.check_out_time) > a.record_date
+                          )
+                     )
+               )
+             ORDER BY w.full_name, w.worker_id`,
+            [siteId, record_date, record_date, record_date, record_date]
+        );
+
+        if (missingAttendance.length > 0) {
+            await connection.rollback();
+            transactionStarted = false;
+
+            return res.status(400).json({
+                status: 'error',
+                code: 'MISSING_ATTENDANCE_RECORDS',
+                message: 'Every assigned worker must have an attendance status before submitting the day.',
+                missing_workers: missingAttendance.map(row => ({
+                    worker_id: row.worker_id,
+                    full_name: row.full_name
+                }))
+            });
+        }
+
+        // ========================================================
+        // 4) Find completed workers who have NO Lunch
         // ========================================================
 
         const [missingLunch] = await connection.execute(
@@ -1132,7 +1187,7 @@ exports.submitDay = async (req, res) => {
         );
 
         // ========================================================
-        // 4) Get the site's lunch period
+        // 5) Get the site's lunch period
         //
         // We use an already recorded Lunch period at this site
         // as the site's default lunch period.
@@ -1168,7 +1223,7 @@ exports.submitDay = async (req, res) => {
         }
 
         // ========================================================
-        // 5) If there are workers without Lunch, require a decision
+        // 6) If there are workers without Lunch, require a decision
         // ========================================================
 
         if (missingLunch.length > 0) {
@@ -1202,7 +1257,7 @@ exports.submitDay = async (req, res) => {
         }
 
         // ========================================================
-        // 6) Apply Lunch decisions
+        // 7) Apply Lunch decisions
         // ========================================================
 
         for (const row of missingLunch) {
@@ -1463,8 +1518,11 @@ exports.submitDay = async (req, res) => {
         }
 
         // ========================================================
-        // 7) Automatically create Absent records
+        // 8) Automatically create Absent records
         // ========================================================
+        // Kept as a defensive fallback for legacy/non-standard flows.
+        // The missing-attendance validation above makes this unreachable
+        // during a normal successful Submit.
 
         await connection.execute(
             `INSERT INTO attendance
@@ -1510,7 +1568,7 @@ exports.submitDay = async (req, res) => {
         );
 
         // ========================================================
-        // 8) Recalculate all completed Draft shifts
+        // 9) Recalculate all completed Draft shifts
         // ========================================================
 
         const [completedShifts] = await connection.execute(
@@ -1543,7 +1601,7 @@ exports.submitDay = async (req, res) => {
         }
 
         // ========================================================
-        // 9) Submit all Draft records
+        // 10) Submit all Draft records
         // ========================================================
 
         const [submitted] = await connection.execute(
