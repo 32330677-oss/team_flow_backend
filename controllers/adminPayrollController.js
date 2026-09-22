@@ -1558,10 +1558,19 @@ async function exportDailyAttendanceExcel(req, res) {
     sheet.autoFilter = { from: 'A4', to: 'L4' };
 
     const fileName = `daily_attendance_${date}.xlsx`;
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-    await workbook.xlsx.write(res);
-    res.end();
+const buffer = await workbook.xlsx.writeBuffer();
+
+res.setHeader(
+  'Content-Type',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+);
+res.setHeader(
+  'Content-Disposition',
+  `attachment; filename="${fileName}"`
+);
+res.setHeader('Content-Length', buffer.length);
+
+return res.end(buffer);
   } catch (error) {
     console.error('exportDailyAttendanceExcel:', error);
     if (!res.headersSent) {
