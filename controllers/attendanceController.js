@@ -486,7 +486,125 @@ exports.bulkCheckOut = (req, res) => runBulkAttendance(req, res, 'checkout');
 
 exports.bulkCheckIn = (req, res) => runBulkAttendance(req, res, 'checkin');
 exports.bulkCheckOut = (req, res) => runBulkAttendance(req, res, 'checkout');
+// ==================== Bulk Absent / Sick / Vacation / Holiday ====================
+// نفس منطق setAttendanceStatus تماماً (سجل Draft بدون أي clock activity)،
+// بس بمعاملة واحدة all-or-nothing على مجموعة عمال، متل bulkCheckIn/bulkCheckOut.
+async function runBulkSetStatus(req, res) {
+    const { site_id, record_date, worker_ids, attendance_status, remarks } = req.body;
+    const workerIds = normalizeWorkerIds(worker_ids);
+    const allowedStatuses = ['Absent', 'Sick', 'Vacation', 'Holiday'];
+    const normalizedStatus = attendance_status === 'Annual' ? 'Vacation' : attendance_status;
+    const recordedByUserId = req.user.user_id;
 
+    if (!site_id || !isValidDateOnly(record_date) || !workerIds || !normalizedStatus) {
+        return res.status(400).json({
+            status: 'error',
+            message: 'site_id, record_date, worker_ids, and attendance_status are required.'
+        });
+    }
+    if (!allowedStatuses.includes(normalizedStatus)) {
+        return res.status(400).json({ status: 'error', message: 'Invalid attendance status.' });
+    }
+    if (!(await verifySiteAction(req, site_id))) {
+        return res.status(403).json({ status: 'error', message: 'You are not authorized to manage this site.' });
+    }
+
+    const connection = await db.getConnection();
+    let failedWorker = null;
+
+    try {
+        await connection.beginTransaction();
+        const validWorkers = await verifyBulkWorkers(workerIds, site_id, record_date, connection);
+
+        for (const workerId of workerIds) {
+            if (!validWorkers.has(workerId)) {
+                failedWorker = { worker_id: workerId, message: 'Worker is not active or is not assigned to this site.' };
+                throw new AppError(`Bulk status update aborted: worker ${workerId} is not active or not assigned to this site. No changes were saved.`);
+            }
+
+            const [rows] = await connection.execute(
+                `SELECT attendance_id, status, attendance_status, check_in_time, check_out_time
+                 FROM attendance
+                 WHERE worker_id = ? AND site_id = ? AND record_date = ?
+                 ORDER BY attendance_id DESC LIMIT 1 FOR UPDATE`,
+                [workerId, site_id, record_date]
+            );
+
+            const message = remarks || `${normalizedStatus} - recorded by supervisor (bulk)`;
+
+            if (rows.length > 0) {
+                const existing = rows[0];
+
+                if (existing.status !== 'Draft') {
+                    failedWorker = { worker_id: workerId, message: 'Attendance cannot be changed after it has been submitted.' };
+                    throw new AppError(`Bulk status update aborted: worker ${workerId}'s attendance is already submitted/finalized. No changes were saved.`);
+                }
+                if (existing.check_in_time || existing.check_out_time) {
+                    failedWorker = { worker_id: workerId, message: 'Cannot change attendance status after clock activity exists.' };
+                    throw new AppError(`Bulk status update aborted: worker ${workerId} already has clock activity (check-in/out). No changes were saved.`);
+                }
+
+                const [updated] = await connection.execute(
+                    `UPDATE attendance
+                     SET attendance_status = ?, remarks = ?, recorded_by_user_id = ?
+                     WHERE attendance_id = ? AND status = 'Draft'
+                       AND check_in_time IS NULL AND check_out_time IS NULL`,
+                    [normalizedStatus, message, recordedByUserId, existing.attendance_id]
+                );
+                if (updated.affectedRows !== 1) {
+                    failedWorker = { worker_id: workerId, message: 'Attendance changed by another request.' };
+                    throw new AppError(`Bulk status update aborted: attendance for worker ${workerId} changed by another request. No changes were saved.`);
+                }
+
+                await connection.execute(
+                    `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+                     VALUES ('attendance', ?, 'STATUS_UPDATED', ?, ?, ?)`,
+                    [
+                        existing.attendance_id, recordedByUserId,
+                        JSON.stringify({ attendance_status: existing.attendance_status, remarks: null }),
+                        JSON.stringify({ attendance_status: normalizedStatus, remarks: message, source: 'bulk' })
+                    ]
+                );
+            } else {
+                const [inserted] = await connection.execute(
+                    `INSERT INTO attendance
+                        (worker_id, site_id, record_date, attendance_status, status, recorded_by_user_id, remarks)
+                     VALUES (?, ?, ?, ?, 'Draft', ?, ?)`,
+                    [workerId, site_id, record_date, normalizedStatus, recordedByUserId, message]
+                );
+                await connection.execute(
+                    `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+                     VALUES ('attendance', ?, 'STATUS_CREATED', ?, NULL, ?)`,
+                    [inserted.insertId, recordedByUserId, JSON.stringify({ attendance_status: normalizedStatus, remarks: message, source: 'bulk' })]
+                );
+            }
+        }
+
+        await connection.commit();
+        return res.status(200).json({ status: 'success', successful: workerIds, failed: [] });
+    } catch (error) {
+        try { await connection.rollback(); } catch (_) {}
+        console.error('BULK SET STATUS ERROR (transaction rolled back, nothing saved):', error);
+
+        if (error.code === 'ER_DUP_ENTRY' || error.errno === 1062) {
+            return res.status(409).json({
+                status: 'error',
+                message: 'Attendance already exists for this date. No changes were saved.',
+                failed_worker: failedWorker
+            });
+        }
+
+        return res.status(error.isOperational ? 400 : 500).json({
+            status: 'error',
+            message: error.isOperational ? error.message : 'Bulk status update failed due to a server error. No changes were saved.',
+            failed_worker: failedWorker
+        });
+    } finally {
+        connection.release();
+    }
+}
+
+exports.bulkSetAttendanceStatus = (req, res) => runBulkSetStatus(req, res);
 exports.setAttendanceStatus = async (req, res) => {
     const { worker_id, site_id, attendance_status, remarks, record_date } = req.body;
     const normalizedStatus = attendance_status === 'Annual' ? 'Vacation' : attendance_status;
