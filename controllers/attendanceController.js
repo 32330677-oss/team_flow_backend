@@ -1527,7 +1527,8 @@ exports.submitDay = async (req, res) => {
         // ========================================================
         // Kept as a defensive fallback for legacy/non-standard flows.
         // The missing-attendance validation above makes this unreachable
-        // during a normal successful Submit.
+        // during a normal successful Submit. Keep its existence check
+        // aligned with that validation, including completed overnight shifts.
 
         await connection.execute(
             `INSERT INTO attendance
@@ -1560,12 +1561,20 @@ exports.submitDay = async (req, res) => {
                    FROM attendance a
                    WHERE a.worker_id = w.worker_id
                      AND a.site_id = wsa.site_id
-                     AND a.record_date = ?
+                     AND (
+                          a.record_date = ?
+                          OR (
+                              a.record_date = DATE_SUB(?, INTERVAL 1 DAY)
+                              AND a.check_out_time IS NOT NULL
+                              AND DATE(a.check_out_time) > a.record_date
+                          )
+                     )
                )`,
             [
                 record_date,
                 req.user.user_id,
                 siteId,
+                record_date,
                 record_date,
                 record_date,
                 record_date
