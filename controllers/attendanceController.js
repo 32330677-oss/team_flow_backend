@@ -1162,34 +1162,90 @@ exports.submitDay = async (req, res) => {
         // 4) Find completed workers who have NO Lunch
         // ========================================================
 
-        const [missingLunch] = await connection.execute(
-            `SELECT
-                 a.attendance_id,
-                 a.worker_id,
-                 a.check_in_time,
-                 a.check_out_time,
-                 w.full_name
-             FROM attendance a
-             JOIN workers w
-               ON w.worker_id = a.worker_id
-             LEFT JOIN attendanceleaveperiods alp
-               ON alp.attendance_id = a.attendance_id
-              AND alp.leave_type = 'Lunch'
-             WHERE a.site_id = ?
-               AND a.status = 'Draft'
-               AND (
-                    a.record_date = ?
-                    OR (
-                        a.record_date = DATE_SUB(?, INTERVAL 1 DAY)
-                        AND a.check_out_time IS NOT NULL
-                        AND DATE(a.check_out_time) > a.record_date
-                    )
-               )
-               AND a.check_in_time IS NOT NULL
-               AND a.check_out_time IS NOT NULL
-               AND alp.leave_id IS NULL`,
-            [siteId, record_date, record_date]
-        );
+const [missingLunch] = await connection.execute(
+    `SELECT
+         a.attendance_id,
+         a.worker_id,
+         a.check_in_time,
+         a.check_out_time,
+         w.full_name
+     FROM attendance a
+     JOIN workers w
+       ON w.worker_id = a.worker_id
+
+     LEFT JOIN attendanceleaveperiods alp
+       ON alp.attendance_id = a.attendance_id
+      AND alp.leave_type = 'Lunch'
+
+     /*
+      * نأخذ نفس فترة الغداء التي يعتمدها الكود حالياً:
+      * أقدم بداية غداء وأحدث نهاية غداء مسجلة فعلياً
+      * في نفس الموقع واليوم.
+      */
+     LEFT JOIN (
+         SELECT
+             MIN(alp2.leave_start_time) AS site_lunch_start,
+             MAX(alp2.leave_end_time) AS site_lunch_end
+         FROM attendanceleaveperiods alp2
+         JOIN attendance a2
+           ON a2.attendance_id = alp2.attendance_id
+         WHERE a2.site_id = ?
+           AND alp2.leave_type = 'Lunch'
+           AND alp2.leave_end_time IS NOT NULL
+           AND (
+                a2.record_date = ?
+                OR (
+                    a2.record_date = DATE_SUB(?, INTERVAL 1 DAY)
+                    AND a2.check_out_time IS NOT NULL
+                    AND DATE(a2.check_out_time) > a2.record_date
+                )
+           )
+     ) site_lunch
+       ON 1 = 1
+
+     WHERE a.site_id = ?
+       AND a.status = 'Draft'
+       AND (
+            a.record_date = ?
+            OR (
+                a.record_date = DATE_SUB(?, INTERVAL 1 DAY)
+                AND a.check_out_time IS NOT NULL
+                AND DATE(a.check_out_time) > a.record_date
+            )
+       )
+       AND a.check_in_time IS NOT NULL
+       AND a.check_out_time IS NOT NULL
+       AND alp.leave_id IS NULL
+
+       /*
+        * التعديل الأساسي:
+        *
+        * إذا لا توجد فترة غداء مسجلة، نحافظ على السلوك القديم
+        * ولا نغيّر شيئاً.
+        *
+        * إذا توجد فترة غداء، لا نطلب قراراً إلا إذا كان هناك
+        * تقاطع فعلي بين دوام العامل وفترة الغداء.
+        */
+       AND (
+            site_lunch.site_lunch_start IS NULL
+            OR (
+                a.check_in_time < site_lunch.site_lunch_end
+                AND a.check_out_time > site_lunch.site_lunch_start
+            )
+       )`,
+    [
+        // Parameters الخاصة باستعلام site_lunch
+        siteId,
+        record_date,
+        record_date,
+
+        // Parameters الخاصة باستعلام العاملين
+        siteId,
+        record_date,
+        record_date
+    ]
+);
+
 
         // ========================================================
         // 5) Get the site's lunch period
