@@ -633,7 +633,6 @@ async function getLastBatchEndDate(req, res) {
     return res.status(500).json({ success: false, message: 'Failed to load the last batch date.' });
   }
 }
-
 async function exportPayrollExcel(req, res) {
   const batchId = Number(req.params.batchId);
   if (!Number.isInteger(batchId) || batchId <= 0) {
@@ -643,10 +642,11 @@ async function exportPayrollExcel(req, res) {
   try {
     const ExcelJS = require('exceljs');
     const path = require('path');
+    const fs = require('fs');
 
     const [batches] = await pool.execute(
       `SELECT payroll_batch_id, start_date, end_date, total_workers, total_amount, status,
-              version_number, is_finalized
+              version_number, is_finalized, scope_site_id
        FROM payrollbatches WHERE payroll_batch_id = ?`,
       [batchId]
     );
@@ -673,23 +673,53 @@ async function exportPayrollExcel(req, res) {
       return res.status(404).json({ success: false, message: 'No payroll items found for this batch.' });
     }
 
+    // ---- (جديد) مجموع الساعات العادية والأوفر تايم لكل عامل من الحضور المعتمد ----
+    // للعرض فقط: لا علاقة له بحسابات الرواتب.
+    // (payrollitems بيخزّن الساعات للعمال بالساعة فقط، فبنجيبها من attendance لتشمل الكل)
+    const hoursParams = [batch.start_date, batch.end_date];
+    let hoursSql = `
+      SELECT worker_id,
+             COALESCE(SUM(total_working_hours), 0) AS regular_hours,
+             COALESCE(SUM(overtime_hours), 0) AS overtime_hours
+      FROM attendance
+      WHERE record_date BETWEEN ? AND ?
+        AND status = 'Approved'`;
+    if (batch.scope_site_id) {
+      hoursSql += ' AND site_id = ?';
+      hoursParams.push(batch.scope_site_id);
+    }
+    hoursSql += ' GROUP BY worker_id';
+    const [hoursRows] = await pool.execute(hoursSql, hoursParams);
+    const hoursByWorker = new Map();
+    for (const h of hoursRows) {
+      hoursByWorker.set(h.worker_id, {
+        regular: Number(h.regular_hours || 0),
+        overtime: Number(h.overtime_hours || 0),
+      });
+    }
+
     const dateOnly = (v) => (v instanceof Date ? v.toISOString().slice(0, 10) : String(v || '').slice(0, 10));
     const logoPath = path.join(__dirname, '../assets/logo.png');
 
-function addLogo(sheet, worksheetWorkbook) {
-    try {
-        const logoId = worksheetWorkbook.addImage({ filename: logoPath, extension: 'png' });
-        sheet.addImage(logoId, {
-            tl: { col: 0.15, row: 0.15 },
-            ext: { width: 150, height: 55 }, // مساحة أكبر ومحسوبة تحفظ التناسب
-            editAs: 'oneCell', // ما يتحرك أو يتمدد مع تغيير الأعمدة/الصفوف
-        });
-    } catch (e) {
-        console.warn('Logo not added:', e.message);
-    }
-}
-
     const workbook = new ExcelJS.Workbook();
+
+    // اللوغو بيتضاف مرة وحدة للـ workbook وبنعيد استخدام الـ id لكل الشيتات
+    let logoId = null;
+    try {
+      if (fs.existsSync(logoPath)) {
+        logoId = workbook.addImage({ filename: logoPath, extension: 'png' });
+      }
+    } catch (e) {
+      console.warn('Logo not added:', e.message);
+    }
+    function addLogo(sheet) {
+      if (logoId === null) return;
+      sheet.addImage(logoId, {
+        tl: { col: 0.15, row: 0.15 },
+        ext: { width: 150, height: 55 },
+        editAs: 'oneCell',
+      });
+    }
 
     // Group rows by site
     const bySite = new Map();
@@ -703,20 +733,21 @@ function addLogo(sheet, worksheetWorkbook) {
     const byWorker = new Map();
     for (const row of rows) {
       if (!byWorker.has(row.worker_id)) {
+        const hrs = hoursByWorker.get(row.worker_id) || { regular: 0, overtime: 0 };
         byWorker.set(row.worker_id, {
           worker_name: row.worker_name,
           worker_unique_id: row.worker_unique_id,
           net_salary: Number(row.net_salary || 0),
+          total_regular_hours: hrs.regular,
+          total_overtime_hours: hrs.overtime,
           sites: new Set(),
         });
       }
       byWorker.get(row.worker_id).sites.add(row.site_name || 'Unassigned');
     }
 
-    // NEW: total distinct workers across the whole batch
     const totalWorkerCount = byWorker.size;
 
-    // NEW: distinct worker count per site (site_id -> Set of worker_id)
     const workerCountBySite = new Map();
     for (const row of rows) {
       const key = row.site_id ?? 'unassigned';
@@ -726,28 +757,32 @@ function addLogo(sheet, worksheetWorkbook) {
 
     // ---------------- Summary sheet ----------------
     const summarySheet = workbook.addWorksheet('Summary');
-    addLogo(summarySheet, workbook);
+    addLogo(summarySheet);
 
+    // ترتيب الأعمدة: A,B فراغ للوغو | C No | D ID | E Name | F Sites | G Net |
+    //                H Regular Hrs | I OT Hrs | J Signature
     summarySheet.columns = [
-          { header: '', key: 'logo_gap', width: 4 },   // عمود فاضي تحت اللوغو
-    { header: '', key: 'logo_gap2', width: 10 },
+      { header: '', key: 'logo_gap', width: 4 },
+      { header: '', key: 'logo_gap2', width: 10 },
       { header: 'No.', key: 'number', width: 6 },
       { header: 'Worker ID', key: 'worker_id', width: 16 },
       { header: 'Worker Name', key: 'worker_name', width: 28 },
       { header: 'Sites', key: 'sites', width: 32 },
       { header: 'Net Salary', key: 'net_salary', width: 18 },
-      { header: 'Signature', key: 'signature', width: 80 },
+      { header: 'Total Regular Hours', key: 'total_regular_hours', width: 16 },
+      { header: 'Total Overtime Hours', key: 'total_overtime_hours', width: 16 },
+      { header: 'Signature', key: 'signature', width: 22 },   // ← عرض التوقيع (كان 80)
     ];
 
-summarySheet.mergeCells('C1:H1');
-summarySheet.getCell('C1').value = `Payroll Batch #${batchId} (v${batch.version_number}${batch.is_finalized ? ' - Finalized' : ''})`;
-summarySheet.mergeCells('C2:H2');
-summarySheet.getCell('C2').value = `Period: ${dateOnly(batch.start_date)} - ${dateOnly(batch.end_date)}`;
-summarySheet.mergeCells('C3:H3');
-summarySheet.getCell('C3').value = `Currency: Syrian Pound (ل.س)`;
-summarySheet.mergeCells('C4:H4');
-summarySheet.getCell('C4').value = `Total Workers Paid: ${totalWorkerCount}`;
-summarySheet.getCell('C4').font = { bold: true };
+    summarySheet.mergeCells('C1:J1');
+    summarySheet.getCell('C1').value = `Payroll Batch #${batchId} (v${batch.version_number}${batch.is_finalized ? ' - Finalized' : ''})`;
+    summarySheet.mergeCells('C2:J2');
+    summarySheet.getCell('C2').value = `Period: ${dateOnly(batch.start_date)} - ${dateOnly(batch.end_date)}`;
+    summarySheet.mergeCells('C3:J3');
+    summarySheet.getCell('C3').value = `Currency: Syrian Pound (ل.س)`;
+    summarySheet.mergeCells('C4:J4');
+    summarySheet.getCell('C4').value = `Total Workers Paid: ${totalWorkerCount}`;
+    summarySheet.getCell('C4').font = { bold: true };
 
     summarySheet.getRow(1).height = 28;
     summarySheet.getRow(2).height = 28;
@@ -755,44 +790,63 @@ summarySheet.getCell('C4').font = { bold: true };
     summarySheet.getRow(4).height = 28;
     summarySheet.getRow(5).values = ['', '', ...summarySheet.columns.slice(2).map((c) => c.header)];
 
+    const SIGNATURE_ROW_HEIGHT = 85; // ← طول صف التوقيع (كان 65)
+
     let grandTotalNet = 0;
+    let grandRegular = 0;
+    let grandOvertime = 0;
     let idx = 0;
- for (const worker of byWorker.values()) {
-    idx += 1;
-    const row = summarySheet.addRow({
+    for (const worker of byWorker.values()) {
+      idx += 1;
+      const row = summarySheet.addRow({
         number: idx,
         worker_id: worker.worker_unique_id,
         worker_name: worker.worker_name,
         sites: [...worker.sites].join(', '),
         net_salary: worker.net_salary,
+        total_regular_hours: Math.round(worker.total_regular_hours * 100) / 100,
+        total_overtime_hours: Math.round(worker.total_overtime_hours * 100) / 100,
         signature: '',
-    });
-    row.height = 65; // مساحة كافية لبصمة إصبع بدل الارتفاع الافتراضي الصغير
-    grandTotalNet += worker.net_salary;
-}
+      });
+      row.height = SIGNATURE_ROW_HEIGHT;
+      grandTotalNet += worker.net_salary;
+      grandRegular += worker.total_regular_hours;
+      grandOvertime += worker.total_overtime_hours;
+    }
+
     const summaryTotalRow = summarySheet.addRow({
       worker_name: 'GRAND TOTAL',
       net_salary: Math.round(grandTotalNet * 100) / 100,
+      total_regular_hours: Math.round(grandRegular * 100) / 100,
+      total_overtime_hours: Math.round(grandOvertime * 100) / 100,
     });
     summaryTotalRow.font = { bold: true };
 
-    summarySheet.getRow(5).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-    summarySheet.getRow(5).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
+    const headerRow = summarySheet.getRow(5);
+    headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
+    headerRow.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+    headerRow.height = 32;
+
+    const thinBorder = {
+      top: { style: 'thin', color: { argb: 'FFDDDDDD' } },
+      bottom: { style: 'thin', color: { argb: 'FFDDDDDD' } },
+      left: { style: 'thin', color: { argb: 'FFDDDDDD' } },
+      right: { style: 'thin', color: { argb: 'FFDDDDDD' } },
+    };
+
     for (let r = 6; r <= summarySheet.rowCount; r += 1) {
-      summarySheet.getCell(r, 5).numFmt = '#,##0 "ل.س"';
+      summarySheet.getCell(r, 7).numFmt = '#,##0 "ل.س"';   // Net Salary (G)
+      summarySheet.getCell(r, 8).numFmt = '0.00';          // Regular Hours (H)
+      summarySheet.getCell(r, 9).numFmt = '0.00';          // Overtime Hours (I)
+      for (const col of [8, 9, 10]) {
+        summarySheet.getCell(r, col).alignment = { vertical: 'middle', horizontal: 'center' };
+      }
+      summarySheet.getCell(r, 10).border = thinBorder;     // Signature (J)
     }
     summarySheet.views = [{ state: 'frozen', ySplit: 5 }];
-for (let r = 6; r <= summarySheet.rowCount; r += 1) {
-    summarySheet.getCell(r, 6).alignment = { vertical: 'middle', horizontal: 'center' };
-    // حد سفلي/علوي للخلية يعطي إحساس بصندوق التوقيع
-    summarySheet.getCell(r, 6).border = {
-        top: { style: 'thin', color: { argb: 'FFDDDDDD' } },
-        bottom: { style: 'thin', color: { argb: 'FFDDDDDD' } },
-        left: { style: 'thin', color: { argb: 'FFDDDDDD' } },
-        right: { style: 'thin', color: { argb: 'FFDDDDDD' } },
-    };
-}
-    // ---------------- One worksheet per site ----------------
+
+    // ---------------- One worksheet per site (بدون أي تغيير) ----------------
     const usedNames = new Set(['Summary']);
     for (const [siteKey, { siteName, rows: siteRows }] of bySite.entries()) {
       let safeName = siteName.replace(/[\\/*?:[\]]/g, ' ').trim().slice(0, 28) || 'Site';
@@ -804,7 +858,7 @@ for (let r = 6; r <= summarySheet.rowCount; r += 1) {
       usedNames.add(finalName);
 
       const sheet = workbook.addWorksheet(finalName);
-      addLogo(sheet, workbook);
+      addLogo(sheet);
 
       sheet.columns = [
         { header: 'No.', key: 'number', width: 6 },
@@ -832,7 +886,6 @@ for (let r = 6; r <= summarySheet.rowCount; r += 1) {
       sheet.mergeCells('A3:N3');
       sheet.getCell('A3').value = `Currency: Syrian Pound (ل.س) — Overtime rate: ${OVERTIME_FLAT_RATE_SYP} ل.س/hour (flat, all workers)`;
 
-      // NEW: workers-at-this-site count line
       sheet.mergeCells('A4:N4');
       sheet.getCell('A4').value = `Workers at this site: ${siteWorkerCount}`;
       sheet.getCell('A4').font = { bold: true };
@@ -892,14 +945,18 @@ for (let r = 6; r <= summarySheet.rowCount; r += 1) {
       sheet.views = [{ state: 'frozen', ySplit: 5 }];
     }
 
+    // نبني الملف كامل بالذاكرة أولاً: إذا صار خطأ بيرجع JSON 500 نظيف بدل ملف مقطوع
+    const buffer = await workbook.xlsx.writeBuffer();
     const fileName = `payroll_batch_${batchId}.xlsx`;
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-    await workbook.xlsx.write(res);
-    res.end();
+    res.setHeader('Content-Length', buffer.length);
+    return res.end(Buffer.from(buffer));
   } catch (error) {
     console.error('exportPayrollExcel:', error);
-    if (!res.headersSent) return res.status(500).json({ success: false, message: 'Failed to export Excel payroll report.' });
+    if (!res.headersSent) {
+      return res.status(500).json({ success: false, message: 'Failed to export Excel payroll report.' });
+    }
   }
 }
 
