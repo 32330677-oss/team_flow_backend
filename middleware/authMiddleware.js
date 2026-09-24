@@ -14,23 +14,36 @@ const authMiddleware = (req, res, next) => {
 
     // Force absolute crash on launch if secure environment configuration is missing
     const secretKey = process.env.JWT_SECRET;
-    if (!secretKey) {
-        console.error("FATAL ERROR: JWT_SECRET variable is completely missing from process.env.");
-        process.exit(1);
-    }
+   if (!secretKey) {
+    console.error("FATAL ERROR: JWT_SECRET variable is completely missing from process.env.");
 
-    try {
-        const decoded = jwt.verify(token, secretKey);
-        req.user = decoded; 
-        console.log("👤 User from JWT:", req.user);
-        next(); 
-    } catch (error) {
-        console.error('JWT Verification Error:', error);
-        return res.status(403).json({ 
-            status: 'error', 
-            message: 'رمز التحقق غير صالح أو انتهت صلاحيته.' 
+    return res.status(500).json({
+        status: 'error',
+        message: 'Server authentication configuration error'
+    });
+}
+
+  try {
+    const decoded = jwt.verify(token, secretKey);
+    req.user = decoded; 
+    next(); 
+} catch (error) {
+    console.error('JWT Verification Error:', error);
+
+    if (error.name === 'TokenExpiredError') {
+        return res.status(401).json({
+            status: 'error',
+            code: 'TOKEN_EXPIRED',
+            message: 'Your session has expired. Please log in again.'
         });
     }
+
+    return res.status(401).json({
+        status: 'error',
+        code: 'TOKEN_INVALID',
+        message: 'Invalid authentication token.'
+    });
+}
 };
 
 module.exports = authMiddleware;
