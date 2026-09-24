@@ -769,18 +769,17 @@ async function exportPayrollExcel(req, res) {
       { header: 'Worker Name', key: 'worker_name', width: 28 },
       { header: 'Sites', key: 'sites', width: 32 },
       { header: 'Net Salary', key: 'net_salary', width: 18 },
-      { header: 'Total Regular Hours', key: 'total_regular_hours', width: 16 },
-      { header: 'Total Overtime Hours', key: 'total_overtime_hours', width: 16 },
+      { header: 'Total Hours (Regular + OT)', key: 'total_hours', width: 18 },
       { header: 'Signature', key: 'signature', width: 22 },   // ← عرض التوقيع (كان 80)
     ];
 
-    summarySheet.mergeCells('C1:J1');
+    summarySheet.mergeCells('C1:I1');
     summarySheet.getCell('C1').value = `Payroll Batch #${batchId} (v${batch.version_number}${batch.is_finalized ? ' - Finalized' : ''})`;
-    summarySheet.mergeCells('C2:J2');
+    summarySheet.mergeCells('C2:I2');
     summarySheet.getCell('C2').value = `Period: ${dateOnly(batch.start_date)} - ${dateOnly(batch.end_date)}`;
-    summarySheet.mergeCells('C3:J3');
+    summarySheet.mergeCells('C3:I3');
     summarySheet.getCell('C3').value = `Currency: Syrian Pound (ل.س)`;
-    summarySheet.mergeCells('C4:J4');
+    summarySheet.mergeCells('C4:I4');
     summarySheet.getCell('C4').value = `Total Workers Paid: ${totalWorkerCount}`;
     summarySheet.getCell('C4').font = { bold: true };
 
@@ -793,32 +792,29 @@ async function exportPayrollExcel(req, res) {
     const SIGNATURE_ROW_HEIGHT = 85; // ← طول صف التوقيع (كان 65)
 
     let grandTotalNet = 0;
-    let grandRegular = 0;
-    let grandOvertime = 0;
+    let grandHours = 0;
     let idx = 0;
     for (const worker of byWorker.values()) {
       idx += 1;
+      const workerTotalHours = worker.total_regular_hours + worker.total_overtime_hours;
       const row = summarySheet.addRow({
         number: idx,
         worker_id: worker.worker_unique_id,
         worker_name: worker.worker_name,
         sites: [...worker.sites].join(', '),
         net_salary: worker.net_salary,
-        total_regular_hours: Math.round(worker.total_regular_hours * 100) / 100,
-        total_overtime_hours: Math.round(worker.total_overtime_hours * 100) / 100,
+        total_hours: Math.round(workerTotalHours * 100) / 100,
         signature: '',
       });
       row.height = SIGNATURE_ROW_HEIGHT;
       grandTotalNet += worker.net_salary;
-      grandRegular += worker.total_regular_hours;
-      grandOvertime += worker.total_overtime_hours;
+      grandHours += workerTotalHours;
     }
 
     const summaryTotalRow = summarySheet.addRow({
       worker_name: 'GRAND TOTAL',
       net_salary: Math.round(grandTotalNet * 100) / 100,
-      total_regular_hours: Math.round(grandRegular * 100) / 100,
-      total_overtime_hours: Math.round(grandOvertime * 100) / 100,
+      total_hours: Math.round(grandHours * 100) / 100,
     });
     summaryTotalRow.font = { bold: true };
 
@@ -835,14 +831,13 @@ async function exportPayrollExcel(req, res) {
       right: { style: 'thin', color: { argb: 'FFDDDDDD' } },
     };
 
-    for (let r = 6; r <= summarySheet.rowCount; r += 1) {
+      for (let r = 6; r <= summarySheet.rowCount; r += 1) {
       summarySheet.getCell(r, 7).numFmt = '#,##0 "ل.س"';   // Net Salary (G)
-      summarySheet.getCell(r, 8).numFmt = '0.00';          // Regular Hours (H)
-      summarySheet.getCell(r, 9).numFmt = '0.00';          // Overtime Hours (I)
-      for (const col of [8, 9, 10]) {
+      summarySheet.getCell(r, 8).numFmt = '0.00';          // Total Hours (H)
+      for (const col of [8, 9]) {
         summarySheet.getCell(r, col).alignment = { vertical: 'middle', horizontal: 'center' };
       }
-      summarySheet.getCell(r, 10).border = thinBorder;     // Signature (J)
+      summarySheet.getCell(r, 9).border = thinBorder;      // Signature (I)
     }
     summarySheet.views = [{ state: 'frozen', ySplit: 5 }];
 
