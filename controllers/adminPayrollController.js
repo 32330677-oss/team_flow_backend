@@ -736,7 +736,7 @@ function addLogo(sheet, worksheetWorkbook) {
       { header: 'Worker Name', key: 'worker_name', width: 28 },
       { header: 'Sites', key: 'sites', width: 32 },
       { header: 'Net Salary', key: 'net_salary', width: 18 },
-      { header: 'Signature', key: 'signature', width: 55 },
+      { header: 'Signature', key: 'signature', width: 80 },
     ];
 
 summarySheet.mergeCells('C1:H1');
@@ -767,7 +767,7 @@ summarySheet.getCell('C4').font = { bold: true };
         net_salary: worker.net_salary,
         signature: '',
     });
-    row.height = 100; // مساحة كافية لبصمة إصبع بدل الارتفاع الافتراضي الصغير
+    row.height = 65; // مساحة كافية لبصمة إصبع بدل الارتفاع الافتراضي الصغير
     grandTotalNet += worker.net_salary;
 }
     const summaryTotalRow = summarySheet.addRow({
