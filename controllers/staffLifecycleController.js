@@ -12,6 +12,7 @@
 //   router.get('/:id/lifecycle-history', restrictTo('Admin'), staffLifecycleController.getStatusHistory);
 
 const db = require('../config/db');
+const { businessToday, addDays } = require('../services/businessDate');
 const { getActiveSpans } = require('../services/staffEmploymentService'); // ← جديد
 const VALID_STATUSES = ['Active', 'Inactive', 'Terminated'];
 
@@ -41,7 +42,7 @@ exports.changeStatus = async (req, res) => {
   if (!reason || !String(reason).trim()) {
     return res.status(400).json({ status: 'error', message: 'A reason is required for any status change.' });
   }
-  if (new_status === 'Terminated' && effective_date > new Date().toISOString().slice(0, 10)) {
+  if (new_status === 'Terminated' && effective_date > businessToday()) {
     return res.status(400).json({ status: 'error', message: 'Termination effective date cannot be in the future.' });
   }
 
@@ -115,19 +116,23 @@ if (lastHistory && effective_date < lastHistory.effective_date) {
     // Terminating staff automatically closes any open site AND supervisor
     // assignment using the termination effective date. (Previously only the
     // site assignment was closed — the supervisor assignment was missed.)
+    // (Explicit existing rule: TERMINATION ends the assignments. Inactive does
+    // NOT close anything — status and assignment are separate, §27.)
+    // effective_date is the first day of the new status, so the LAST assigned
+    // day (inclusive, §5) is the day before.
     if (new_status === 'Terminated') {
       await connection.execute(
         `UPDATE staff_site_assignments
          SET unassigned_date = ?
          WHERE staff_id = ? AND unassigned_date IS NULL`,
-        [effective_date, staffId]
+        [addDays(effective_date, -1), staffId]
       );
 
       await connection.execute(
         `UPDATE staff_supervisor_assignments
          SET unassigned_date = ?
          WHERE staff_id = ? AND unassigned_date IS NULL`,
-        [effective_date, staffId]
+        [addDays(effective_date, -1), staffId]
       );
     }
 

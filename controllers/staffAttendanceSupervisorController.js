@@ -6,6 +6,15 @@ const {
   calculateStaffShiftHours,
 } = require('../services/staffAttendanceService');
 const { getActiveSpansOverlapping } = require('../services/staffEmploymentService');
+const { getStaffCompensationForDate } = require('../services/staffCompensationService');
+const { businessToday } = require('../services/businessDate');
+const { assertStaffDateEditable, findLockedStaffBatch } = require('../services/payrollLock');
+const weekGate = require('../services/weekGate');
+const anomalyService = require('../services/anomalyService');
+
+// #2: compare two wall-clock values to the minute ('YYYY-MM-DD HH:MM').
+const sameMinute = (a, b) => Boolean(a && b) &&
+  String(a).replace('T', ' ').slice(0, 16) === String(b).replace('T', ' ').slice(0, 16);
 
 const ATTENDANCE_STATUSES = ['Present', 'Absent', 'Sick', 'Vacation', 'Holiday'];
 
@@ -14,9 +23,10 @@ const ATTENDANCE_STATUSES = ['Present', 'Absent', 'Sick', 'Vacation', 'Holiday']
 const SAVE_MODES = ['draft', 'submit'];
 
 class AppError extends Error {
-  constructor(message) {
+  constructor(message, statusCode = 400) {
     super(message);
     this.isOperational = true;
+    this.statusCode = statusCode;
   }
 }
 
@@ -54,24 +64,36 @@ exports.getDayView = async (req, res) => {
               sa.regular_hours, sa.overtime_hours, sa.lunch_deducted_hours,
               sa.lunch_start_time, sa.lunch_end_time,
               COALESCE(sa.standard_minutes_snapshot, ROUND(sm.standard_daily_hours * 60)) AS standard_minutes_snapshot,
-              sa.is_friday_worked, sa.status, sa.admin_rejection_notes
+              sa.is_friday_worked, sa.status, sa.admin_rejection_notes,
+              sa.source, sa.anomaly_code, sa.anomaly_detail
        FROM staff_members sm
        LEFT JOIN staff_attendance sa ON sa.staff_id = sm.staff_id AND sa.record_date = ?
        WHERE sm.staff_id IN (${placeholders})
-         AND (sm.status = 'Active' OR sa.staff_attendance_id IS NOT NULL)
        ORDER BY sm.full_name`,
       [date, ...assignedIds]
     );
+    // Historical employment on that date (staff_status_history spans), never
+    // today's status; a record that already exists is always shown.
     const eligibleRows = [];
     for (const row of rows) {
       const spans = await getActiveSpansOverlapping(row.staff_id, date, date);
-      if (spans.length > 0) eligibleRows.push(row);
+      if (spans.length > 0 || row.staff_attendance_id) eligibleRows.push(row);
     }
+    const locked = await findLockedStaffBatch(db, { date });
+    const gate = await weekGate.previousWeekStaffDrafts(db, { staffIds: assignedIds, recordDate: date });
 
     res.status(200).json({
       status: 'success',
       data: eligibleRows,
       is_friday: isFriday(date), // lets the frontend show the confirmation banner
+      day: {
+        record_date: date,
+        business_today: businessToday(),
+        payroll_locked: Boolean(locked),
+        payroll_lock_batch_id: locked ? locked.staff_payroll_batch_id : null,
+        previous_week_drafts: gate.days,
+        previous_week: { start: gate.prevStart, end: gate.prevEnd },
+      },
     });
   } catch (error) {
     console.error('GET SUPERVISOR DAY VIEW ERROR:', error);
@@ -109,7 +131,7 @@ exports.bulkSetAttendance = async (req, res) => {
       message: 'A valid record_date (YYYY-MM-DD) is required.'
     });
   }
-const maxAllowed = new Date().toISOString().slice(0, 10);
+const maxAllowed = businessToday();   // B10: business date, not the UTC date
 
 if (record_date > maxAllowed) {
   return res.status(400).json({ status: 'error', message: 'Attendance date cannot be in the future.' });
@@ -154,6 +176,11 @@ if (record_date > maxAllowed) {
     const assignedSet = new Set(assignedIds);
 
     await connection.beginTransaction();
+    await assertStaffDateEditable(connection, record_date);   // D-02
+    if (mode === 'submit' && !isResubmit) {
+      const gate = await weekGate.previousWeekStaffDrafts(connection, { staffIds: assignedIds, recordDate: record_date });
+      if (gate.days.length > 0) throw weekGate.gateError(gate);   // §10
+    }
 
     if (isResubmit) {
       const staffId = Number(entries[0]?.staff_id);
@@ -177,7 +204,7 @@ if (record_date > maxAllowed) {
          FROM staff_members sm
          LEFT JOIN staff_attendance sa
            ON sa.staff_id = sm.staff_id AND sa.record_date = ?
-         WHERE sm.status = 'Active' AND sm.staff_id IN (${assignedIds.map(() => '?').join(',')})
+         WHERE sm.staff_id IN (${assignedIds.map(() => '?').join(',')})
          ORDER BY sm.full_name`,
         [record_date, ...assignedIds]
       );
@@ -246,10 +273,12 @@ if (record_date > maxAllowed) {
         [staffId]
       );
 
-      if (!staffRows.length || staffRows[0].status !== 'Active') {
+      // Historical employment is checked just below (spans on record_date);
+      // today's status is not used for past days.
+      if (!staffRows.length) {
         results.skipped.push({
           staff_id: staffId,
-          reason: 'Staff member not found or inactive.'
+          reason: 'Staff member not found.'
         });
         continue;
       }
@@ -268,7 +297,41 @@ if (record_date > maxAllowed) {
         continue;
       }
 
-      const standardHours = Number(staffRows[0].standard_daily_hours || 8);
+      // D3: standard hours that applied on record_date (history), not today's profile.
+      const compOnDate = await getStaffCompensationForDate(staffId, record_date, connection);
+      const standardHours = compOnDate ? compOnDate.standard_daily_hours : Number(staffRows[0].standard_daily_hours || 8);
+
+      /*
+       * Get the existing attendance row and lock it (moved up: #2/#3 need it
+       * before validating the entry). Old values are kept for change
+       * detection and for an accurate audit record.
+       */
+      const [existing] = await connection.execute(
+        `SELECT
+           staff_attendance_id,
+           attendance_status,
+           check_in_time,
+           check_out_time,
+           regular_hours,
+           overtime_hours,
+           lunch_deducted_hours,
+           lunch_start_time,
+           lunch_end_time,
+           is_friday_worked,
+           friday_confirmed_by_user_id,
+           recorded_by_user_id,
+           admin_rejection_notes,
+           standard_minutes_snapshot,
+           status,
+           source
+         FROM staff_attendance
+         WHERE staff_id = ? AND record_date = ?
+         LIMIT 1
+         FOR UPDATE`,
+        [staffId, record_date]
+      );
+      const existingRow = existing.length > 0 ? existing[0] : null;
+      const isBiometricRow = existingRow && existingRow.source === 'Biometric';
 
       let regularHours = 0;
       let overtimeHours = 0;
@@ -277,12 +340,48 @@ if (record_date > maxAllowed) {
       let checkOut = null;
       let lunchStart = null;
       let lunchEnd = null;
+      let rawCheckIn = null;
+      let rawCheckOut = null;
+      let biometricInOnlyDraft = false;
 
 if (status === 'Present') {
-  const rawCheckIn = formatToMySqlDateTime(entry.check_in_time);
-  const rawCheckOut = formatToMySqlDateTime(entry.check_out_time);
+  rawCheckIn = formatToMySqlDateTime(entry.check_in_time);
+  rawCheckOut = formatToMySqlDateTime(entry.check_out_time);
 
-  if (!rawCheckIn || !rawCheckOut) {
+  // #2: an unchanged biometric time (same minute) keeps the stored value
+  // exactly, seconds included. Only an explicit edit changes it.
+  if (isBiometricRow) {
+    if (sameMinute(rawCheckIn, existingRow.check_in_time)) rawCheckIn = String(existingRow.check_in_time).replace('T', ' ').slice(0, 19);
+    if (sameMinute(rawCheckOut, existingRow.check_out_time)) rawCheckOut = String(existingRow.check_out_time).replace('T', ' ').slice(0, 19);
+  }
+
+  // #3: in DRAFT mode only, a biometric record that has an IN and is still
+  // waiting for its OUT may be saved without a check-out (OUT stays NULL,
+  // hours stay empty). Submit still requires both times (checked below).
+  biometricInOnlyDraft = Boolean(isDraftMode && !rawCheckOut && rawCheckIn &&
+    isBiometricRow && existingRow.check_in_time && !existingRow.check_out_time);
+
+  if (biometricInOnlyDraft) {
+    if (rawCheckIn.slice(0, 10) !== record_date) {
+      results.skipped.push({ staff_id: staffId, reason: 'Check-in date must match the attendance date.' });
+      continue;
+    }
+    const rawLunchStart = entry.lunch_start_time ? formatToMySqlDateTime(entry.lunch_start_time) : null;
+    const rawLunchEnd = entry.lunch_end_time ? formatToMySqlDateTime(entry.lunch_end_time) : null;
+    if ((entry.lunch_start_time && !rawLunchStart) || (entry.lunch_end_time && !rawLunchEnd) ||
+        (Boolean(rawLunchStart) !== Boolean(rawLunchEnd)) ||
+        (rawLunchStart && (rawLunchEnd <= rawLunchStart || rawLunchStart < rawCheckIn))) {
+      results.skipped.push({ staff_id: staffId, reason: 'Invalid lunch start/end time.' });
+      continue;
+    }
+    checkIn = rawCheckIn;
+    checkOut = null;
+    lunchStart = rawLunchStart;
+    lunchEnd = rawLunchEnd;
+    regularHours = null;
+    overtimeHours = null;
+    lunchHours = 0;
+  } else if (!rawCheckIn || !rawCheckOut) {
     results.skipped.push({
       staff_id: staffId,
       reason:
@@ -290,6 +389,9 @@ if (status === 'Present') {
     });
     continue;
   }
+}
+
+if (status === 'Present' && !biometricInOnlyDraft) {
 
   // Check-in date must match the attendance record date.
   if (rawCheckIn.slice(0, 10) !== record_date) {
@@ -332,34 +434,6 @@ if (status === 'Present') {
         }
       }
 
-      /*
-       * Get the existing attendance row and lock it.
-       * Old values are kept for change detection and for an accurate audit record.
-       */
-      const [existing] = await connection.execute(
-        `SELECT
-           staff_attendance_id,
-           attendance_status,
-           check_in_time,
-           check_out_time,
-           regular_hours,
-           overtime_hours,
-           lunch_deducted_hours,
-           lunch_start_time,
-           lunch_end_time,
-           is_friday_worked,
-           friday_confirmed_by_user_id,
-           recorded_by_user_id,
-           admin_rejection_notes,
-           standard_minutes_snapshot,
-           status
-         FROM staff_attendance
-         WHERE staff_id = ? AND record_date = ?
-         LIMIT 1
-         FOR UPDATE`,
-        [staffId, record_date]
-      );
-
       const isFridayWorked =
         dayIsFriday && status === 'Present' && fridayConfirmed ? 1 : 0;
 
@@ -388,6 +462,7 @@ if (status === 'Present') {
           ? Number(existingRecord.standard_minutes_snapshot)
           : Math.round(standardHours * 60);
       if (status === 'Present' && checkIn && checkOut && existingRecord.standard_minutes_snapshot) {
+  // (IN-only biometric drafts keep their hours empty until the OUT exists.)
   const historicalShift = calculateStaffShiftHours({
     checkInRaw: checkIn,
     checkOutRaw: checkOut,
@@ -427,8 +502,8 @@ if (status === 'Present') {
           attendance_status: status,
           check_in_time: checkIn,
           check_out_time: checkOut,
-          regular_hours: Number(regularHours.toFixed(2)),
-          overtime_hours: Number(overtimeHours.toFixed(2)),
+          regular_hours: regularHours === null ? null : Number(regularHours.toFixed(2)),
+          overtime_hours: overtimeHours === null ? null : Number(overtimeHours.toFixed(2)),
           lunch_deducted_hours: Number(lunchHours.toFixed(2)),
           is_friday_worked: isFridayWorked,
           friday_confirmed_by_user_id: fridayConfirmedBy,
@@ -465,9 +540,15 @@ if (status === 'Present') {
           ? existingRecord.admin_rejection_notes
           : null;
 
+        // D-11: Sick is NOT paid by default. Changing a record to Sick sets
+        // is_paid = 0; only an Admin "Mark as Paid" decision makes it paid.
+        // Leaving Sick for a paid-leave status restores the previous default (1).
         await connection.execute(
           `UPDATE staff_attendance
-           SET attendance_status = ?, check_in_time = ?, check_out_time = ?,
+           SET is_paid = CASE WHEN ? = 'Sick' AND attendance_status <> 'Sick' THEN 0
+                              WHEN ? <> 'Sick' AND attendance_status = 'Sick' THEN 1
+                              ELSE is_paid END,
+               attendance_status = ?, check_in_time = ?, check_out_time = ?,
                regular_hours = ?, overtime_hours = ?, lunch_deducted_hours = ?,
                is_friday_worked = ?, friday_confirmed_by_user_id = ?, standard_minutes_snapshot = ?,
                lunch_start_time = ?, lunch_end_time = ?,
@@ -476,10 +557,12 @@ if (status === 'Present') {
            WHERE staff_attendance_id = ?`,
           [
             status,
+            status,
+            status,
             checkIn,
             checkOut,
-            regularHours.toFixed(2),
-            overtimeHours.toFixed(2),
+            regularHours === null ? null : regularHours.toFixed(2),
+            overtimeHours === null ? null : overtimeHours.toFixed(2),
             lunchHours.toFixed(2),
             isFridayWorked,
             fridayConfirmedBy,
@@ -492,6 +575,9 @@ if (status === 'Present') {
             existingRecord.staff_attendance_id,
           ]
         );
+        const anomalyU = status === 'Present' && checkIn && checkOut
+          ? await anomalyService.evaluateSession(checkIn, checkOut, record_date) : null;
+        await anomalyService.applyAnomalyFlag(connection, 'staff_attendance', 'staff_attendance_id', existingRecord.staff_attendance_id, anomalyU);
 
         if (attendanceChanged) {
           let actionType;
@@ -533,8 +619,8 @@ if (status === 'Present') {
               regular_hours, overtime_hours, lunch_deducted_hours,
               is_friday_worked, friday_confirmed_by_user_id, standard_minutes_snapshot,
               lunch_start_time, lunch_end_time,
-              recorded_by_user_id, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              recorded_by_user_id, status, is_paid)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             staffId,
             record_date,
@@ -551,10 +637,14 @@ if (status === 'Present') {
             lunchEnd,
             supervisorId,
             targetStatus,
+            status === 'Sick' ? 0 : 1,   // D-11: Sick unpaid by default
           ]
         );
 
         const staffAttendanceId = insertResult.insertId;
+        const anomalyI = status === 'Present' && checkIn && checkOut
+          ? await anomalyService.evaluateSession(checkIn, checkOut, record_date) : null;
+        await anomalyService.applyAnomalyFlag(connection, 'staff_attendance', 'staff_attendance_id', staffAttendanceId, anomalyI);
 
         await connection.execute(
           `INSERT INTO auditlogs
@@ -588,16 +678,38 @@ if (status === 'Present') {
     }
 
     if (mode === 'submit' && !isResubmit) {
-      // Promote only Draft rows for this date. Rejected, Submitted, and
-      // Approved rows are deliberately excluded from this day submission.
       const [drafts] = await connection.execute(
-        `SELECT staff_attendance_id, staff_id
-         FROM staff_attendance
-         WHERE record_date = ? AND status = 'Draft'
-           AND staff_id IN (${assignedIds.map(() => '?').join(',')})
-         FOR UPDATE`,
+        `SELECT sa.staff_attendance_id, sa.staff_id, sa.attendance_status,
+                sa.check_in_time, sa.check_out_time, sa.is_friday_worked, sm.full_name
+         FROM staff_attendance sa
+         JOIN staff_members sm ON sm.staff_id = sa.staff_id
+         WHERE sa.record_date = ? AND sa.status = 'Draft'
+           AND sa.staff_id IN (${assignedIds.map(() => '?').join(',')})
+         FOR UPDATE OF sa`,
         [record_date, ...assignedIds]
       );
+
+      // Rule: Present without a real check-in AND check-out can never become Submitted.
+      const incomplete = drafts.filter((d) =>
+        d.attendance_status === 'Present' && (!d.check_in_time || !d.check_out_time));
+      if (incomplete.length > 0) {
+        throw new AppError(
+          `Cannot submit. Missing check-out (wait for the biometric OUT or enter it manually): ` +
+          incomplete.map((d) => d.full_name).join(', ')
+        );
+      }
+
+      // Biometric Friday records are created unconfirmed; they must be confirmed first.
+      if (dayIsFriday) {
+        const unconfirmed = drafts.filter((d) =>
+          d.attendance_status === 'Present' && Number(d.is_friday_worked) !== 1);
+        if (unconfirmed.length > 0) {
+          throw new AppError(
+            `Friday attendance needs confirmation for: ${unconfirmed.map((d) => d.full_name).join(', ')}`
+          );
+        }
+      }
+
       for (const draft of drafts) {
         await connection.execute(
           `UPDATE staff_attendance
@@ -608,15 +720,10 @@ if (status === 'Present') {
         );
         results.updated.push(draft.staff_id);
         await connection.execute(
-          `INSERT INTO auditlogs
-             (table_name, record_id, action_type, user_id, old_values, new_values)
+          `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
            VALUES ('staff_attendance', ?, 'SUPERVISOR_ATTENDANCE_SUBMITTED', ?, ?, ?)`,
-          [
-            draft.staff_attendance_id,
-            supervisorId,
-            JSON.stringify({ status: 'Draft' }),
-            JSON.stringify({ status: 'Submitted', staff_id: draft.staff_id, record_date })
-          ]
+          [draft.staff_attendance_id, supervisorId, JSON.stringify({ status: 'Draft' }),
+            JSON.stringify({ status: 'Submitted', staff_id: draft.staff_id, record_date })]
         );
       }
     }
@@ -656,12 +763,14 @@ if (status === 'Present') {
       });
     }
 
-    const httpStatus = error.isOperational ? 400 : 500;
-    res.status(httpStatus).json({
+    if (error.isOperational) {
+      return res.status(error.statusCode || 400).json({
+        status: 'error', ...(error.code ? { code: error.code } : {}), message: error.message, ...(error.extra || {}),
+      });
+    }
+    res.status(500).json({
       status: 'error',
-      message: error.isOperational
-        ? error.message
-        : (isDraftMode ? 'Failed to save staff attendance draft.' : 'Failed to submit staff attendance.')
+      message: isDraftMode ? 'Failed to save staff attendance draft.' : 'Failed to submit staff attendance.'
     });
   } finally {
     connection.release();

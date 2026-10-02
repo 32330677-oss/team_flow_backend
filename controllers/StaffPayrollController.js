@@ -1,6 +1,8 @@
 const pool = require('../config/db');
 const { countNonFridayDays, listNonFridayDates, isFriday, round2 } = require('../services/staffAttendanceService');
 const { getActiveSpansOverlapping } = require('../services/staffEmploymentService');
+const { buildStaffCompensationTimeline } = require('../services/staffCompensationService');
+const settingsCache = require('../services/settingsCache');
 function isValidDate(value) {
     return /^\d{4}-\d{2}-\d{2}$/.test(String(value || '')) && !Number.isNaN(Date.parse(`${value}T00:00:00`));
 }
@@ -24,6 +26,10 @@ async function generateStaffPayrollBatch(req, res) {
     const { start_date, end_date, acknowledge_pending } = req.body || {};
     const acknowledgePending = acknowledge_pending === true;
     const userId = req.user?.user_id;
+    // D-03: set only by staffPayrollVersioningController.createNewVersion —
+    // the replacement is generated and verified BEFORE the old batch is
+    // superseded, in the same transaction.
+    const supersede = req._supersede || null;
 
     if (!userId) return res.status(401).json({ status: 'error', message: 'Unable to determine user identity' });
     if (!isValidDate(start_date) || !isValidDate(end_date)) {
@@ -38,12 +44,21 @@ async function generateStaffPayrollBatch(req, res) {
         await connection.beginTransaction();
         const [overlap] = await connection.execute(
             `SELECT staff_payroll_batch_id FROM staff_payroll_batches
-             WHERE start_date <= ? AND end_date >= ? AND status <> 'Superseded' LIMIT 1 FOR UPDATE`,
-            [end_date, start_date]
+             WHERE start_date <= ? AND end_date >= ? AND status IN ('Generated','Paid')
+               AND staff_payroll_batch_id <> ? LIMIT 1 FOR UPDATE`,
+            [end_date, start_date, supersede ? supersede.batchId : 0]
         );
         if (overlap.length) {
             await connection.rollback();
             return res.status(409).json({ status: 'error', message: 'A payroll batch overlapping with this period already exists' });
+        }
+        if (supersede) {
+            const [[old]] = await connection.execute(
+                'SELECT status, start_date, end_date FROM staff_payroll_batches WHERE staff_payroll_batch_id = ? FOR UPDATE', [supersede.batchId]);
+            if (!old || old.status !== 'Generated') {
+                await connection.rollback();
+                return res.status(409).json({ status: 'error', message: 'The batch to supersede is no longer active (or is Paid).' });
+            }
         }
 
 
@@ -82,22 +97,38 @@ const [prev] = await connection.execute(
   [start_date, end_date]
 );
 const nextVersion = prev.length ? prev[0].version_number + 1 : 1;
-const supersedesId = prev.length ? prev[0].staff_payroll_batch_id : null;
+const supersedesId = supersede ? supersede.batchId : (prev.length ? prev[0].staff_payroll_batch_id : null);
+const staffCurrency = String(await settingsCache.getSetting('staff_payroll_currency', 'USD') || 'USD').toUpperCase();
 
 const [batchResult] = await connection.execute(
   `INSERT INTO staff_payroll_batches
-     (start_date, end_date, generated_by_user_id, status, version_number, supersedes_batch_id)
-   VALUES (?, ?, ?, 'Generated', ?, ?)`,
-  [start_date, end_date, userId, nextVersion, supersedesId]
+     (start_date, end_date, generated_by_user_id, status, version_number, supersedes_batch_id, currency, supersede_reason)
+   VALUES (?, ?, ?, 'Generated', ?, ?, ?, ?)`,
+  [start_date, end_date, userId, nextVersion, supersedesId, staffCurrency, supersede ? supersede.reason : null]
 );
         const batchId = batchResult.insertId;
         let totalStaff = 0;
         let totalAmount = 0;
         const pendingAttendance = [];
+        // D3: dates whose historical salary / hours / paid leave types cannot be
+        // reconstructed reliably (never silently replaced by today's profile).
+        const unresolvedCompensation = [];
+        const segmentAudits = [];
+
+        // Every calendar date of the batch period (used for compensation checks).
+        const periodDates = [];
+        for (let d = new Date(`${start_date}T00:00:00Z`); d <= new Date(`${end_date}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + 1)) {
+            periodDates.push(d.toISOString().slice(0, 10));
+        }
 
         for (const staff of staffList) {
-            const paidLeaveTypes = getPaidLeaveTypes(staff);
-            const standardDailyHours = Number(staff.standard_daily_hours) > 0 ? Number(staff.standard_daily_hours) : 8;
+            // D3 / #12: salary, standard hours and paid leave types come from the
+            // values that applied on each date (staff_compensation_history), not
+            // from today's profile. Staff without history keep the profile values
+            // (identical to the previous behavior).
+            // D3 (final decision): history -> reliable snapshot -> current profile,
+            // resolved per date (staffCompensationService.buildStaffCompensationTimeline).
+            const resolveComp = await buildStaffCompensationTimeline(staff.staff_id, connection, { excludeBatchId: batchId });
 
 // Clamp to this staff member's actual employment window, and never
 // beyond "today" — future days have no attendance yet and must never
@@ -109,7 +140,6 @@ const [batchResult] = await connection.execute(
                 staff.staff_id, start_date, end_date, connection
             );
             if (employmentSpans.length === 0) continue; // غير موظف إطلاقاً خلال هذه الفترة
-
             const isDateInEmployment = (dateStr) => employmentSpans.some((span) =>
                 dateStr >= span.start && (!span.end || dateStr <= span.end)
             );
@@ -172,15 +202,57 @@ for (const record of records) {
 // Each attendance row carries the required-hours rule used when it was
 // recorded. This prevents a later profile edit from changing old payroll
 // calculations. Missing/legacy rows safely fall back to the current profile.
+//
+// D3 (final decision): every employed date is resolved on its own:
+//   dailyHours (h_d) = history -> that day's attendance snapshot -> baseline/profile
+//   periodComp (S_d, H_d) = the salary/standard hours in effect on that date
+//                           WITHOUT the attendance snapshot (used for proration),
+//                           which equals the previous single standardDailyHours.
 const standardHoursByDate = new Map();
+const periodCompByDate = new Map();
+const staffUnresolved = [];
 for (const dateStr of calendarDates) {
     const record = recordsByDate.get(dateStr);
     const snapshotMinutes = Number(record?.standard_minutes_snapshot);
-    standardHoursByDate.set(
-        dateStr,
-        snapshotMinutes > 0 ? snapshotMinutes / 60 : standardDailyHours
-    );
+    const daily = resolveComp(dateStr, { hoursSnapshot: snapshotMinutes > 0 ? snapshotMinutes / 60 : null });
+    const period = resolveComp(dateStr);
+    for (const u of [...daily.unresolved, ...period.unresolved]) {
+        if (!staffUnresolved.some((x) => x.date === dateStr && x.field === u.field)) {
+            staffUnresolved.push({ date: dateStr, ...u });
+        }
+    }
+    // Paid leave types are only needed when that day's record is a leave record.
+    if (record && !['Present', 'Absent'].includes(record.attendance_status) && !daily.paid_leave_types) {
+        staffUnresolved.push({ date: dateStr, field: 'paid_leave_types',
+            reason: 'compensation history exists for this staff member but does not cover this date' });
+    }
+    standardHoursByDate.set(dateStr, daily.standard_daily_hours);
+    periodCompByDate.set(dateStr, { ...period, paid_leave_types: daily.paid_leave_types });
 }
+if (staffUnresolved.length > 0) {
+    unresolvedCompensation.push({ staff_id: staff.staff_id, full_name: staff.full_name, dates: staffUnresolved });
+    continue;
+}
+const paidLeaveTypesFor = (dateStr) => periodCompByDate.get(dateStr)?.paid_leave_types || getPaidLeaveTypes(staff);
+
+// Compensation segments: consecutive employed dates with the same salary and
+// standard hours. One segment == the previous single-value calculation.
+const segments = [];
+for (const dateStr of calendarDates) {
+    const c = periodCompByDate.get(dateStr);
+    const last = segments[segments.length - 1];
+    if (last && last.monthly_salary === c.monthly_salary && last.standard_daily_hours === c.standard_daily_hours) {
+        last.dates.push(dateStr);
+    } else {
+        segments.push({
+            monthly_salary: c.monthly_salary, standard_daily_hours: c.standard_daily_hours,
+            salary_source: c.salary_source, hours_source: c.hours_source, dates: [dateStr],
+        });
+    }
+}
+const standardDailyHours = segments[segments.length - 1].standard_daily_hours;
+staff.monthly_salary = segments[segments.length - 1].monthly_salary;
+
 const requiredHours = round2(
     calendarDates.reduce((sum, dateStr) => sum + standardHoursByDate.get(dateStr), 0)
 );
@@ -194,6 +266,9 @@ let presentDaysCount = 0;
 let paidLeaveDays = 0;
 let managementPaidDays = 0;
 let unpaidAbsenceDays = 0;
+const workedShortfallByDate = new Map();   // D3: date -> worked-day shortfall hours
+const absenceShortfallByDate = new Map();  // D3: date -> absence shortfall hours
+const addTo = (map, key, v) => map.set(key, (map.get(key) || 0) + v);
 
 // الجمعة: خارج requiredDays/requiredHours تمامًا. تُحسب أوفر تايم كامل
 // فقط إذا فيها سجل Present معتمد مع is_friday_worked = 1.
@@ -214,6 +289,7 @@ for (const dateStr of calendarDates) {
         // Submitted/Rejected ومش Approved بعد) -> غياب غير مدفوع تلقائيًا.
         // لا يُغطى من الأوفر تايم إطلاقًا.
         absenceShortfall += dailyStandardHours;
+        addTo(absenceShortfallByDate, dateStr, dailyStandardHours);
         unpaidAbsenceDays += 1;
         continue;
     }
@@ -221,6 +297,7 @@ for (const dateStr of calendarDates) {
     if (record.attendance_status === 'Present') {
         const regHours = Number(record.regular_hours || 0);
         workedDayShortfall += Math.max(0, dailyStandardHours - regHours);
+        addTo(workedShortfallByDate, dateStr, Math.max(0, dailyStandardHours - regHours));
         actualRegularRaw += regHours;
         dailyOtEarned += Number(record.overtime_hours || 0);
         presentDaysCount += 1;
@@ -230,14 +307,16 @@ for (const dateStr of calendarDates) {
             managementPaidDays += 1;
         } else {
             absenceShortfall += dailyStandardHours;   // ← لا يُغطى من الـ OT
+            addTo(absenceShortfallByDate, dateStr, dailyStandardHours);
             unpaidAbsenceDays += 1;
         }
-    } else if (paidLeaveTypes.includes(record.attendance_status) && Number(record.is_paid) === 1) {
+    } else if (paidLeaveTypesFor(dateStr).includes(record.attendance_status) && Number(record.is_paid) === 1) {
         actualRegularRaw += dailyStandardHours;
         paidLeaveDays += 1;
     } else {
         // إجازة من نوع غير مدرج بـ paid_leave_types، أو is_paid = 0
         absenceShortfall += dailyStandardHours;        // ← لا يُغطى من الـ OT
+        addTo(absenceShortfallByDate, dateStr, dailyStandardHours);
         unpaidAbsenceDays += 1;
     }
 }
@@ -250,13 +329,58 @@ for (const dateStr of calendarDates) {
             const shortageHours        = round2(workedDayShortfall + absenceShortfall);       // للعرض فقط
             const uncoveredShortageHours = round2(uncoveredWorked + absenceShortfall);
 
-const periodRequiredHours = round2(batchNonFridayDays * standardDailyHours);
-const prorationRatio = periodRequiredHours > 0
-    ? Math.min(1, Math.max(0, requiredHours / periodRequiredHours))
-    : 0;
-const proratedBaseSalary = money(Number(staff.monthly_salary) * prorationRatio);
-const hourlyRateRaw   = requiredHours > 0 ? proratedBaseSalary / requiredHours : 0;
-const salaryDeduction = money(uncoveredShortageHours * hourlyRateRaw);
+let periodRequiredHours;
+let proratedBaseSalary;
+let hourlyRateRaw;
+let salaryDeduction;
+let segmentDetails = null;
+if (segments.length === 1) {
+    // Unchanged single-value calculation (no compensation change in the period).
+    periodRequiredHours = round2(batchNonFridayDays * standardDailyHours);
+    const prorationRatio = periodRequiredHours > 0
+        ? Math.min(1, Math.max(0, requiredHours / periodRequiredHours))
+        : 0;
+    proratedBaseSalary = money(Number(staff.monthly_salary) * prorationRatio);
+    hourlyRateRaw   = requiredHours > 0 ? proratedBaseSalary / requiredHours : 0;
+    salaryDeduction = money(uncoveredShortageHours * hourlyRateRaw);
+} else {
+    // D3 (final decision): a mid-period change splits the calculation by
+    // effective date. Each segment applies the exact single-value formula to
+    // its own dates with its own salary and standard hours:
+    //   segBase = S_seg * min(1, segRequired / (periodWorkingDays * H_seg))
+    //   segRate = segBase / segRequired
+    // Shortfall hours are charged at the rate of the date they occurred on.
+    // OT coverage of worked-day shortfall is spread over those dates
+    // proportionally (identical to the single-segment result when there is one).
+    let baseSum = 0;
+    let periodHoursSum = 0;
+    const rateByDate = new Map();
+    segmentDetails = segments.map((seg) => {
+        const segRequired = seg.dates.reduce((sum, dt) => sum + standardHoursByDate.get(dt), 0);
+        const segPeriodHours = batchNonFridayDays * seg.standard_daily_hours;
+        const ratio = segPeriodHours > 0 ? Math.min(1, Math.max(0, segRequired / segPeriodHours)) : 0;
+        const segBase = Number(seg.monthly_salary) * ratio;
+        const segRate = segRequired > 0 ? segBase / segRequired : 0;
+        seg.dates.forEach((dt) => rateByDate.set(dt, segRate));
+        baseSum += segBase;
+        periodHoursSum += segPeriodHours * (seg.dates.length / requiredDays);
+        return {
+            from: seg.dates[0], to: seg.dates[seg.dates.length - 1], working_days: seg.dates.length,
+            monthly_salary: seg.monthly_salary, standard_daily_hours: seg.standard_daily_hours,
+            salary_source: seg.salary_source, hours_source: seg.hours_source,
+            required_hours: round2(segRequired), prorated_base_salary: money(segBase), hourly_rate: money(segRate),
+        };
+    });
+    periodRequiredHours = round2(periodHoursSum);
+    proratedBaseSalary = money(baseSum);
+    hourlyRateRaw = requiredHours > 0 ? proratedBaseSalary / requiredHours : 0;
+    let absenceAmount = 0;
+    for (const [dt, h] of absenceShortfallByDate) absenceAmount += h * (rateByDate.get(dt) || 0);
+    let workedAmount = 0;
+    for (const [dt, h] of workedShortfallByDate) workedAmount += h * (rateByDate.get(dt) || 0);
+    const uncoveredShare = workedDayShortfall > 0 ? uncoveredWorked / workedDayShortfall : 0;
+    salaryDeduction = money(absenceAmount + workedAmount * uncoveredShare);
+}
 const netSalary        = money(proratedBaseSalary - salaryDeduction);
 const hourlyRate       = money(hourlyRateRaw); // هاد بس للعرض/التخزين بالتقرير
 
@@ -279,6 +403,17 @@ const hourlyRate       = money(hourlyRateRaw); // هاد بس للعرض/الت�
                 ]
             );
             if (!payrollResult.insertId) continue;
+            if (segmentDetails) {
+                // The row's single monthly_salary_snapshot (the last segment) cannot
+                // describe every date; the full split is kept in the audit log and
+                // this row is never reused as a salary snapshot (D3 fallback).
+                segmentAudits.push({ staff_id: staff.staff_id, full_name: staff.full_name, segments: segmentDetails });
+                await connection.execute(
+                    `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+                     VALUES ('staff_payroll', ?, 'COMPENSATION_SEGMENTS', ?, NULL, ?)`,
+                    [payrollResult.insertId, userId, JSON.stringify({ batch_id: batchId, staff_id: staff.staff_id, segments: segmentDetails })]
+                );
+            }
 
             // One ledger row per (staff, payroll_month). If a batch is
             // regenerated for the same month, this overwrites the prior
@@ -314,6 +449,18 @@ const hourlyRate       = money(hourlyRateRaw); // هاد بس للعرض/الت�
             totalAmount = money(totalAmount + netSalary);
         }
 
+        if (unresolvedCompensation.length > 0) {
+            await connection.rollback();
+            return res.status(409).json({
+                status: 'error',
+                code: 'HISTORICAL_COMPENSATION_UNRESOLVED',
+                message: 'The historical salary, standard hours or paid leave types for some dates cannot be reconstructed reliably ' +
+                    '(conflicting payroll snapshots, or compensation history that does not cover the date). ' +
+                    'No value was guessed. Record the correct compensation history for these dates, then generate again.',
+                staff: unresolvedCompensation,
+            });
+        }
+
         if (pendingAttendance.length > 0 && !acknowledgePending) {
             await connection.rollback();
             return res.status(409).json({
@@ -334,12 +481,35 @@ const hourlyRate       = money(hourlyRateRaw); // هاد بس للعرض/الت�
             [totalStaff, totalAmount, batchId]
         );
 
+        if (supersede) {
+            // Verified replacement exists -> supersede the old batch (same transaction).
+            const [[check]] = await connection.execute(
+                'SELECT COUNT(*) AS cnt FROM staff_payroll WHERE staff_payroll_batch_id = ?', [batchId]);
+            if (Number(check.cnt) !== totalStaff) throw new Error('Replacement verification failed.');
+            await connection.execute(
+                `UPDATE staff_payroll_batches SET status = 'Superseded' WHERE staff_payroll_batch_id = ? AND status = 'Generated'`,
+                [supersede.batchId]);
+            await connection.execute(
+                `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+                 VALUES ('staff_payroll_batches', ?, 'SUPERSEDED', ?, ?, ?)`,
+                [supersede.batchId, userId, JSON.stringify({ status: 'Generated' }),
+                    JSON.stringify({ status: 'Superseded', replaced_by_batch_id: batchId, reason: supersede.reason })]);
+        }
+
         await connection.commit();
-        return res.status(201).json({ status: 'success', message: 'Staff payroll batch generated successfully', batch_id: batchId });
+        return res.status(201).json({
+            status: 'success',
+            message: supersede
+                ? `Replacement batch #${batchId} (version ${nextVersion}) generated; batch #${supersede.batchId} is now Superseded.`
+                : 'Staff payroll batch generated successfully',
+            batch_id: batchId,
+            currency: staffCurrency,
+            ...(segmentAudits.length ? { compensation_segments: segmentAudits } : {}),
+        });
     } catch (error) {
         await connection.rollback();
         console.error('generateStaffPayrollBatch:', error);
-        return res.status(500).json({ status: 'error', message: 'Failed to generate payroll batch' });
+        return res.status(500).json({ status: 'error', message: 'Failed to generate payroll batch. No batch was changed.' });
     } finally {
         connection.release();
     }
@@ -350,6 +520,8 @@ async function getStaffPayrollReport(req, res) {
         const [rows] = await pool.execute(
             `SELECT spb.staff_payroll_batch_id, spb.start_date, spb.end_date,
                     spb.total_staff, spb.total_amount, spb.status, spb.generated_at,
+                    spb.version_number, spb.is_finalized, spb.finalized_at, spb.currency,
+                    spb.supersedes_batch_id, spb.void_reason, spb.supersede_reason,
                     u.full_name AS generated_by
              FROM staff_payroll_batches spb
              JOIN users u ON u.user_id = spb.generated_by_user_id
@@ -399,9 +571,9 @@ if (!batches.length) {
     await connection.rollback();
     return res.status(404).json({ status: 'error', message: 'Payroll batch not found' });
 }
-if (batches[0].status === 'Superseded') {
+if (batches[0].status === 'Superseded' || batches[0].status === 'Voided') {
     await connection.rollback();
-    return res.status(409).json({ status: 'error', message: 'A superseded batch cannot be marked as paid' });
+    return res.status(409).json({ status: 'error', message: `A ${batches[0].status.toLowerCase()} batch cannot be marked as paid` });
 }
 if (batches[0].status === 'Paid') {
     await connection.rollback();
@@ -411,7 +583,13 @@ if (!batches[0].is_finalized) {
     await connection.rollback();
     return res.status(409).json({ status: 'error', message: 'Finalize this payroll batch before marking it as paid.' });
 }
-await connection.execute(`UPDATE staff_payroll_batches SET status = 'Paid' WHERE staff_payroll_batch_id = ?`, [batchId]);
+// C-09: who marked it paid and when.
+await connection.execute(`UPDATE staff_payroll_batches SET status = 'Paid', paid_by_user_id = ?, paid_at = NOW() WHERE staff_payroll_batch_id = ?`, [req.user?.user_id, batchId]);
+await connection.execute(
+    `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+     VALUES ('staff_payroll_batches', ?, 'MARKED_PAID', ?, ?, ?)`,
+    [batchId, req.user?.user_id, JSON.stringify({ status: batches[0].status }), JSON.stringify({ status: 'Paid' })]
+);
         await connection.commit();
         return res.json({ status: 'success', message: 'Payroll batch marked as paid successfully' });
     } catch (error) {
@@ -500,7 +678,7 @@ sheet.columns = [
         sheet.getCell('A1').value =
             `Staff Payroll Batch #${batchId} (v${batch.version_number || 1}) — ${finalizedLabel}`;
         sheet.mergeCells('A2:R2');
-        sheet.getCell('A2').value = `Period: ${dateOnly(batch.start_date)}  →  ${dateOnly(batch.end_date)}`;
+        sheet.getCell('A2').value = `Period: ${dateOnly(batch.start_date)}  →  ${dateOnly(batch.end_date)}   |   Currency: ${batch.currency || 'USD'}`;
         sheet.mergeCells('A3:R3');
         sheet.getCell('A3').value =
             `Status: ${statusLabel}   |   Generated By: ${batch.generated_by || '-'}` +
@@ -717,7 +895,7 @@ async function exportStaffPayrollPdf(req, res) {
             doc.font('Helvetica-Bold').fontSize(10);
             doc.text(`Batch #${batchId}  (Version ${batch.version_number || 1})`, doc.page.margins.left, cursorY);
             doc.text(
-                `Period: ${dateOnly(batch.start_date)}   to   ${dateOnly(batch.end_date)}`,
+                `Period: ${dateOnly(batch.start_date)}   to   ${dateOnly(batch.end_date)}   |   Currency: ${batch.currency || 'USD'}`,
                 doc.page.margins.left, cursorY, { width: pageWidth, align: 'right' }
             );
             cursorY += 16;
