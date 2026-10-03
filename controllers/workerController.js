@@ -11,16 +11,14 @@ const UPLOAD_DIR = path.join(__dirname, '..', 'uploads');
 const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 const ALLOWED_IMAGE_EXT = ['.jpg', '.jpeg', '.png', '.webp'];
 
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch (_) {}
-        cb(null, 'uploads/');
-    },
-    filename: (req, file, cb) => {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname).toLowerCase());
-    }
-});
+const fileStorage = require('../services/fileStorage');
+const storage = multer.memoryStorage();
+
+async function storeUploaded(req, field) {
+    const f = req.files && req.files[field] && req.files[field][0];
+    if (!f) return null;
+    return fileStorage.save(fileStorage.newName(field, f.originalname), f.buffer, f.mimetype);
+}
 // C-18: images only, max 5 MB each.
 const upload = multer({
     storage,
@@ -63,13 +61,13 @@ exports.getWorkerFile = async (req, res) => {
         if (!row || !row.file_path) return res.status(404).json({ status: 'error', message: 'File not found.' });
         // Accept legacy values stored as full URLs or relative paths; resolve the
         // file name inside uploads/ only (no path traversal).
-        const fileName = path.basename(String(row.file_path).replace(/\\/g, '/'));
-        const absolute = path.join(UPLOAD_DIR, fileName);
-        if (!absolute.startsWith(UPLOAD_DIR) || !fs.existsSync(absolute)) {
-            return res.status(404).json({ status: 'error', message: 'File not found.' });
-        }
-        res.setHeader('Cache-Control', 'private, no-store');
-        return res.sendFile(absolute);
+res.setHeader('Cache-Control', 'private, no-store');
+const found = await fileStorage.send(res, row.file_path);
+if (!found) {
+    res.removeHeader('Cache-Control');
+    return res.status(404).json({ status: 'error', message: 'File not found.' });
+}
+return;
     } catch (error) {
         console.error('GET WORKER FILE ERROR:', error);
         return res.status(500).json({ status: 'error', message: 'Failed to load the file.' });
@@ -365,8 +363,14 @@ exports.createWorker = async (req, res) => {
     }
 
     const comp = normalizedCompensationValues(payment_type, daily_rate, regular_hourly_rate, overtime_hourly_rate);
-    const personalPhotoPath = req.files && req.files['personal_photo'] ? req.files['personal_photo'][0].path : null;
-    const idPhotoPath = req.files && req.files['id_photo'] ? req.files['id_photo'][0].path : null;
+let personalPhotoPath, idPhotoPath;
+try {
+    personalPhotoPath = await storeUploaded(req, 'personal_photo');
+    idPhotoPath = await storeUploaded(req, 'id_photo');
+} catch (e) {
+    console.error('PHOTO UPLOAD ERROR:', e);
+    return res.status(502).json({ status: 'error', message: 'Could not store the photos. Please try again.' });
+}
     const effectiveHireDate = hire_date || businessToday();   // B10: business date
 
     const connection = await db.getConnection();
@@ -667,12 +671,8 @@ const touchesCompensation =
                 }
             }
 
-            const personalPhotoPath = req.files && req.files['personal_photo']
-                ? req.files['personal_photo'][0].path
-                : existing.personal_photo;
-            const idPhotoPath = req.files && req.files['id_photo']
-                ? req.files['id_photo'][0].path
-                : existing.id_photo;
+const personalPhotoPath = (await storeUploaded(req, 'personal_photo')) || existing.personal_photo;
+const idPhotoPath = (await storeUploaded(req, 'id_photo')) || existing.id_photo;
             const birthDateValue = typeof birth_date === 'string' && birth_date.trim() === '' ? null : birth_date;
 
             await connection.execute(
