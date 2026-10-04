@@ -150,6 +150,7 @@ exports.correctWorkerAttendance = async (req, res) => {
 
     let checkIn = null;
     let checkOut = null;
+    let removedBreaks = [];
     if (status === 'Present') {
       checkIn = req.body.check_in_time !== undefined ? wall(req.body.check_in_time) : wall(original.check_in_time);
       checkOut = req.body.check_out_time !== undefined ? wall(req.body.check_out_time) : wall(original.check_out_time);
@@ -166,8 +167,14 @@ exports.correctWorkerAttendance = async (req, res) => {
         }
       }
     } else {
-      const [[breaks]] = await connection.execute('SELECT COUNT(*) AS cnt FROM attendanceleaveperiods WHERE attendance_id = ?', [attendanceId]);
-      if (Number(breaks.cnt) > 0) throw new OpError('This record has recorded breaks; it can only stay Present.');
+      // Present -> Absent/Sick/...: every submitted Present day carries a Lunch
+      // row (added at Submit Day), so refusing here blocked EVERY such
+      // correction. The breaks are meaningless without a shift: snapshot them
+      // into the correction log / audit and remove them below.
+      const [breaks] = await connection.execute(
+        'SELECT leave_id, leave_start_time, leave_end_time, leave_type FROM attendanceleaveperiods WHERE attendance_id = ?',
+        [attendanceId]);
+      removedBreaks = breaks;
     }
 
     let mgmt = Number(original.management_leave_hours || 0);
@@ -202,6 +209,9 @@ exports.correctWorkerAttendance = async (req, res) => {
       await connection.execute(
         "DELETE FROM attendanceleaveperiods WHERE attendance_id = ? AND leave_type = 'Lunch'", [attendanceId]);
     }
+    if (removedBreaks.length > 0) {
+      await connection.execute('DELETE FROM attendanceleaveperiods WHERE attendance_id = ?', [attendanceId]);
+    }
 
     if (status === 'Present') {
       await attendanceService.calculateWorkingHours(attendanceId, connection);
@@ -227,7 +237,9 @@ exports.correctWorkerAttendance = async (req, res) => {
          (record_table, record_id, person_id, record_date, original_values, corrected_values, reason,
           corrected_by_user_id, corrected_at, locked_batch_table, locked_batch_id, payroll_effect, adjustment_status)
        VALUES ('attendance', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [attendanceId, original.worker_id, recordDate, JSON.stringify(original), JSON.stringify(corrected), reason,
+      [attendanceId, original.worker_id, recordDate,
+        JSON.stringify(removedBreaks.length ? { ...original, removed_breaks: removedBreaks } : original),
+        JSON.stringify(corrected), reason,
         userId, nowWall(), locked ? 'payrollbatches' : null, locked ? locked.payroll_batch_id : null,
         effect, effect === 'AdjustmentRequired' ? 'Open' : 'NotApplicable']
     );
@@ -237,6 +249,7 @@ exports.correctWorkerAttendance = async (req, res) => {
       [attendanceId, userId, JSON.stringify(original),
         JSON.stringify({ correction_id: log.insertId, reason, attendance_status: status, check_in_time: checkIn,
           check_out_time: checkOut, management_leave_hours: mgmt, locked_batch_id: locked ? locked.payroll_batch_id : null,
+          removed_breaks: removedBreaks.length ? removedBreaks : undefined,
           lunch: lunch ? { action: lunch.action, start: lunch.start || null, end: lunch.end || null, from_site: Boolean(lunch.fromSite) } : null })]
     );
     await connection.commit();
