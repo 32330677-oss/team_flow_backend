@@ -53,7 +53,9 @@ function nowWall() {
 }
 
 function send(res, error, fallback) {
-  if (error && error.isOperational) return res.status(error.statusCode || 400).json({ status: 'error', message: error.message });
+  if (error && error.isOperational) {
+    return res.status(error.statusCode || 400).json({ status: 'error', ...(error.code ? { code: error.code } : {}), message: error.message });
+  }
   console.error(fallback, error);
   return res.status(500).json({ status: 'error', message: fallback });
 }
@@ -67,8 +69,69 @@ function requireReason(body) {
 // ---------------------------------------------------------------------------
 // Worker attendance
 // POST /api/attendance/:attendance_id/admin-correction
-// body: { reason, attendance_status?, check_in_time?, check_out_time?, management_leave_hours? }
+// body: { reason, attendance_status?, check_in_time?, check_out_time?, management_leave_hours?,
+//         lunch_start_time?, lunch_end_time?, worked_through_lunch? }
+//
+// Lunch (same rule as Submit Day): a record that BECOMES Present (Absent,
+// Sick, ... corrected to Present) and has no lunch gets the site's lunch
+// period of that day; a record that was already Present keeps its lunch; explicit lunch times replace it;
+// worked_through_lunch = true keeps the full shift (noted in remarks). When the
+// site has no lunch recorded that day, the Admin must give one of the two —
+// otherwise an absent day corrected to 07:00-18:00 silently became 11 h
+// (10 h + 1 h overtime) instead of 10 h.
 // ---------------------------------------------------------------------------
+async function resolveCorrectionLunch(connection, original, checkIn, checkOut, body) {
+  const { normalizeTimeForShift, parseAttendanceDate } = require('./attendanceController')._shared;
+  const shiftStart = parseAttendanceDate(checkIn);
+  const shiftEnd = parseAttendanceDate(checkOut);
+  const timeOf = (v) => {
+    const t = String(v || '').trim().replace('T', ' ');
+    if (/^\d{2}:\d{2}(:\d{2})?$/.test(t)) return t;
+    const m = /\d{2}:\d{2}(:\d{2})?$/.exec(t);
+    return m ? m[0] : null;
+  };
+  const inShift = (startTxt, endTxt) => {
+    const st = normalizeTimeForShift(timeOf(startTxt), shiftStart, shiftEnd);
+    const en = normalizeTimeForShift(timeOf(endTxt), shiftStart, shiftEnd);
+    return { st, en };
+  };
+
+  const [[existing]] = await connection.execute(
+    "SELECT COUNT(*) AS cnt FROM attendanceleaveperiods WHERE attendance_id = ? AND leave_type = 'Lunch'", [original.attendance_id]);
+  const hasLunch = Number(existing.cnt) > 0;
+  const given = body.lunch_start_time || body.lunch_end_time;
+
+  if (given) {
+    if (!body.lunch_start_time || !body.lunch_end_time) throw new OpError('Give both lunch start and lunch end.');
+    const { st, en } = inShift(body.lunch_start_time, body.lunch_end_time);
+    if (!st || !en) throw new OpError('The lunch period must be inside the corrected shift.');
+    if (en <= st) throw new OpError('Lunch end must be after lunch start.');
+    return { action: 'set', start: st, end: en };
+  }
+  if (body.worked_through_lunch === true) return { action: 'worked_through' };
+  if (hasLunch) return { action: 'keep' };
+  // A record that was already Present keeps its lunch decision from Submit Day
+  // (e.g. "worked through lunch" or a shift outside the lunch period).
+  if (original.attendance_status === 'Present') return { action: 'keep' };
+
+  // Site lunch of that day (same site / shift), exactly like Submit Day.
+  const recordDate = String(original.record_date).slice(0, 10);
+  const [[site]] = await connection.execute(
+    `SELECT MIN(alp.leave_start_time) AS s, MAX(alp.leave_end_time) AS e
+     FROM attendanceleaveperiods alp JOIN attendance a ON a.attendance_id = alp.attendance_id
+     WHERE a.site_id = ? AND a.shift_type = ? AND a.record_date = ? AND a.attendance_id <> ?
+       AND alp.leave_type = 'Lunch' AND alp.leave_end_time IS NOT NULL`,
+    [original.site_id, original.shift_type, recordDate, original.attendance_id]);
+  if (!site || !site.s || !site.e) {
+    const err = new OpError('No lunch is recorded at this site on that day. Enter the lunch time, or confirm the worker worked through lunch.', 409);
+    err.code = 'LUNCH_DECISION_REQUIRED';
+    throw err;
+  }
+  const { st, en } = inShift(site.s, site.e);
+  if (!st || !en || en <= st) return { action: 'none' };   // shift does not cross the site lunch
+  return { action: 'set', start: st, end: en, fromSite: true };
+}
+
 exports.correctWorkerAttendance = async (req, res) => {
   const connection = await db.getConnection();
   try {
@@ -114,12 +177,31 @@ exports.correctWorkerAttendance = async (req, res) => {
     }
 
     const locked = await findLockedWorkerBatch(connection, { siteId: original.site_id, date: recordDate });
+    const lunch = status === 'Present' ? await resolveCorrectionLunch(connection, original, checkIn, checkOut, req.body) : null;
+
+    // A status change replaces the old remark (e.g. "Absent - recorded by supervisor").
+    let remarks = original.remarks;
+    if (status !== original.attendance_status) remarks = `Admin correction: ${reason}`.slice(0, 255);
+    if (lunch && lunch.action === 'worked_through') {
+      remarks = `${remarks ? `${remarks} | ` : ''}Worked through lunch (admin correction)`.slice(0, 255);
+    }
 
     await connection.execute(
-      `UPDATE attendance SET attendance_status = ?, check_in_time = ?, check_out_time = ?, management_leave_hours = ?
+      `UPDATE attendance SET attendance_status = ?, check_in_time = ?, check_out_time = ?, management_leave_hours = ?, remarks = ?
        WHERE attendance_id = ?`,
-      [status, checkIn, checkOut, mgmt.toFixed(2), attendanceId]
+      [status, checkIn, checkOut, mgmt.toFixed(2), remarks, attendanceId]
     );
+
+    if (lunch && lunch.action === 'set') {
+      await connection.execute(
+        "DELETE FROM attendanceleaveperiods WHERE attendance_id = ? AND leave_type = 'Lunch'", [attendanceId]);
+      await connection.execute(
+        "INSERT INTO attendanceleaveperiods (attendance_id, leave_start_time, leave_end_time, leave_type) VALUES (?, ?, ?, 'Lunch')",
+        [attendanceId, lunch.start, lunch.end]);
+    } else if (lunch && lunch.action === 'worked_through') {
+      await connection.execute(
+        "DELETE FROM attendanceleaveperiods WHERE attendance_id = ? AND leave_type = 'Lunch'", [attendanceId]);
+    }
 
     if (status === 'Present') {
       await attendanceService.calculateWorkingHours(attendanceId, connection);
@@ -154,7 +236,8 @@ exports.correctWorkerAttendance = async (req, res) => {
        VALUES ('attendance', ?, 'ADMIN_CORRECTION', ?, ?, ?)`,
       [attendanceId, userId, JSON.stringify(original),
         JSON.stringify({ correction_id: log.insertId, reason, attendance_status: status, check_in_time: checkIn,
-          check_out_time: checkOut, management_leave_hours: mgmt, locked_batch_id: locked ? locked.payroll_batch_id : null })]
+          check_out_time: checkOut, management_leave_hours: mgmt, locked_batch_id: locked ? locked.payroll_batch_id : null,
+          lunch: lunch ? { action: lunch.action, start: lunch.start || null, end: lunch.end || null, from_site: Boolean(lunch.fromSite) } : null })]
     );
     await connection.commit();
 
