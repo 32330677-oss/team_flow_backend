@@ -1288,7 +1288,7 @@ function shapeArabicAware(str) {
     const CURRENCY_LABEL = CURRENCY_CODE === 'SYP' ? 'ل.س' : CURRENCY_CODE;
 
     const [rows] = await pool.execute(
-      `SELECT w.full_name AS worker_name, w.worker_unique_id, p.worker_id,
+      `SELECT w.full_name AS worker_name, w.worker_unique_id, p.worker_id, pi.payroll_item_id,
               s.site_id, s.site_name, pi.pay_type,
               pi.regular_hours_worked, pi.overtime_hours_worked,
               pi.hourly_rate_snapshot, pi.overtime_hourly_rate_snapshot,
@@ -1331,7 +1331,7 @@ function shapeArabicAware(str) {
     // ---- Daily hours: the batch's own snapshot (C-07); older batches fall
     //      back to the attendance as recorded today (stated in the header). ----
     let [attRows] = await pool.execute(
-      `SELECT worker_id, site_id, DATE_FORMAT(record_date, '%Y-%m-%d') AS record_date,
+      `SELECT payroll_item_id, worker_id, site_id, DATE_FORMAT(record_date, '%Y-%m-%d') AS record_date,
               regular_hours AS total_working_hours, overtime_hours
        FROM payroll_attendance_snapshot WHERE payroll_batch_id = ?`,
       [batchId]
@@ -1349,8 +1349,13 @@ function shapeArabicAware(str) {
     }
 const dailyMap = new Map();
 
+// With the snapshot, days are keyed by payroll item: a worker whose rate
+// changed inside the period has one item (row) per rate, and each row shows
+// only the days paid at that rate.
+const dayKey = (itemId, workerId, siteId, date) =>
+  (hoursFromSnapshot ? `i${itemId}|${date}` : `${workerId}|${siteId}|${date}`);
 for (const a of attRows) {
-  const key = `${a.worker_id}|${a.site_id}|${a.record_date}`;
+  const key = dayKey(a.payroll_item_id, a.worker_id, a.site_id, a.record_date);
   const prior = dailyMap.get(key) || { reg: 0, ot: 0 };
 
   dailyMap.set(key, {
@@ -1359,8 +1364,8 @@ for (const a of attRows) {
   });
 }
 
-    function getDaily(workerId, siteId, date) {
-      return dailyMap.get(`${workerId}|${siteId}|${date}`) || { reg: 0, ot: 0 };
+    function getDaily(itemId, workerId, siteId, date) {
+      return dailyMap.get(dayKey(itemId, workerId, siteId, date)) || { reg: 0, ot: 0 };
     }
 
 
@@ -1681,7 +1686,7 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
       const dailyByDate = {};
       let totalReg = 0, totalOt = 0;
       for (const d of usedDates) {
-        const v = getDaily(r.worker_id, r.site_id, d);
+        const v = getDaily(r.payroll_item_id, r.worker_id, r.site_id, d);
         dailyByDate[d] = v;
         totalReg += v.reg;
         totalOt += v.ot;
@@ -1697,7 +1702,8 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
         total_reg: fmt2(totalReg),
         total_ot: fmt2(totalOt),
         daily_wage: dailyWageLabel,
-        net: money(r.net_salary),
+        // Per row (one rate period at one site). The worker's total is in the grand total.
+        net: money(num(r.base_salary) + num(r.overtime_pay)),
         dailyByDate,
       };
 
