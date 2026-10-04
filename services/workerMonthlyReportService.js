@@ -58,10 +58,30 @@ async function loadData(monthStart, monthEnd) {
     );
     workers = r3[0];
   }
-  return { attendance, batches, payrolls, items, workers };
+  // Rates in effect during the period (a raise inside the period = 2 rows).
+  let rates = [];
+  if (workerIds.length) {
+    const r4 = await pool.query(
+      `SELECT worker_id, payment_type, daily_rate, regular_hourly_rate,
+              DATE_FORMAT(effective_from, '%Y-%m-%d') AS f, DATE_FORMAT(effective_to, '%Y-%m-%d') AS t
+       FROM workercompensationhistory
+       WHERE worker_id IN (?) AND effective_from <= ? AND (effective_to IS NULL OR effective_to >= ?)
+       ORDER BY worker_id, effective_from`,
+      [workerIds, monthEnd, monthStart]
+    );
+    rates = r4[0];
+  }
+  return { attendance, batches, payrolls, items, workers, rates };
 }
 
-function aggregate({ attendance, batches, payrolls, items, workers }, monthStart, monthEnd) {
+const fmtRate = (r) => {
+  const hourly = r.payment_type === 'Hourly';
+  const v = Math.round(Number(hourly ? r.regular_hourly_rate : r.daily_rate) || 0).toLocaleString('en-US');
+  return hourly ? `${v}/h` : v;
+};
+const ddmm = (d) => `${d.slice(8, 10)}/${d.slice(5, 7)}`;
+
+function aggregate({ attendance, batches, payrolls, items, workers, rates = [] }, monthStart, monthEnd) {
   const workerById = new Map(workers.map((w) => [w.worker_id, w]));
   const batchById = new Map(batches.map((b) => [b.payroll_batch_id, b]));
   const rows = new Map();
@@ -78,11 +98,17 @@ function aggregate({ attendance, batches, payrolls, items, workers }, monthStart
         days: {}, dayOt: {}, normal: 0, ot: 0,
         hasPay: false, basic: 0, otPay: 0, total: 0,
         payOt: 0, covOt: 0, uncovered: 0, nonApproved: 0, partialBatch: false,
-        flags: [],
+        flags: [], rateLabel: '',
       });
     }
     return rows.get(id);
   };
+
+  const ratesByWorker = new Map();
+  for (const r of rates) {
+    if (!ratesByWorker.has(r.worker_id)) ratesByWorker.set(r.worker_id, []);
+    ratesByWorker.get(r.worker_id).push(r);
+  }
 
   const covering = (date, siteId) => batches.filter((b) =>
     b.start_date <= date && date <= b.end_date &&
@@ -138,6 +164,15 @@ function aggregate({ attendance, batches, payrolls, items, workers }, monthStart
   }
 
   for (const r of rows.values()) {
+    // Rate column: "100,000" or, after a raise inside the period,
+    // "100,000 → 120,000 (05/06)" (the new rate and the day it starts).
+    const wr = ratesByWorker.get(r.worker_id) || [];
+    if (wr.length) {
+      r.rateLabel = wr.map((x, i) => (i === 0 ? fmtRate(x) : `${fmtRate(x)} (${ddmm(x.f)})`)).join(' → ');
+      for (let i = 1; i < wr.length; i += 1) {
+        r.flags.push(`Rate changed on ${wr[i].f}: ${fmtRate(wr[i - 1])} until ${wr[i - 1].t || ''}, ${fmtRate(wr[i])} from ${wr[i].f} (pay split by date)`);
+      }
+    }
     if (!r.hasPay && r.normal + r.ot > 0) r.flags.push('No payroll batch covers this worker in the selected period (pay left blank)');
     if (r.hasPay && r.uncovered > 0) r.flags.push(`${r.uncovered} approved attendance record(s) not covered by any payroll batch`);
     if (r.nonApproved > 0) r.flags.push(`${r.nonApproved} non-approved attendance record(s) excluded (Draft/Submitted/Rejected)`);
@@ -168,7 +203,7 @@ function buildSpec(rows, batches, period) {
     r.flags.forEach((f) => flags.push({ id: r.uid, name: r.name, flag: f }));
     return {
       fixed: [idx + 1, r.name, r.trade, [...r.shifts].map((x) => String(x).toUpperCase()).join(' / '),
-        r.uid, [...r.sites].join(', ')],
+        r.uid, [...r.sites].join(', '), r.rateLabel],
       days,
       tail: [round2(monthly), round2(r.normal), round2(r.ot),
         r.hasPay ? round2(r.basic) : '', r.hasPay ? round2(r.otPay) : '', r.hasPay ? round2(r.total) : '',
@@ -210,6 +245,7 @@ function buildSpec(rows, batches, period) {
       { header: 'Shift', width: 9 },
       { header: 'Worker ID', width: 13 },
       { header: 'Site', width: 18 },
+      { header: 'Rate (SYP)', width: 27 },
     ],
     tailCols: [
       { header: 'Monthly\nHours', width: 11, kind: 'hoursStrong' },

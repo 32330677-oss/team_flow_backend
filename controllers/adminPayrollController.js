@@ -678,17 +678,22 @@ async function getPayrollBatchDetails(req, res) {
     );
 
     const [items] = await pool.execute(
-      `SELECT pi.payroll_id, pi.site_id, s.site_name, pi.pay_type,
+      `SELECT pi.payroll_item_id, pi.payroll_id, pi.site_id, s.site_name, pi.pay_type,
               pi.regular_hours_worked, pi.overtime_hours_worked,
               pi.hourly_rate_snapshot, pi.overtime_hourly_rate_snapshot,
               pi.daily_rate_snapshot, pi.days_worked,
-              pi.base_salary, pi.overtime_pay
+              pi.base_salary, pi.overtime_pay,
+              DATE_FORMAT(span.rate_from, '%Y-%m-%d') AS rate_from,
+              DATE_FORMAT(span.rate_to, '%Y-%m-%d') AS rate_to
        FROM payroll p
        JOIN payrollitems pi ON pi.payroll_id = p.payroll_id
        LEFT JOIN sites s ON s.site_id = pi.site_id
+       LEFT JOIN (SELECT payroll_item_id, MIN(record_date) AS rate_from, MAX(record_date) AS rate_to
+                  FROM payroll_attendance_snapshot WHERE payroll_batch_id = ?
+                  GROUP BY payroll_item_id) span ON span.payroll_item_id = pi.payroll_item_id
        WHERE p.payroll_batch_id = ?
-       ORDER BY s.site_name`,
-      [batchId]
+       ORDER BY s.site_name, span.rate_from`,
+      [batchId, batchId]
     );
 
     const itemsByPayroll = new Map();
@@ -708,6 +713,8 @@ async function getPayrollBatchDetails(req, res) {
         daily_rate: sites[0]?.daily_rate_snapshot ?? null,
         regular_rate: sites[0]?.hourly_rate_snapshot ?? null,
         // The rate actually used is stored per item (dated, D3). No overtime -> no rate.
+        // A raise inside the period gives one item per rate (rate_from / rate_to on each item).
+        rate_changed: new Set(sites.map((x) => `${x.pay_type}|${x.daily_rate_snapshot}|${x.hourly_rate_snapshot}`)).size > 1,
         overtime_rate: sites.find((x) => x.overtime_hourly_rate_snapshot != null)
           ? Number(sites.find((x) => x.overtime_hourly_rate_snapshot != null).overtime_hourly_rate_snapshot)
           : null,
@@ -875,7 +882,7 @@ async function exportPayrollExcel(req, res) {
     const batch = batches[0];
 
     const [rows] = await pool.execute(
-      `SELECT w.full_name AS worker_name, w.worker_unique_id, p.worker_id,
+      `SELECT w.full_name AS worker_name, w.worker_unique_id, p.worker_id, pi.payroll_item_id,
               s.site_id, s.site_name, pi.pay_type,
               pi.regular_hours_worked, pi.overtime_hours_worked,
               pi.hourly_rate_snapshot, pi.overtime_hourly_rate_snapshot,
@@ -904,6 +911,11 @@ async function exportPayrollExcel(req, res) {
       `SELECT worker_id, COALESCE(SUM(regular_hours), 0) AS regular_hours, COALESCE(SUM(overtime_hours), 0) AS overtime_hours
        FROM payroll_attendance_snapshot WHERE payroll_batch_id = ? GROUP BY worker_id`, [batchId]);
     const hoursFromSnapshot = snapRows.length > 0;
+    // Rate period of each payroll item (a raise inside the period = 2 items).
+    const [spanRows] = await pool.execute(
+      `SELECT payroll_item_id, DATE_FORMAT(MIN(record_date), '%Y-%m-%d') AS f, DATE_FORMAT(MAX(record_date), '%Y-%m-%d') AS t
+       FROM payroll_attendance_snapshot WHERE payroll_batch_id = ? GROUP BY payroll_item_id`, [batchId]);
+    const itemSpan = new Map(spanRows.map((r) => [r.payroll_item_id, { from: r.f, to: r.t }]));
     let hoursRows = snapRows;
     if (!hoursFromSnapshot) {
       const hoursParams = [batch.start_date, batch.end_date];
@@ -1094,6 +1106,7 @@ async function exportPayrollExcel(req, res) {
         { header: 'Worker ID', key: 'worker_id', width: 16 },
         { header: 'Worker Name', key: 'worker_name', width: 28 },
         { header: 'Payment Type', key: 'pay_type', width: 14 },
+        { header: 'Rate Period', key: 'rate_period', width: 24 },
         { header: 'Days Worked', key: 'days_worked', width: 12 },
         { header: 'Daily Rate', key: 'daily_rate', width: 14 },
         { header: 'Regular Hours', key: 'regular_hours', width: 14 },
@@ -1102,20 +1115,21 @@ async function exportPayrollExcel(req, res) {
         { header: 'Overtime Rate', key: 'overtime_rate', width: 14 },
         { header: 'Base Salary', key: 'base_salary', width: 16 },
         { header: 'Overtime Pay', key: 'overtime_pay', width: 16 },
-        { header: 'Site Total', key: 'site_total', width: 16 },
+        { header: 'Line Total', key: 'site_total', width: 16 },
+        { header: 'Worker Total', key: 'worker_total', width: 18 },
         { header: 'Signature', key: 'signature', width: 30 },
       ];
 
       const siteWorkerCount = workerCountBySite.get(siteKey)?.size || 0;
 
-      sheet.mergeCells('A1:N1');
+      sheet.mergeCells('A1:P1');
       sheet.getCell('A1').value = `Payroll Batch #${batchId} - Site: ${siteName}`;
-      sheet.mergeCells('A2:N2');
+      sheet.mergeCells('A2:P2');
       sheet.getCell('A2').value = `Period: ${dateOnly(batch.start_date)} - ${dateOnly(batch.end_date)}`;
-      sheet.mergeCells('A3:N3');
+      sheet.mergeCells('A3:P3');
       sheet.getCell('A3').value = `Currency: ${currencyLabel} — Overtime: flat company rate per hour (see the Overtime Rate column)`;
 
-      sheet.mergeCells('A4:N4');
+      sheet.mergeCells('A4:P4');
       sheet.getCell('A4').value = `Workers at this site: ${siteWorkerCount}`;
       sheet.getCell('A4').font = { bold: true };
 
@@ -1127,33 +1141,57 @@ async function exportPayrollExcel(req, res) {
 
       let siteTotalBase = 0, siteTotalOT = 0, siteTotalAll = 0;
 
-      siteRows.forEach((item, index) => {
-        const isDaily = item.pay_type === 'Daily';
-        const rowTotal = Number(item.base_salary || 0) + Number(item.overtime_pay || 0);
-        const rowData = {
-          number: index + 1,
-          worker_id: item.worker_unique_id,
-          worker_name: item.worker_name,
-          pay_type: item.pay_type,
-          overtime_hours: Number(item.overtime_hours_worked || 0),
-          overtime_rate: Number(item.overtime_hourly_rate_snapshot || 0),
-          base_salary: Number(item.base_salary || 0),
-          overtime_pay: Number(item.overtime_pay || 0),
-          site_total: rowTotal,
-          signature: '',
-        };
-        if (isDaily) {
-          rowData.days_worked = item.days_worked;
-          rowData.daily_rate = Number(item.daily_rate_snapshot || 0);
-        } else {
-          rowData.regular_hours = Number(item.regular_hours_worked || 0);
-          rowData.regular_rate = Number(item.hourly_rate_snapshot || 0);
+      // One block per worker: a raise inside the period gives one line per
+      // rate (with its period); No. / ID / Name / Worker Total / Signature are
+      // merged over the worker's lines.
+      const workerGroups = [];
+      const groupIdx = new Map();
+      for (const item of siteRows) {
+        if (!groupIdx.has(item.worker_id)) { groupIdx.set(item.worker_id, workerGroups.length); workerGroups.push([]); }
+        workerGroups[groupIdx.get(item.worker_id)].push(item);
+      }
+      workerGroups.forEach((items, gIndex) => {
+        items.sort((x, z) => String(itemSpan.get(x.payroll_item_id)?.from || '').localeCompare(String(itemSpan.get(z.payroll_item_id)?.from || '')));
+        const workerTotal = items.reduce((sum, it) => sum + Number(it.base_salary || 0) + Number(it.overtime_pay || 0), 0);
+        const firstRowNumber = sheet.rowCount + 1;
+        items.forEach((item, i) => {
+          const isDaily = item.pay_type === 'Daily';
+          const rowTotal = Number(item.base_salary || 0) + Number(item.overtime_pay || 0);
+          const span = itemSpan.get(item.payroll_item_id);
+          const rowData = {
+            number: i === 0 ? gIndex + 1 : null,
+            worker_id: i === 0 ? item.worker_unique_id : null,
+            worker_name: i === 0 ? item.worker_name : null,
+            pay_type: item.pay_type,
+            rate_period: span ? `${span.from} → ${span.to}` : '',
+            overtime_hours: Number(item.overtime_hours_worked || 0),
+            overtime_rate: Number(item.overtime_hourly_rate_snapshot || 0),
+            base_salary: Number(item.base_salary || 0),
+            overtime_pay: Number(item.overtime_pay || 0),
+            site_total: rowTotal,
+            worker_total: i === 0 ? Math.round(workerTotal * 100) / 100 : null,
+            signature: '',
+          };
+          if (isDaily) {
+            rowData.days_worked = item.days_worked;
+            rowData.daily_rate = Number(item.daily_rate_snapshot || 0);
+          } else {
+            rowData.regular_hours = Number(item.regular_hours_worked || 0);
+            rowData.regular_rate = Number(item.hourly_rate_snapshot || 0);
+          }
+          sheet.addRow(rowData);
+          siteTotalBase += rowData.base_salary;
+          siteTotalOT += rowData.overtime_pay;
+          siteTotalAll += rowTotal;
+        });
+        if (items.length > 1) {
+          const last = sheet.rowCount;
+          for (const key of ['number', 'worker_id', 'worker_name', 'worker_total', 'signature']) {
+            const col = sheet.getColumn(key).number;
+            sheet.mergeCells(firstRowNumber, col, last, col);
+            sheet.getCell(firstRowNumber, col).alignment = { vertical: 'middle', horizontal: key === 'worker_name' ? 'left' : 'center' };
+          }
         }
-        sheet.addRow(rowData);
-
-        siteTotalBase += rowData.base_salary;
-        siteTotalOT += rowData.overtime_pay;
-        siteTotalAll += rowTotal;
       });
 
       const totalRow = sheet.addRow({
@@ -1161,14 +1199,15 @@ async function exportPayrollExcel(req, res) {
         base_salary: Math.round(siteTotalBase * 100) / 100,
         overtime_pay: Math.round(siteTotalOT * 100) / 100,
         site_total: Math.round(siteTotalAll * 100) / 100,
+        worker_total: Math.round(siteTotalAll * 100) / 100,
       });
       totalRow.font = { bold: true };
 
       sheet.getRow(5).font = { bold: true, color: { argb: 'FFFFFFFF' } };
       sheet.getRow(5).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
       for (let r = 6; r <= sheet.rowCount; r += 1) {
-        for (const col of [6, 9, 10, 11, 12, 13]) {
-          sheet.getCell(r, col).numFmt = moneyFmt;
+        for (const key of ['daily_rate', 'regular_rate', 'overtime_rate', 'base_salary', 'overtime_pay', 'site_total', 'worker_total']) {
+          sheet.getCell(r, sheet.getColumn(key).number).numFmt = moneyFmt;
         }
       }
       sheet.views = [{ state: 'frozen', ySplit: 5 }];
@@ -1363,6 +1402,18 @@ for (const a of attRows) {
     ot: prior.ot + Number(a.overtime_hours || 0),
   });
 }
+
+    // Date span of each payroll item (rate period), from the snapshot.
+    const itemSpan = new Map();
+    if (hoursFromSnapshot) {
+      for (const a of attRows) {
+        const span = itemSpan.get(a.payroll_item_id) || { from: a.record_date, to: a.record_date };
+        if (a.record_date < span.from) span.from = a.record_date;
+        if (a.record_date > span.to) span.to = a.record_date;
+        itemSpan.set(a.payroll_item_id, span);
+      }
+    }
+    const ddmm = (d) => `${d.slice(8, 10)}/${d.slice(5, 7)}`;
 
     function getDaily(itemId, workerId, siteId, date) {
       return dailyMap.get(dayKey(itemId, workerId, siteId, date)) || { reg: 0, ot: 0 };
@@ -1593,7 +1644,8 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
       doc.font(fontNameFor(item.net));
       const netH = doc.heightOfString(item.net, { width: totalsCols[3].width - 6 });
 
-      return Math.max(13, Math.ceil(Math.max(nameH, siteH, rateH, netH)) + 5);
+      const periodH = item.period ? 8 : 0;   // rate period line (Latin only)
+      return Math.max(13, Math.ceil(Math.max(nameH, siteH, rateH + periodH, netH)) + 5);
     }
 
     function drawDataRow(y, item, opts = {}) {
@@ -1604,6 +1656,10 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
         doc.rect(x, y, tableTotalWidth, rowH).fill(COLOR_ZEBRA);
         doc.fillColor('black');
       }
+      if (opts.mergedFixed) {
+        // No. / ID / Name / Site are drawn once for the whole worker group.
+        x += fixedCols.reduce((sum, c) => sum + c.width, 0);
+      } else {
 
       // No. / ID — short, fixed, never wraps
       doc.font(opts.bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(6.6);
@@ -1642,12 +1698,18 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
         });
         x += c.width;
       }
+      }
 
       // Day columns
       doc.font(opts.bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(6.5);
       for (const d of usedDates) {
-        const daily = item.dailyByDate[d] || { reg: 0, ot: 0 };
         const half = dayColWidth / 2;
+        if (opts.blankDays) {
+          doc.rect(x, y, dayColWidth, rowH).stroke(COLOR_GRID);
+          x += dayColWidth;
+          continue;
+        }
+        const daily = item.dailyByDate[d] || { reg: 0, ot: 0 };
         doc.rect(x, y, half, rowH).stroke(COLOR_GRID);
         doc.fillColor('black').text(daily.reg > 0 ? hoursCell(daily.reg) : '-', x, y + rowH / 2 - 4, { width: half, align: 'center', lineBreak: false });
         x += half;
@@ -1671,6 +1733,12 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
         doc.font(fontNameFor(raw, opts.bold));
         doc.fillColor(c.key === 'net' ? COLOR_ACCENT : 'black')
           .text(shapeArabicAware(raw), x + 3, y + 3, { width: c.width - 6, align: 'center', lineBreak: true });
+        if (c.key === 'daily_wage' && item.period) {
+          const rh = doc.heightOfString(shapeArabicAware(raw), { width: c.width - 6 });
+          doc.font('Helvetica').fontSize(5.8).fillColor('#5b6770')
+            .text(item.period, x + 3, y + 3 + rh, { width: c.width - 6, align: 'center', lineBreak: false });
+          doc.fontSize(6.6);
+        }
         x += c.width;
       }
       doc.fillColor('black');
@@ -1682,38 +1750,99 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
     y = drawTableHeader(y);
     const bottomLimit = VBOTTOM - 20;
 
-    sortedRows.forEach((r, idx) => {
-      const dailyByDate = {};
-      let totalReg = 0, totalOt = 0;
-      for (const d of usedDates) {
-        const v = getDaily(r.payroll_item_id, r.worker_id, r.site_id, d);
-        dailyByDate[d] = v;
-        totalReg += v.reg;
-        totalOt += v.ot;
+    // One group per worker + site. A rate change inside the period gives
+    // several payroll items: they are drawn as sub-rows of the SAME worker row
+    // (No. / ID / Name / Site merged), each with its rate period, followed by
+    // the worker's total.
+    const groups = [];
+    const groupByKey = new Map();
+    for (const r of sortedRows) {
+      const key = `${r.worker_id}|${r.site_id}`;
+      if (!groupByKey.has(key)) { groupByKey.set(key, { rows: [] }); groups.push(groupByKey.get(key)); }
+      groupByKey.get(key).rows.push(r);
+    }
+    for (const g of groups) {
+      g.rows.sort((x, z) => String(itemSpan.get(x.payroll_item_id)?.from || '').localeCompare(String(itemSpan.get(z.payroll_item_id)?.from || '')));
+    }
+
+    function drawMergedFixed(y, h, item, zebra) {
+      let x = VL;
+      if (zebra) { doc.rect(x, y, fixedCols.reduce((sum, c) => sum + c.width, 0), h).fill(COLOR_ZEBRA); }
+      doc.font('Helvetica').fontSize(6.6);
+      for (const c of fixedCols) {
+        doc.rect(x, y, c.width, h).stroke(COLOR_GRID);
+        const raw = String(item[c.key] ?? '');
+        if (c.key === 'full_name' || c.key === 'site_name') {
+          doc.font(fontNameFor(raw));
+          const th = doc.heightOfString(shapeArabicAware(raw), { width: c.width - 6 });
+          doc.fillColor('black').text(shapeArabicAware(raw), x + 3, y + Math.max(3, (h - th) / 2), {
+            width: c.width - 6, align: isArabicText(raw) ? 'right' : 'left', lineBreak: true,
+          });
+          doc.font('Helvetica');
+        } else {
+          doc.fillColor('black').text(raw, x + 2, y + h / 2 - 4, { width: c.width - 4, align: 'center', lineBreak: false });
+        }
+        x += c.width;
       }
-      const isDaily = r.pay_type === 'Daily';
-      const dailyWageLabel = isDaily ? money(r.daily_rate_snapshot) : `${money(r.hourly_rate_snapshot)}/h`;
+      doc.fillColor('black');
+    }
 
-      const item = {
-        no: idx + 1,
-        worker_id: r.worker_unique_id,
-        full_name: r.worker_name,
-        site_name: r.site_name || 'Unassigned',
-        total_reg: fmt2(totalReg),
-        total_ot: fmt2(totalOt),
-        daily_wage: dailyWageLabel,
-        // Per row (one rate period at one site). The worker's total is in the grand total.
-        net: money(num(r.base_salary) + num(r.overtime_pay)),
-        dailyByDate,
-      };
+    groups.forEach((g, gi) => {
+      const zebra = gi % 2 === 1;
+      const subItems = g.rows.map((r) => {
+        const dailyByDate = {};
+        let totalReg = 0, totalOt = 0;
+        for (const d of usedDates) {
+          const v = getDaily(r.payroll_item_id, r.worker_id, r.site_id, d);
+          dailyByDate[d] = v;
+          totalReg += v.reg;
+          totalOt += v.ot;
+        }
+        const isDaily = r.pay_type === 'Daily';
+        const rateLabel = isDaily ? money(r.daily_rate_snapshot) : `${money(r.hourly_rate_snapshot)}/h`;
+        const span = itemSpan.get(r.payroll_item_id);
+        const itemNet = num(r.base_salary) + num(r.overtime_pay);
+        return {
+          no: gi + 1,
+          worker_id: r.worker_unique_id,
+          full_name: r.worker_name,
+          site_name: r.site_name || 'Unassigned',
+          total_reg: fmt2(totalReg), total_ot: fmt2(totalOt),
+          totalRegNum: totalReg, totalOtNum: totalOt, netNum: itemNet,
+          // the period is shown only when the worker has more than one rate
+          daily_wage: rateLabel,
+          period: g.rows.length > 1 && span ? `${ddmm(span.from)} - ${ddmm(span.to)}` : '',
+          net: money(itemNet),
+          dailyByDate,
+        };
+      });
+      const multi = subItems.length > 1;
+      const totalItem = multi ? {
+        ...subItems[0],
+        total_reg: fmt2(subItems.reduce((sum, i) => sum + i.totalRegNum, 0)),
+        total_ot: fmt2(subItems.reduce((sum, i) => sum + i.totalOtNum, 0)),
+        daily_wage: 'Worker total',
+        period: '',
+        net: money(subItems.reduce((sum, i) => sum + i.netNum, 0)),
+        dailyByDate: {},
+      } : null;
 
-      const rowHeight = measureRowHeight(item);
-      if (y + rowHeight > bottomLimit) {
+      const heights = subItems.map((it) => measureRowHeight(it));
+      const totalH = totalItem ? 13 : 0;
+      const groupH = heights.reduce((sum, h) => sum + h, 0) + totalH;
+      if (y + groupH > bottomLimit) {
         doc.addPage();
         y = VT;
         y = drawTableHeader(y);
       }
-      y = drawDataRow(y, item, { zebra: idx % 2 === 1, rowHeight });
+      if (!multi) {
+        y = drawDataRow(y, subItems[0], { zebra, rowHeight: heights[0] });
+        return;
+      }
+      const top = y;
+      subItems.forEach((it, i) => { y = drawDataRow(y, it, { zebra, rowHeight: heights[i], mergedFixed: true }); });
+      y = drawDataRow(y, totalItem, { zebra, rowHeight: totalH, mergedFixed: true, blankDays: true, bold: true });
+      drawMergedFixed(top, groupH, subItems[0], zebra);
     });
 
     if (y + 20 > bottomLimit) {
