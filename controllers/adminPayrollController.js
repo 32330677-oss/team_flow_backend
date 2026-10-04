@@ -1306,6 +1306,8 @@ function shapeArabicAware(str) {
 
     const num = (v) => Number(v || 0);
     const fmt2 = (v) => num(v).toFixed(2);
+    // Compact day cell: "10" instead of "10.0", "7.5" stays.
+    const hoursCell = (v) => (Number.isInteger(Math.round(v * 10) / 10) ? String(Math.round(v)) : (Math.round(v * 10) / 10).toFixed(1));
     // Matches the app's formatSyp(): comma-grouped number + " ل.س"
     const money = (v) => `${Math.round(num(v)).toLocaleString('en-US')} ${CURRENCY_LABEL}`;
 
@@ -1320,7 +1322,9 @@ function shapeArabicAware(str) {
         cursor.setUTCDate(cursor.getUTCDate() + 1);
       }
     }
-    const MAX_DAYS = 62;
+    // Long periods are no longer cut off: the whole table is scaled down to fit
+    // the page width (and a larger sheet is used for very long periods).
+    const MAX_DAYS = 93;
     const truncated = dateList.length > MAX_DAYS;
     const usedDates = truncated ? dateList.slice(0, MAX_DAYS) : dateList;
 
@@ -1381,14 +1385,45 @@ for (const a of attRows) {
     const COLOR_GRID = '#dfe3e8';
     const COLOR_SUMMARY_BG = '#fff4e0';
 
-    const doc = new PDFDocument({ size: 'A4', layout: 'landscape', margin: 30 });
+    // ---- Fit-to-width layout ----
+    // Natural table width = fixed columns + one column per day + totals. When
+    // it is wider than the page, everything (fonts, columns, rows) is drawn at
+    // scale K instead of running off the right edge. Very long periods move to
+    // A3 / A2 so the text stays readable on screen (printing with "fit to page"
+    // still gives one sheet width).
+    const MARGIN = 30;
+    const NATURAL_FIXED_W = 20 + 40 + 120 + 82;
+    const NATURAL_DAY_W = 26;
+    const NATURAL_TOTALS_W = 40 + 40 + 66 + 78;
+    const naturalTableWidth = NATURAL_FIXED_W + usedDates.length * NATURAL_DAY_W + NATURAL_TOTALS_W;
+    const SHEETS = [['A4', 841.89, 595.28], ['A3', 1190.55, 841.89], ['A2', 1683.78, 1190.55]];
+    let sheet = SHEETS[0];
+    for (const candidate of SHEETS) {
+      sheet = candidate;
+      if ((candidate[1] - 2 * MARGIN) / naturalTableWidth >= 0.5) break;   // A4 up to ~1 month
+    }
+    const K = Math.min(1, (sheet[1] - 2 * MARGIN) / naturalTableWidth);
+
+    const doc = new PDFDocument({ size: sheet[0], layout: 'landscape', margin: MARGIN });
     if (hasArabicFont) doc.registerFont('Arabic', ARABIC_FONT_PATH);
+    // Every page is drawn in "virtual" coordinates scaled by K from the origin.
+    // PDFKit's automatic page break compares y with the UNscaled page height;
+    // the table paginates itself, so that check is disabled on every page.
+    const applyScale = () => {
+      doc.page.maxY = () => 1e9;
+      if (K < 1) doc.scale(K);
+    };
+    applyScale();
+    doc.on('pageAdded', applyScale);
+    const VL = MARGIN / K;                                   // virtual left margin
+    const VT = MARGIN / K;                                   // virtual top margin
+    const VBOTTOM = (doc.page.height - MARGIN) / K;          // virtual bottom edge
 
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="payroll_batch_${batchId}.pdf"`);
     doc.pipe(res);
 
-    const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+    const pageWidth = (doc.page.width - 2 * MARGIN) / K;   // virtual usable width
     const logoPath = path.join(__dirname, '../assets/logo.png');
     const hasLogo = fs.existsSync(logoPath);
 
@@ -1396,44 +1431,44 @@ for (const a of attRows) {
     const isFinalized = batch.is_finalized === 1 || batch.is_finalized === true;
 
     function drawHeader() {
-      let y = doc.page.margins.top;
-      if (hasLogo) doc.image(logoPath, doc.page.margins.left, y, { width: 85, height: 38 });
+      let y = VT;
+      if (hasLogo) doc.image(logoPath, VL, y, { width: 85, height: 38 });
 
       doc.font('Helvetica-Bold').fontSize(16).fillColor('black')
-        .text('WORKERS PAYROLL REPORT', doc.page.margins.left, y + 2, { width: pageWidth, align: 'center' });
+        .text('WORKERS PAYROLL REPORT', VL, y + 2, { width: pageWidth, align: 'center' });
       doc.font('Helvetica').fontSize(9)
-        .text('ASIK ENGINEERING CONSTRUCTION', doc.page.margins.left, y + 22, { width: pageWidth, align: 'center' });
+        .text('ASIK ENGINEERING CONSTRUCTION', VL, y + 22, { width: pageWidth, align: 'center' });
 
       y += 48;
       doc.font('Helvetica-Bold').fontSize(10).fillColor('black');
-      doc.text(`Batch #${batchId}  (Version ${batch.version_number || 1})`, doc.page.margins.left, y);
+      doc.text(`Batch #${batchId}  (Version ${batch.version_number || 1})`, VL, y);
       doc.text(`Period: ${String(batch.start_date).slice(0, 10)}   to   ${String(batch.end_date).slice(0, 10)}`,
-        doc.page.margins.left, y, { width: pageWidth, align: 'right' });
+        VL, y, { width: pageWidth, align: 'right' });
       y += 15;
 
       const payColor = statusText === 'PAID' ? '#1a7a3c' : statusText === 'SUPERSEDED' ? '#888888' : COLOR_OT_TEXT;
-      doc.fillColor(isFinalized ? '#1a7a3c' : '#b21f1f').text(`Status: ${isFinalized ? 'FINALIZED' : 'NOT FINALIZED'}`, doc.page.margins.left, y);
-      doc.fillColor(payColor).text(`Payment: ${statusText}`, doc.page.margins.left + 170, y);
+      doc.fillColor(isFinalized ? '#1a7a3c' : '#b21f1f').text(`Status: ${isFinalized ? 'FINALIZED' : 'NOT FINALIZED'}`, VL, y);
+      doc.fillColor(payColor).text(`Payment: ${statusText}`, VL + 170, y);
       doc.fillColor('black');
       y += 18;
 
       if (truncated) {
         doc.font('Helvetica-Oblique').fontSize(8).fillColor('#b21f1f')
-          .text(`Showing first ${MAX_DAYS} of ${dateList.length} days in this period.`, doc.page.margins.left, y);
+          .text(`Showing first ${MAX_DAYS} of ${dateList.length} days in this period (generate shorter periods for full detail).`, VL, y);
         doc.fillColor('black');
         y += 12;
       }
       if (!hoursFromSnapshot) {
         doc.font('Helvetica-Oblique').fontSize(8).fillColor('#b21f1f')
-          .text('Daily hours shown as currently recorded (this batch was generated before hour snapshots). Amounts are the stored batch amounts.', doc.page.margins.left, y);
+          .text('Daily hours shown as currently recorded (this batch was generated before hour snapshots). Amounts are the stored batch amounts.', VL, y);
         doc.fillColor('black');
         y += 12;
       }
 
-      doc.rect(doc.page.margins.left, y, pageWidth, 20).fill(COLOR_SUMMARY_BG);
+      doc.rect(VL, y, pageWidth, 20).fill(COLOR_SUMMARY_BG);
      doc.fillColor(COLOR_ACCENT).font('Helvetica-Bold').fontSize(9);
 
-const summaryX = doc.page.margins.left + 8;
+const summaryX = VL + 8;
 const summaryY = y + 5;
 
 const summaryLabel =
@@ -1486,7 +1521,7 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
       { key: 'full_name', label: 'Worker Name', width: 120 },
       { key: 'site_name', label: 'Site', width: 82 },
     ];
-    const dayColWidth = 30;
+    const dayColWidth = NATURAL_DAY_W;
     const totalsCols = [
       { key: 'total_reg', label: 'Tot.Reg', width: 40 },
       { key: 'total_ot', label: 'Tot.OT', width: 40 },
@@ -1500,7 +1535,7 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
 
     function drawTableHeader(y) {
       const rowH1 = 14, rowH2 = 16;
-      let x = doc.page.margins.left;
+      let x = VL;
 
       doc.rect(x, y, fixedCols.reduce((s, c) => s + c.width, 0), rowH1 + rowH2).fill(COLOR_HEADER_BG);
       doc.fillColor(COLOR_HEADER_TEXT).font('Helvetica-Bold').fontSize(7);
@@ -1558,7 +1593,7 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
 
     function drawDataRow(y, item, opts = {}) {
       const rowH = opts.rowHeight || 13;
-      let x = doc.page.margins.left;
+      let x = VL;
 
       if (opts.zebra) {
         doc.rect(x, y, tableTotalWidth, rowH).fill(COLOR_ZEBRA);
@@ -1609,11 +1644,11 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
         const daily = item.dailyByDate[d] || { reg: 0, ot: 0 };
         const half = dayColWidth / 2;
         doc.rect(x, y, half, rowH).stroke(COLOR_GRID);
-        doc.fillColor('black').text(daily.reg > 0 ? daily.reg.toFixed(1) : '-', x, y + rowH / 2 - 4, { width: half, align: 'center', lineBreak: false });
+        doc.fillColor('black').text(daily.reg > 0 ? hoursCell(daily.reg) : '-', x, y + rowH / 2 - 4, { width: half, align: 'center', lineBreak: false });
         x += half;
         doc.rect(x, y, half, rowH).stroke(COLOR_GRID);
         doc.fillColor(daily.ot > 0 ? COLOR_OT_TEXT : 'black')
-          .text(daily.ot > 0 ? daily.ot.toFixed(1) : '-', x, y + rowH / 2 - 4, { width: half, align: 'center', lineBreak: false });
+          .text(daily.ot > 0 ? hoursCell(daily.ot) : '-', x, y + rowH / 2 - 4, { width: half, align: 'center', lineBreak: false });
         x += half;
       }
 
@@ -1640,7 +1675,7 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
 
     let y = drawHeader();
     y = drawTableHeader(y);
-    const bottomLimit = doc.page.height - doc.page.margins.bottom - 20;
+    const bottomLimit = VBOTTOM - 20;
 
     sortedRows.forEach((r, idx) => {
       const dailyByDate = {};
@@ -1669,7 +1704,7 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
       const rowHeight = measureRowHeight(item);
       if (y + rowHeight > bottomLimit) {
         doc.addPage();
-        y = doc.page.margins.top;
+        y = VT;
         y = drawTableHeader(y);
       }
       y = drawDataRow(y, item, { zebra: idx % 2 === 1, rowHeight });
@@ -1677,10 +1712,10 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
 
     if (y + 20 > bottomLimit) {
       doc.addPage();
-      y = doc.page.margins.top;
+      y = VT;
       y = drawTableHeader(y);
     }
-const grandTotalX = doc.page.margins.left;
+const grandTotalX = VL;
 const grandTotalY = y + 6;
 
 const grandTotalLabel = 'GRAND TOTAL NET: ';
@@ -1729,9 +1764,9 @@ doc.fillColor('black');
       const footerY = currentY + 15; // مسافة بسيطة بعد الجدول
 
       // تحقق إذا كانت التواقيع ستنزل خارج الصفحة، إذاً انقلها لصفحة جديدة
-      if (footerY + 50 > doc.page.height - doc.page.margins.bottom) {
+      if (footerY + 50 > VBOTTOM) {
         doc.addPage();
-        return doc.page.margins.top + 20;
+        return VT + 20;
       }
 
       doc.font('Helvetica').fontSize(8);
@@ -1743,7 +1778,7 @@ doc.fillColor('black');
       ];
 
       signaturesData.forEach((sig, index) => {
-        const startXPos = doc.page.margins.left + index * sectionWidth;
+        const startXPos = VL + index * sectionWidth;
         doc.font('Helvetica-Bold').text(`${sig.title}:`, startXPos, footerY, { width: sectionWidth - 20 });
         doc.font('Helvetica').text(`Name: ${sig.name}`, startXPos, footerY + 12, { width: sectionWidth - 20 });
         doc.text('Signature: ___________________', startXPos, footerY + 24, { width: sectionWidth - 20 });
