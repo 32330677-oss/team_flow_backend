@@ -337,6 +337,32 @@ exports.updateBreakSettings = async (req, res) => {
         return sendError(res, error, 'Invalid settings.');
     }
 
+    // A value that is already in effect on effective_from is not a change. The
+    // settings dialog sends every field; without this, re-sending unchanged
+    // lunch / standard-minutes values made an overtime-rate-only change fail
+    // with SETTINGS_AFFECT_REVIEWED_RECORDS and wrote empty history rows.
+    const sameValue = (a, b) => {
+        if (a === null || a === undefined) return false;
+        const na = Number(a);
+        const nb = Number(b);
+        if (String(a).trim() !== '' && String(b).trim() !== '' && Number.isFinite(na) && Number.isFinite(nb)) return na === nb;
+        return String(a).trim().toLowerCase() === String(b).trim().toLowerCase();
+    };
+    const unchanged = [];
+    for (const key of Object.keys(updates)) {
+        const current = await settingsCache.getSettingForDate(key, effectiveFrom, DEFAULT_SETTING_VALUES[key] ?? null);
+        if (sameValue(current, updates[key])) {
+            unchanged.push(key);
+            delete updates[key];
+        }
+    }
+    if (Object.keys(updates).length === 0) {
+        return res.status(200).json({
+            status: 'success', message: 'Nothing changed: every value is already in effect on that date.',
+            effective_from: effectiveFrom, unchanged, recalculated_draft_ids: [],
+        });
+    }
+
     const connection = await db.getConnection();
     try {
         await connection.beginTransaction();
