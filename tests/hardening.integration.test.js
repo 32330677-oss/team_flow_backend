@@ -25,6 +25,10 @@ const D1 = addDays(TODAY, -1);
 test.before(async () => {
   resetDatabase({ migrate: true });
   global.__BASE__ = await startServer();
+  // These scenarios record days out of order on purpose; the daily gate has
+  // its own suite (tests/daily_gate.integration.test.js).
+  await q("INSERT INTO system_settings (setting_key, setting_value) VALUES ('attendance_daily_gate_enabled', 'false') ON DUPLICATE KEY UPDATE setting_value = 'false'");
+  await require('../services/settingsCache').refresh();
 });
 test.after(async () => { await stopServer(); });
 

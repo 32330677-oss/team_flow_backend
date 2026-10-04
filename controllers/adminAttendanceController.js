@@ -12,11 +12,14 @@ const DEFAULT_SETTING_VALUES = {
     standard_work_minutes: '600',
     long_shift_review_hours: '16',
     attendance_week_start_day: '6',
+    attendance_daily_gate_enabled: 'true',
+    attendance_daily_gate_start_date: '',
     worker_payroll_currency: 'SYP',
     staff_payroll_currency: 'USD',
 };
 const SETTING_KEYS = ['is_lunch_paid', 'standard_work_minutes', 'overtime_flat_rate_syp', 'long_shift_review_hours',
-    'attendance_week_start_day', 'worker_payroll_currency', 'staff_payroll_currency'];
+    'attendance_week_start_day', 'attendance_daily_gate_enabled', 'attendance_daily_gate_start_date',
+    'worker_payroll_currency', 'staff_payroll_currency'];
 // Keys whose value is baked into stored attendance hours.
 const HOURS_KEYS = ['is_lunch_paid', 'standard_work_minutes'];
 
@@ -306,6 +309,18 @@ exports.updateBreakSettings = async (req, res) => {
             const v = Number(body.attendance_week_start_day);
             if (!Number.isInteger(v) || v < 0 || v > 6) throw new OpError('attendance_week_start_day must be 0 (Sunday) to 6 (Saturday).');
             updates.attendance_week_start_day = String(v);
+        }
+        // Daily submission gate (services/dailyGate.js).
+        if (body.attendance_daily_gate_enabled !== undefined) {
+            if (!['true', 'false', true, false].includes(body.attendance_daily_gate_enabled)) {
+                throw new OpError('attendance_daily_gate_enabled must be true or false.');
+            }
+            updates.attendance_daily_gate_enabled = String(body.attendance_daily_gate_enabled);
+        }
+        if (body.attendance_daily_gate_start_date !== undefined) {
+            const v = String(body.attendance_daily_gate_start_date || '').trim();
+            if (v !== '' && !isValidDateOnly(v)) throw new OpError('attendance_daily_gate_start_date must be empty or a date (YYYY-MM-DD).');
+            updates.attendance_daily_gate_start_date = v;
         }
         for (const key of ['worker_payroll_currency', 'staff_payroll_currency']) {
             if (body[key] !== undefined) {

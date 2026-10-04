@@ -5,6 +5,7 @@ const { activeOn } = require('../services/assignmentDates');
 const { assertWorkerDateEditable, findLockedWorkerBatch } = require('../services/payrollLock');
 const { getWorkerStatusOnDate, getActiveWorkerIdsOnDate } = require('../services/workerStatusService');
 const weekGate = require('../services/weekGate');
+const dailyGate = require('../services/dailyGate');
 const { addDays } = require('../services/businessDate');
 class AppError extends Error {
     constructor(message, statusCode = 400, extra = null) {
@@ -256,6 +257,7 @@ exports.getSiteWorkers = async (req, res) => {
         const lockedBatch = await findLockedWorkerBatch(db, { siteId, date: recordDate });
         const gate = await weekGate.previousWeekWorkerDrafts(db, { siteId, shiftType, recordDate });
         const week = await weekGate.weekBounds(recordDate);
+        const daily = await dailyGate.pendingWorkerDays(db, { siteId, shiftType, recordDate });
         res.status(200).json({
             status: 'success',
             data: workers,
@@ -268,6 +270,9 @@ exports.getSiteWorkers = async (req, res) => {
                 week_end: week.weekEnd,
                 previous_week_drafts: gate.days,
                 previous_week: { start: gate.prevStart, end: gate.prevEnd },
+                // Daily gate: earlier open days (Draft or skipped). Only Supervisors are blocked.
+                pending_days: daily.days,
+                daily_gate_applies: req.user.role === 'Supervisor' && daily.days.length > 0,
                 payroll_locked: Boolean(lockedBatch),
                 payroll_lock_batch_id: lockedBatch ? lockedBatch.payroll_batch_id : null,
             },
@@ -314,6 +319,8 @@ exports.checkIn = async (req, res) => {
     try {
         await connection.beginTransaction();
         await assertWorkerDateEditable(connection, site_id, recordDate);   // D-02
+        // Daily gate: earlier days of this site/shift must be finished first (Supervisor).
+        await dailyGate.assertPreviousDaysDone(connection, req, { siteId: site_id, shiftType: shift_type, recordDate });
 
         const openShiftId = await getAttendanceId(worker_id, site_id, shift_type, recordDate, connection, true);
         if (openShiftId) {
@@ -473,6 +480,9 @@ async function runBulkAttendance(req, res, mode) {
     try {
         await connection.beginTransaction();
         await assertWorkerDateEditable(connection, site_id, record_date);   // D-02
+        if (mode === 'checkin') {
+            await dailyGate.assertPreviousDaysDone(connection, req, { siteId: site_id, shiftType: shift_type, recordDate: record_date });
+        }
         const validWorkers = await verifyBulkWorkers(workerIds, site_id, shift_type, record_date, connection);
 
         for (const workerId of workerIds) {
@@ -624,6 +634,7 @@ async function runBulkSetStatus(req, res) {
     try {
         await connection.beginTransaction();
         await assertWorkerDateEditable(connection, site_id, record_date);   // D-02
+        await dailyGate.assertPreviousDaysDone(connection, req, { siteId: site_id, shiftType: shift_type, recordDate: record_date });
         const validWorkers = await verifyBulkWorkers(workerIds, site_id, shift_type, record_date, connection);
 
         for (const workerId of workerIds) {
@@ -747,6 +758,7 @@ exports.setAttendanceStatus = async (req, res) => {
     try {
         await connection.beginTransaction();
         await assertWorkerDateEditable(connection, site_id, record_date);   // D-02
+        await dailyGate.assertPreviousDaysDone(connection, req, { siteId: site_id, shiftType: shift_type, recordDate: record_date });
         const [existingRows] = await connection.execute(
             `SELECT attendance_id, status, attendance_status, check_in_time, check_out_time
              FROM attendance
@@ -1221,6 +1233,9 @@ exports.submitDay = async (req, res) => {
 
         // D-02: a finalized payroll period cannot receive new submissions.
         await assertWorkerDateEditable(connection, siteId, record_date);
+        // Daily gate: the earlier days of this site/shift must be finished first
+        // (checked before the weekly rule: it names the exact day to open).
+        await dailyGate.assertPreviousDaysDone(connection, req, { siteId, shiftType, recordDate: record_date });
         // §10: actual Draft records in the previous week block this submission.
         const gate = await weekGate.previousWeekWorkerDrafts(connection, { siteId, shiftType, recordDate: record_date });
         if (gate.days.length > 0) throw weekGate.gateError(gate);
