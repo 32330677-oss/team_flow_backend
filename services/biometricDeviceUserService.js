@@ -43,7 +43,7 @@ function isValidDeviceEmployeeId(value) {
   return DEVICE_ID_RE.test(String(value ?? ''));
 }
 
-// B10: business date (Asia/Beirut), not the UTC date.
+// B10: business date (Asia/Damascus), not the UTC date.
 function todayDateOnly() {
   return businessToday();
 }

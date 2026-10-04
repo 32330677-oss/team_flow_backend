@@ -29,10 +29,10 @@ function sendOpError(res, error, fallbackMessage) {
     return res.status(500).json({ status: 'error', message: fallbackMessage });
 }
 
-// Business "now" as a wall-clock string (Asia/Beirut by default), used to
+// Business "now" as a wall-clock string (Asia/Damascus by default), used to
 // refuse check-out / break times in the future (R-06).
 function businessNowWall() {
-    const timeZone = process.env.APP_TIME_ZONE || 'Asia/Beirut';
+    const timeZone = process.env.APP_TIME_ZONE || 'Asia/Damascus';
     const parts = new Intl.DateTimeFormat('en-CA', {
         timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
         hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
@@ -80,7 +80,7 @@ function requireRecordDate(value) {
 }
 
 function businessTodayDateOnly() {
-    const timeZone = process.env.APP_TIME_ZONE || 'Asia/Beirut';
+    const timeZone = process.env.APP_TIME_ZONE || 'Asia/Damascus';
     const parts = new Intl.DateTimeFormat('en-CA', {
         timeZone,
         year: 'numeric',

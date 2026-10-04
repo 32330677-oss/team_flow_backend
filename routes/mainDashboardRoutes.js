@@ -9,7 +9,7 @@ const restrictTo = require('../middleware/roleMiddleware');
 router.use(authMiddleware);
 router.use(restrictTo('Admin'));
 
-// Live site operations (current business date, Asia/Beirut).
+// Live site operations (current business date, Asia/Damascus).
 router.get('/live', controller.getLiveOperations);
 // Drill-down for one Active site (all its shifts).
 router.get('/sites/:siteId', controller.getSiteOperations);

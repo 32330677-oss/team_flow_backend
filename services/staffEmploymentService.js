@@ -105,7 +105,7 @@ async function getActiveSpans(staffId, executor = db) {
 async function getActiveSpansOverlapping(staffId, periodStart, periodEnd, executor = db) {
     if (!isValidDateOnly(periodStart) || !isValidDateOnly(periodEnd) || periodStart > periodEnd) return [];
 
-    // B10: business date (Asia/Beirut), not the UTC date.
+    // B10: business date (Asia/Damascus), not the UTC date.
     const todayStr = businessToday();
     const clampedPeriodEnd = periodEnd > todayStr ? todayStr : periodEnd;
     if (periodStart > clampedPeriodEnd) return [];

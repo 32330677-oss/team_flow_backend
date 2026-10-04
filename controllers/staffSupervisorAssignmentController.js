@@ -271,7 +271,7 @@ exports.bulkAssignSupervisor = async (req, res) => {
   }
 };
 // Shared helper — used by staffAttendanceController.js for scope filtering.
-// B10: "today" is the business date (Asia/Beirut), not the DB server's CURDATE().
+// B10: "today" is the business date (Asia/Damascus), not the DB server's CURDATE().
 exports.getAssignedStaffIdsForSupervisor = async (supervisorUserId, executor = db) => {
   const today = businessToday();
   const [rows] = await executor.execute(

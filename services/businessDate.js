@@ -1,6 +1,6 @@
 // services/businessDate.js
 //
-// One shared definition of the BUSINESS date (Asia/Beirut by default,
+// One shared definition of the BUSINESS date (Asia/Damascus by default,
 // override with APP_TIME_ZONE). Every "today" used for a business rule
 // (no future attendance, default effective dates, punch age window, ...)
 // must come from here instead of new Date().toISOString() (UTC) or the
@@ -10,7 +10,7 @@
 // wall-clock value through the local timezone.
 
 function businessToday(now = new Date()) {
-  const timeZone = process.env.APP_TIME_ZONE || 'Asia/Beirut';
+  const timeZone = process.env.APP_TIME_ZONE || 'Asia/Damascus';
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
   }).formatToParts(now);
