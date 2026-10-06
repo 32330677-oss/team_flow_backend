@@ -18,6 +18,8 @@ router.post('/submit', attendanceController.submitDay);
 router.post('/leave/start', attendanceController.startLeave);
 router.post('/leave/end', attendanceController.endLeave);
 router.post('/lunch/bulk', attendanceController.saveLunchBulk);
+router.patch('/:attendance_id/lunch', attendanceController.updateLunch);
+router.delete('/:attendance_id/lunch', attendanceController.deleteLunch);
 router.get('/rejected', attendanceController.getRejectedRecords);
 router.patch('/:attendance_id/management-leave', restrictTo('Admin'), attendanceController.setManagementLeaveHours);
 // C-13: Admin may resubmit as well (sites without an active supervisor).

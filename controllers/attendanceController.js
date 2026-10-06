@@ -1194,6 +1194,123 @@ async function hasOverlappingLeave(executor, attendanceId, start, end, excludeLe
     return rows.length > 0;
 }
 
+// ==================== Single worker lunch: edit / remove ====================
+// Allowed only while the record is still Draft (not submitted) and the payroll
+// period is not locked. Audited; hours are recalculated when the shift is closed.
+async function loadDraftForLunch(connection, req, attendanceId) {
+    const [rows] = await connection.execute(
+        `SELECT attendance_id, site_id, shift_type, status, check_in_time, check_out_time,
+                DATE_FORMAT(record_date, '%Y-%m-%d') AS record_date
+         FROM attendance WHERE attendance_id = ? FOR UPDATE`,
+        [attendanceId]
+    );
+    if (rows.length === 0) throw new AppError('Attendance record not found.', 404);
+    const record = rows[0];
+    if (!(await verifySiteAction(req, record.site_id, record.shift_type))) {
+        throw new AppError('You are not authorized to edit attendance for this site.', 403);
+    }
+    if (record.status !== 'Draft') throw new AppError('Lunch can only be changed while the day is not submitted (Draft).');
+    await assertWorkerDateEditable(connection, record.site_id, record.record_date);   // D-02
+    return record;
+}
+
+exports.updateLunch = async (req, res) => {
+    const { attendance_id } = req.params;
+    const { start_time, end_time } = req.body;
+    if (!start_time || !end_time) {
+        return res.status(400).json({ status: 'error', message: 'start_time and end_time are required.' });
+    }
+    const connection = await db.getConnection();
+    try {
+        await connection.beginTransaction();
+        const record = await loadDraftForLunch(connection, req, attendance_id);
+        const checkInDate = parseAttendanceDate(record.check_in_time);
+        const checkOutDate = parseAttendanceDate(record.check_out_time);
+        if (!checkInDate || !checkOutDate) throw new AppError('Lunch can be edited after the worker checks out.');
+
+        const [existing] = await connection.execute(
+            `SELECT leave_id, leave_start_time, leave_end_time FROM attendanceleaveperiods
+             WHERE attendance_id = ? AND leave_type = 'Lunch'
+             ORDER BY leave_id DESC LIMIT 1 FOR UPDATE`,
+            [attendance_id]
+        );
+        if (existing.length === 0) throw new AppError('This worker has no lunch to edit. Use "Lunch break (bulk)" to add one.');
+        const lunch = existing[0];
+
+        const start = normalizeTimeForShift(start_time, checkInDate, checkOutDate);
+        const end = normalizeTimeForShift(end_time, checkInDate, checkOutDate);
+        const startDate = parseAttendanceDate(start);
+        const endDate = parseAttendanceDate(end);
+        if (!start || !end || !startDate || !endDate) throw new AppError('Lunch must be between check-in and check-out.');
+        if (endDate <= startDate) throw new AppError('Lunch end must be after lunch start.');
+        if (startDate < checkInDate || endDate > checkOutDate) throw new AppError('Lunch must be between check-in and check-out.');
+        if (await hasOverlappingLeave(connection, attendance_id, start, end, lunch.leave_id)) {
+            throw new AppError('Lunch period overlaps another break.');
+        }
+
+        const [updated] = await connection.execute(
+            `UPDATE attendanceleaveperiods SET leave_start_time = ?, leave_end_time = ? WHERE leave_id = ?`,
+            [start, end, lunch.leave_id]
+        );
+        if (updated.affectedRows !== 1) throw new AppError('Lunch record was changed by another request.');
+        await connection.execute(
+            `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+             VALUES ('attendanceleaveperiods', ?, 'LUNCH_UPDATE', ?, ?, ?)`,
+            [lunch.leave_id, req.user.user_id,
+                JSON.stringify({ attendance_id: Number(attendance_id), leave_start_time: lunch.leave_start_time, leave_end_time: lunch.leave_end_time }),
+                JSON.stringify({ leave_start_time: start, leave_end_time: end })]
+        );
+        await attendanceService.calculateWorkingHours(attendance_id, connection);
+        await connection.commit();
+        return res.status(200).json({ status: 'success', message: 'Lunch updated.' });
+    } catch (error) {
+        try { await connection.rollback(); } catch (_) {}
+        console.error('UPDATE LUNCH ERROR:', error);
+        return sendOpError(res, error, 'An error occurred while updating the lunch.');
+    } finally {
+        connection.release();
+    }
+};
+
+exports.deleteLunch = async (req, res) => {
+    const { attendance_id } = req.params;
+    const connection = await db.getConnection();
+    try {
+        await connection.beginTransaction();
+        const record = await loadDraftForLunch(connection, req, attendance_id);
+        const [lunches] = await connection.execute(
+            `SELECT leave_id, leave_start_time, leave_end_time FROM attendanceleaveperiods
+             WHERE attendance_id = ? AND leave_type = 'Lunch' FOR UPDATE`,
+            [attendance_id]
+        );
+        if (lunches.length === 0) throw new AppError('This worker has no lunch recorded.');
+
+        await connection.execute(
+            `DELETE FROM attendanceleaveperiods WHERE attendance_id = ? AND leave_type = 'Lunch'`,
+            [attendance_id]
+        );
+        for (const l of lunches) {
+            await connection.execute(
+                `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+                 VALUES ('attendanceleaveperiods', ?, 'LUNCH_DELETE', ?, ?, NULL)`,
+                [l.leave_id, req.user.user_id,
+                    JSON.stringify({ attendance_id: Number(attendance_id), leave_start_time: l.leave_start_time, leave_end_time: l.leave_end_time, leave_type: 'Lunch' })]
+            );
+        }
+        if (record.check_in_time && record.check_out_time) {
+            await attendanceService.calculateWorkingHours(attendance_id, connection);
+        }
+        await connection.commit();
+        return res.status(200).json({ status: 'success', message: 'Lunch removed.' });
+    } catch (error) {
+        try { await connection.rollback(); } catch (_) {}
+        console.error('DELETE LUNCH ERROR:', error);
+        return sendOpError(res, error, 'An error occurred while removing the lunch.');
+    } finally {
+        connection.release();
+    }
+};
+
 exports.saveLunchBulk = async (req, res) => {
     const { siteId, date, default_start_time, default_end_time, overrides = {}, excluded_worker_ids = [] } = req.body;
     const shiftType = normalizeShift(req.body.shift_type);
