@@ -25,6 +25,7 @@ router.patch('/:attendance_id/resubmit', attendanceController.resubmitAttendance
 router.post('/bulk/checkin', attendanceController.bulkCheckIn);
 router.post('/bulk/checkout', attendanceController.bulkCheckOut);
 router.post('/bulk/status', attendanceController.bulkSetAttendanceStatus);
+router.post('/bulk/edit-times', attendanceController.bulkEditTimes);
 router.patch('/:attendance_id/edit-times', attendanceController.editAttendanceTimes);
 
 // D-02 / §12: explicit Admin correction workflow (reason + audit, original kept).

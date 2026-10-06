@@ -222,7 +222,14 @@ exports.getSiteWorkers = async (req, res) => {
                     ORDER BY alp.leave_id DESC
                     LIMIT 1) AS current_leave_type,
                    (SELECT COUNT(*) FROM attendanceleaveperiods alp
-                    WHERE alp.attendance_id = a.attendance_id AND alp.leave_type = 'Lunch') AS lunch_count
+                    WHERE alp.attendance_id = a.attendance_id AND alp.leave_type = 'Lunch') AS lunch_count,
+                   -- Latest recorded lunch (for the lunch indicator in the supervisor list).
+                   (SELECT alp.leave_start_time FROM attendanceleaveperiods alp
+                    WHERE alp.attendance_id = a.attendance_id AND alp.leave_type = 'Lunch'
+                    ORDER BY alp.leave_id DESC LIMIT 1) AS lunch_start_time,
+                   (SELECT alp.leave_end_time FROM attendanceleaveperiods alp
+                    WHERE alp.attendance_id = a.attendance_id AND alp.leave_type = 'Lunch'
+                    ORDER BY alp.leave_id DESC LIMIT 1) AS lunch_end_time
             FROM workers w
             JOIN workersiteassignments wsa ON w.worker_id = wsa.worker_id AND wsa.shift_type = ?
             LEFT JOIN attendance a ON a.attendance_id = (
@@ -605,6 +612,155 @@ async function runBulkAttendance(req, res, mode) {
 
 exports.bulkCheckIn = (req, res) => runBulkAttendance(req, res, 'checkin');
 exports.bulkCheckOut = (req, res) => runBulkAttendance(req, res, 'checkout');
+
+// ==================== Bulk Edit Times (check-in OR check-out) ====================
+// Corrects ONE field (check_in_time or check_out_time) to the same value for the
+// selected workers' Draft records of record_date. Same rules as the single
+// editAttendanceTimes, applied all-or-nothing in one transaction:
+//   * only existing Draft records of this exact site/shift/record_date;
+//   * the field being edited must already be set (this never creates a check-in
+//     or check-out: use bulk check-in / check-out for that);
+//   * leave records (Absent / Sick / Vacation / Holiday) are never touched;
+//   * check-in date = record date, no future times, OUT after IN, breaks/lunch
+//     stay inside the shift; hours are recalculated when IN and OUT both exist.
+// Like the single edit, this finishes an existing record, so the daily gate does
+// not apply; the payroll lock does.
+const LEAVE_STATUSES = ['Absent', 'Sick', 'Vacation', 'Holiday'];
+
+exports.bulkEditTimes = async (req, res) => {
+    const { site_id, record_date, worker_ids, field, time } = req.body;
+    const shift_type = normalizeShift(req.body.shift_type);
+    const workerIds = normalizeWorkerIds(worker_ids);
+    const column = field === 'check_in' ? 'check_in_time' : field === 'check_out' ? 'check_out_time' : null;
+    const label = field === 'check_in' ? 'Check-in' : 'Check-out';
+
+    if (!site_id || !isValidDateOnly(record_date) || !workerIds || !column || !time) {
+        return res.status(400).json({
+            status: 'error',
+            message: "site_id, record_date, worker_ids, field ('check_in' or 'check_out') and time are required."
+        });
+    }
+
+    const formattedTime = formatToMySqlDateTime(time);
+    if (!formattedTime) return res.status(400).json({ status: 'error', message: `Invalid ${label.toLowerCase()} time format.` });
+    try {
+        assertNotFutureDate(record_date);
+        assertNotFutureTime(formattedTime, `${label} time`);
+        if (column === 'check_in_time' && formattedTime.slice(0, 10) !== String(record_date)) {
+            throw new AppError(`Check-in date (${formattedTime.slice(0, 10)}) must match the attendance date (${record_date}).`);
+        }
+    } catch (e) {
+        return sendOpError(res, e);
+    }
+    if (!(await verifySiteAction(req, site_id, shift_type))) {
+        return res.status(403).json({ status: 'error', message: 'You are not authorized to manage this site.' });
+    }
+
+    const connection = await db.getConnection();
+    let failedWorker = null;
+    const fail = (workerId, message) => {
+        failedWorker = { worker_id: workerId, message };
+        return new AppError(`Bulk ${label.toLowerCase()} edit aborted: ${message} (worker ${workerId}). No changes were saved.`);
+    };
+
+    try {
+        await connection.beginTransaction();
+        await assertWorkerDateEditable(connection, site_id, record_date);   // D-02
+        const validWorkers = await verifyBulkWorkers(workerIds, site_id, shift_type, record_date, connection);
+
+        for (const workerId of workerIds) {
+            if (!validWorkers.has(workerId)) throw fail(workerId, 'Worker is not active or is not assigned to this site/shift.');
+
+            const [rows] = await connection.execute(
+                `SELECT attendance_id, attendance_status, check_in_time, check_out_time, status
+                 FROM attendance
+                 WHERE worker_id = ? AND site_id = ? AND shift_type = ? AND record_date = ?
+                 ORDER BY attendance_id DESC LIMIT 1 FOR UPDATE`,
+                [workerId, site_id, shift_type, record_date]
+            );
+            if (rows.length === 0) throw fail(workerId, 'No attendance record for this date.');
+            const record = rows[0];
+            if (record.status !== 'Draft') throw fail(workerId, 'Attendance is already submitted/finalized.');
+            if (LEAVE_STATUSES.includes(record.attendance_status)) {
+                throw fail(workerId, `Worker is marked as ${record.attendance_status}; leave records are not edited here.`);
+            }
+            if (!record[column]) {
+                throw fail(workerId, column === 'check_in_time'
+                    ? 'Worker has no check-in to edit.'
+                    : 'Worker has no check-out to edit. Use bulk check-out instead.');
+            }
+
+            const newCheckIn = column === 'check_in_time' ? formattedTime : formatToMySqlDateTime(record.check_in_time) || record.check_in_time;
+            const newCheckOut = column === 'check_out_time' ? formattedTime : (record.check_out_time ? (formatToMySqlDateTime(record.check_out_time) || record.check_out_time) : null);
+
+            if (newCheckIn && newCheckOut) {
+                const start = parseAttendanceDate(newCheckIn);
+                const end = parseAttendanceDate(newCheckOut);
+                if (!start || !end || end <= start) throw fail(workerId, 'Check-out time must be after check-in time.');
+
+                const [leaves] = await connection.execute(
+                    `SELECT leave_start_time, leave_end_time FROM attendanceleaveperiods WHERE attendance_id = ?`,
+                    [record.attendance_id]
+                );
+                for (const leave of leaves) {
+                    const leaveStart = parseAttendanceDate(leave.leave_start_time);
+                    const leaveEnd = leave.leave_end_time ? parseAttendanceDate(leave.leave_end_time) : null;
+                    if (leaveStart && leaveStart < start) throw fail(workerId, 'Check-in would be after an existing break/lunch start. Adjust the break first.');
+                    if (leaveEnd && leaveEnd > end) throw fail(workerId, 'Check-out would be before an existing break/lunch end. Adjust the break first.');
+                }
+            } else if (column === 'check_in_time') {
+                // Still working: the new check-in must not be after a break that already started.
+                const [leaves] = await connection.execute(
+                    `SELECT leave_start_time FROM attendanceleaveperiods WHERE attendance_id = ?`,
+                    [record.attendance_id]
+                );
+                const start = parseAttendanceDate(newCheckIn);
+                if (leaves.some((l) => { const s = parseAttendanceDate(l.leave_start_time); return s && start && s < start; })) {
+                    throw fail(workerId, 'Check-in would be after an existing break/lunch start. Adjust the break first.');
+                }
+            }
+
+            const [updated] = await connection.execute(
+                `UPDATE attendance SET ${column} = ? WHERE attendance_id = ? AND status = 'Draft' AND ${column} IS NOT NULL`,
+                [formattedTime, record.attendance_id]
+            );
+            if (updated.affectedRows !== 1) throw fail(workerId, 'Attendance changed by another request.');
+
+            await connection.execute(
+                `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+                 VALUES ('attendance', ?, 'TIMES_CORRECTED', ?, ?, ?)`,
+                [
+                    record.attendance_id, req.user.user_id,
+                    JSON.stringify({ check_in_time: record.check_in_time, check_out_time: record.check_out_time }),
+                    JSON.stringify({ check_in_time: newCheckIn, check_out_time: newCheckOut, source: 'bulk', shift_type })
+                ]
+            );
+
+            if (newCheckIn && newCheckOut) {
+                await attendanceService.calculateWorkingHours(record.attendance_id, connection);
+            }
+        }
+
+        await connection.commit();
+        return res.status(200).json({ status: 'success', successful: workerIds, failed: [] });
+    } catch (error) {
+        try { await connection.rollback(); } catch (_) {}
+        console.error('BULK EDIT TIMES ERROR (transaction rolled back, nothing saved):', error);
+        if (error.isOperational) {
+            return res.status(error.statusCode || 400).json({
+                status: 'error', ...(error.code ? { code: error.code } : {}),
+                message: error.message, failed_worker: failedWorker, ...(error.extra || {}),
+            });
+        }
+        return res.status(500).json({
+            status: 'error',
+            message: 'Bulk time edit failed due to a server error. No changes were saved.',
+            failed_worker: failedWorker
+        });
+    } finally {
+        connection.release();
+    }
+};
 // ==================== Bulk Absent / Sick / Vacation / Holiday ====================
 async function runBulkSetStatus(req, res) {
     const { site_id, record_date, worker_ids, attendance_status, remarks } = req.body;
