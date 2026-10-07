@@ -16,6 +16,7 @@ router.get('/by-date', restrictTo('Admin', 'StaffSupervisor'), staffAttendanceCo
 
 const staffAttendanceSupervisorController = require('../controllers/staffAttendanceSupervisorController');
 router.get('/supervisor/day', restrictTo('StaffSupervisor'), staffAttendanceSupervisorController.getDayView);
+router.get('/supervisor/week', restrictTo('StaffSupervisor'), staffAttendanceSupervisorController.getWeekStatus);
 router.post('/supervisor/bulk-set', restrictTo('StaffSupervisor'), staffAttendanceSupervisorController.bulkSetAttendance);
 router.post('/supervisor/resubmit-rejected', restrictTo('StaffSupervisor'), staffAttendanceSupervisorController.resubmitRejected);
 

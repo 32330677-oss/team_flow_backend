@@ -5,7 +5,7 @@ const {
   isFriday,
   calculateStaffShiftHours,
 } = require('../services/staffAttendanceService');
-const { getActiveSpansOverlapping } = require('../services/staffEmploymentService');
+const { getActiveSpans, getActiveSpansOverlapping } = require('../services/staffEmploymentService');
 const { getStaffCompensationForDate } = require('../services/staffCompensationService');
 const { businessToday } = require('../services/businessDate');
 const { assertStaffDateEditable, findLockedStaffBatch } = require('../services/payrollLock');
@@ -774,6 +774,85 @@ if (status === 'Present' && !biometricInOnlyDraft) {
     });
   } finally {
     connection.release();
+  }
+};
+
+// GET /api/staff-attendance/supervisor/week?date=YYYY-MM-DD
+// One entry per day of the attendance week containing `date` (same week
+// definition as the submission gate). Lets the screen colour each day:
+//   complete — every expected staff member has a Submitted/Approved record
+//   draft    — some records are still Draft or Rejected
+//   missing  — an expected staff member has no record at all
+//   off      — Friday with no records, or nobody employed that day
+//   future   — after today
+// "Expected" = staff in this supervisor's scope who were employed that day.
+// Fridays are never expected (non-working day).
+exports.getWeekStatus = async (req, res) => {
+  const { date } = req.query;
+  if (!isValidDateOnly(date)) {
+    return res.status(400).json({ status: 'error', message: 'A valid date (YYYY-MM-DD) is required.' });
+  }
+  try {
+    const { weekStart, weekEnd } = await weekGate.weekBounds(date);
+    const today = businessToday();
+    const days = [];
+    for (let i = 0; i < 7; i += 1) {
+      const d = new Date(`${weekStart}T00:00:00Z`);
+      d.setUTCDate(d.getUTCDate() + i);
+      days.push(d.toISOString().slice(0, 10));
+    }
+
+    const assignedIds = await getAssignedStaffIdsForSupervisor(req.user.user_id);
+    const spansByStaff = new Map();
+    for (const id of assignedIds) spansByStaff.set(id, await getActiveSpans(id));
+
+    const recordsByDay = new Map(days.map((d) => [d, new Map()]));
+    if (assignedIds.length) {
+      const [records] = await db.query(
+        `SELECT staff_id, DATE_FORMAT(record_date, '%Y-%m-%d') AS record_date, status
+         FROM staff_attendance
+         WHERE staff_id IN (?) AND record_date BETWEEN ? AND ?`,
+        [assignedIds, weekStart, weekEnd]
+      );
+      for (const r of records) recordsByDay.get(r.record_date)?.set(Number(r.staff_id), r.status);
+    }
+
+    const data = days.map((day) => {
+      const recs = recordsByDay.get(day);
+      const counts = { Draft: 0, Submitted: 0, Approved: 0, Rejected: 0 };
+      for (const s of recs.values()) if (counts[s] !== undefined) counts[s] += 1;
+
+      const friday = isFriday(day);
+      let expected = 0;
+      let missing = 0;
+      if (!friday && day <= today) {
+        for (const id of assignedIds) {
+          const employed = (spansByStaff.get(id) || []).some((s) => day >= s.start && (!s.end || day <= s.end));
+          if (!employed) continue;
+          expected += 1;
+          if (!recs.has(id)) missing += 1;
+        }
+      }
+
+      let state;
+      if (day > today) state = 'future';
+      else if (missing > 0) state = 'missing';
+      else if (counts.Draft + counts.Rejected > 0) state = 'draft';
+      else if (counts.Submitted + counts.Approved > 0) state = 'complete';
+      else state = 'off';
+
+      return { date: day, is_friday: friday, state, expected, missing, ...counts };
+    });
+
+    return res.status(200).json({
+      status: 'success',
+      week: { start: weekStart, end: weekEnd },
+      business_today: today,
+      data,
+    });
+  } catch (error) {
+    console.error('GET SUPERVISOR WEEK STATUS ERROR:', error);
+    return res.status(500).json({ status: 'error', message: 'Failed to load the week status.' });
   }
 };
 

@@ -3,6 +3,7 @@ const { countNonFridayDays, listNonFridayDates, isFriday, round2 } = require('..
 const { getActiveSpansOverlapping } = require('../services/staffEmploymentService');
 const { buildStaffCompensationTimeline } = require('../services/staffCompensationService');
 const settingsCache = require('../services/settingsCache');
+const { businessToday } = require('../services/businessDate');
 function isValidDate(value) {
     return /^\d{4}-\d{2}-\d{2}$/.test(String(value || '')) && !Number.isNaN(Date.parse(`${value}T00:00:00`));
 }
@@ -37,6 +38,19 @@ async function generateStaffPayrollBatch(req, res) {
     }
     if (end_date < start_date) {
         return res.status(400).json({ status: 'error', message: 'End date must be after or equal to start date' });
+    }
+    // Days after today have no attendance yet. Employment spans are clipped to
+    // today while proration still divides by the whole period, so a period
+    // that ends in the future would underpay everyone and then block the
+    // period. Generate only once the period has ended.
+    const todayStr = businessToday();
+    if (end_date > todayStr) {
+        return res.status(400).json({
+            status: 'error',
+            code: 'PERIOD_NOT_ENDED',
+            message: `The period ends on ${end_date}, which is after today (${todayStr}). ` +
+                'Payroll can only be generated for a period that has already ended.',
+        });
     }
 
     const connection = await pool.getConnection();
@@ -600,10 +614,54 @@ await connection.execute(
         connection.release();
     }
 }
+async function loadBatchForExport(batchId) {
+    const [batches] = await pool.execute(
+        `SELECT spb.*, u.full_name AS generated_by, fu.full_name AS finalized_by
+         FROM staff_payroll_batches spb
+         JOIN users u ON u.user_id = spb.generated_by_user_id
+         LEFT JOIN users fu ON fu.user_id = spb.finalized_by_user_id
+         WHERE spb.staff_payroll_batch_id = ?`,
+        [batchId]
+    );
+    if (!batches.length) return { batch: null, rows: [] };
+    const [rows] = await pool.execute(
+        `SELECT sp.*, sm.full_name, sm.staff_unique_id, sm.position, sm.standard_daily_hours
+         FROM staff_payroll sp
+         JOIN staff_members sm ON sm.staff_id = sp.staff_id
+         WHERE sp.staff_payroll_batch_id = ?
+         ORDER BY sm.full_name`,
+        [batchId]
+    );
+    return { batch: batches[0], rows };
+}
+
+const exportDateOnly = (v) => {
+    if (v === null || v === undefined || v === '') return '';
+    if (v instanceof Date) {
+        return `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, '0')}-${String(v.getDate()).padStart(2, '0')}`;
+    }
+    return String(v).slice(0, 10);
+};
+
+/**
+ * True when the staff member was employed for only part of the batch period
+ * (hired or terminated mid-period), i.e. the base salary was prorated for
+ * employment and not only for absences.
+ */
+function isPartialPeriod(row, batch) {
+    const from = exportDateOnly(row.employed_from);
+    const to = exportDateOnly(row.employed_to);
+    const start = exportDateOnly(batch.start_date);
+    const end = exportDateOnly(batch.end_date);
+    return Boolean((from && from > start) || (to && to < end));
+}
+
 // ============================================================
 // GET /api/staff-payroll/batch/:batchId/export.xlsx
 // Streams a formatted Excel report for one staff payroll batch:
 // company logo, period, finalized/paid status, and full breakdown.
+// "Monthly Salary" is the full contract salary; "Prorated Base" is the part
+// of it that applies to the days actually employed in the period.
 // ============================================================
 async function exportStaffPayrollExcel(req, res) {
     const batchId = Number(req.params.batchId);
@@ -615,28 +673,11 @@ async function exportStaffPayrollExcel(req, res) {
         const ExcelJS = require('exceljs');
         const path = require('path');
 
-        const [batches] = await pool.execute(
-            `SELECT spb.*, u.full_name AS generated_by, fu.full_name AS finalized_by
-             FROM staff_payroll_batches spb
-             JOIN users u ON u.user_id = spb.generated_by_user_id
-             LEFT JOIN users fu ON fu.user_id = spb.finalized_by_user_id
-             WHERE spb.staff_payroll_batch_id = ?`,
-            [batchId]
-        );
-        if (!batches.length) return res.status(404).json({ status: 'error', message: 'Payroll batch not found.' });
-        const batch = batches[0];
-
-        const [rows] = await pool.execute(
-            `SELECT sp.*, sm.full_name, sm.staff_unique_id, sm.position, sm.standard_daily_hours
-             FROM staff_payroll sp
-             JOIN staff_members sm ON sm.staff_id = sp.staff_id
-             WHERE sp.staff_payroll_batch_id = ?
-             ORDER BY sm.full_name`,
-            [batchId]
-        );
+        const { batch, rows } = await loadBatchForExport(batchId);
+        if (!batch) return res.status(404).json({ status: 'error', message: 'Payroll batch not found.' });
         if (!rows.length) return res.status(404).json({ status: 'error', message: 'No staff found in this batch.' });
 
-        const dateOnly = (v) => (v instanceof Date ? v.toISOString().slice(0, 10) : String(v || '').slice(0, 10));
+        const currency = String(batch.currency || 'USD').toUpperCase();
         const logoPath = path.join(__dirname, '../assets/logo.png');
 
         const workbook = new ExcelJS.Workbook();
@@ -648,43 +689,57 @@ async function exportStaffPayrollExcel(req, res) {
         } catch (e) {
             console.warn('Logo not added:', e.message);
         }
-sheet.columns = [
-    { header: 'No.', key: 'number', width: 5 },
-    { header: 'Staff ID', key: 'staff_id', width: 10 },
-    { header: 'Full Name', key: 'full_name', width: 20 },       
-    { header: 'Position', key: 'position', width: 14 },          
-    { header: 'Monthly Salary', key: 'monthly_salary', width: 13 },
-    { header: 'Working Days', key: 'working_days', width: 11 },
-    { header: 'Present Days', key: 'present_days', width: 12 },
-    { header: 'Paid Leave Days', key: 'paid_leave_days', width: 13 },
-    { header: 'Mgmt-Paid Absence', key: 'management_paid_days', width: 16 },
-    { header: 'Unpaid Absence', key: 'unpaid_absence_days', width: 15 },
-    { header: 'Required Hrs', key: 'required_hours', width: 13 },
-    { header: 'OT Earned', key: 'ot_earned_hours', width: 12 },
-    { header: 'OT Used', key: 'ot_used_hours', width: 13 },
-    { header: 'OT Remaining', key: 'ot_remaining_hours', width: 13 },
-    { header: 'Shortage Hrs', key: 'shortage_hours', width: 13 },
-    { header: 'Deduction', key: 'salary_deduction_amount', width: 11 },
-    { header: 'Net Salary', key: 'net_salary', width: 15 },
-    { header: 'Signature', key: 'signature', width: 16 },
-];
+
+        const columns = [
+            { header: 'No.', key: 'number', width: 5 },
+            { header: 'Staff ID', key: 'staff_id', width: 10 },
+            { header: 'Full Name', key: 'full_name', width: 22 },
+            { header: 'Position', key: 'position', width: 14 },
+            { header: `Monthly Salary (${currency})`, key: 'monthly_salary', width: 14, money: true },
+            { header: 'Employed From', key: 'employed_from', width: 12 },
+            { header: 'Employed To', key: 'employed_to', width: 12 },
+            { header: 'Working Days', key: 'working_days', width: 10 },
+            { header: `Prorated Base (${currency})`, key: 'prorated_base', width: 14, money: true },
+            { header: 'Present Days', key: 'present_days', width: 9 },
+            { header: 'Paid Leave Days', key: 'paid_leave_days', width: 9 },
+            { header: 'Mgmt-Paid Absence', key: 'management_paid_days', width: 10 },
+            { header: 'Unpaid Absence', key: 'unpaid_absence_days', width: 9 },
+            { header: 'Required Hrs', key: 'required_hours', width: 10 },
+            { header: 'OT Earned', key: 'ot_earned_hours', width: 9 },
+            { header: 'OT Used', key: 'ot_used_hours', width: 9 },
+            { header: 'OT Remaining', key: 'ot_remaining_hours', width: 10 },
+            { header: 'Shortage Hrs', key: 'shortage_hours', width: 10 },
+            { header: `Deduction (${currency})`, key: 'salary_deduction_amount', width: 12, money: true },
+            { header: `Net Salary (${currency})`, key: 'net_salary', width: 14, money: true },
+            { header: 'Signature', key: 'signature', width: 16 },
+        ];
+        // Keys/widths only: rows 1-4 are the title block, row 5 is the header.
+        sheet.columns = columns.map(({ key, width }) => ({ key, width }));
+        const lastCol = sheet.getColumn(columns.length).letter;
+        const colIndex = (key) => columns.findIndex((c) => c.key === key) + 1;
 
         const statusLabel = batch.status === 'Superseded' ? 'Superseded'
+            : batch.status === 'Voided' ? 'Voided'
             : batch.status === 'Paid' ? 'Paid' : 'Generated';
         const finalizedLabel = (batch.is_finalized === 1 || batch.is_finalized === true)
             ? 'Finalized ✅' : 'Not Finalized ⚠️';
+        const partialCount = rows.filter((r) => isPartialPeriod(r, batch)).length;
 
-        sheet.mergeCells('A1:R1');
+        sheet.mergeCells(`A1:${lastCol}1`);
         sheet.getCell('A1').value =
             `Staff Payroll Batch #${batchId} (v${batch.version_number || 1}) — ${finalizedLabel}`;
-        sheet.mergeCells('A2:R2');
-        sheet.getCell('A2').value = `Period: ${dateOnly(batch.start_date)}  →  ${dateOnly(batch.end_date)}   |   Currency: ${batch.currency || 'USD'}`;
-        sheet.mergeCells('A3:R3');
+        sheet.mergeCells(`A2:${lastCol}2`);
+        sheet.getCell('A2').value =
+            `Period: ${exportDateOnly(batch.start_date)}  →  ${exportDateOnly(batch.end_date)}   |   Currency: ${currency}`;
+        sheet.mergeCells(`A3:${lastCol}3`);
         sheet.getCell('A3').value =
             `Status: ${statusLabel}   |   Generated By: ${batch.generated_by || '-'}` +
             (batch.finalized_by ? `   |   Finalized By: ${batch.finalized_by}` : '');
-        sheet.mergeCells('A4:R4');
-        sheet.getCell('A4').value = `Total Staff Paid: ${batch.total_staff || rows.length}`;
+        sheet.mergeCells(`A4:${lastCol}4`);
+        sheet.getCell('A4').value = `Total Staff Paid: ${batch.total_staff || rows.length}` +
+            (partialCount
+                ? `   |   ${partialCount} employed for part of the period (highlighted): Prorated Base covers only their employed days.`
+                : '');
         sheet.getCell('A4').font = { bold: true };
 
         sheet.getRow(1).height = 26;
@@ -692,17 +747,29 @@ sheet.columns = [
         sheet.getRow(2).height = 22;
         sheet.getRow(3).height = 22;
         sheet.getRow(4).height = 20;
-        sheet.getRow(5).values = sheet.columns.map((c) => c.header);
 
-        let grandTotalNet = 0;
+        const headerRow = sheet.getRow(5);
+        headerRow.values = columns.map((c) => c.header);
+        headerRow.height = 32;
+        headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+        headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
+        headerRow.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+
+        const totals = { prorated_base: 0, salary_deduction_amount: 0, net_salary: 0 };
+        const partialFill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF4CC' } };
+
         rows.forEach((r, index) => {
-            sheet.addRow({
+            const prorated = Number(r.prorated_base_salary ?? r.monthly_salary_snapshot ?? 0);
+            const row = sheet.addRow({
                 number: index + 1,
                 staff_id: r.staff_unique_id,
                 full_name: r.full_name,
                 position: r.position || '-',
-                monthly_salary: Number(r.prorated_base_salary ?? r.monthly_salary_snapshot ?? 0),
-                working_days: r.working_days_in_period,
+                monthly_salary: Number(r.monthly_salary_snapshot || 0),
+                employed_from: exportDateOnly(r.employed_from) || '-',
+                employed_to: exportDateOnly(r.employed_to) || '-',
+                working_days: Number(r.working_days_in_period || 0),
+                prorated_base: prorated,
                 present_days: Number(r.present_days || 0),
                 paid_leave_days: Number(r.paid_leave_days || 0),
                 management_paid_days: Number(r.management_paid_days || 0),
@@ -716,26 +783,31 @@ sheet.columns = [
                 net_salary: Number(r.net_salary || 0),
                 signature: '',
             });
-            grandTotalNet += Number(r.net_salary || 0);
+            if (isPartialPeriod(r, batch)) {
+                ['employed_from', 'employed_to', 'prorated_base'].forEach((k) => {
+                    row.getCell(colIndex(k)).fill = partialFill;
+                });
+            }
+            totals.prorated_base += prorated;
+            totals.salary_deduction_amount += Number(r.salary_deduction_amount || 0);
+            totals.net_salary += Number(r.net_salary || 0);
         });
 
         const totalRow = sheet.addRow({
             full_name: 'GRAND TOTAL',
-            net_salary: Math.round(grandTotalNet * 100) / 100,
+            prorated_base: money(totals.prorated_base),
+            salary_deduction_amount: money(totals.salary_deduction_amount),
+            net_salary: money(totals.net_salary),
         });
         totalRow.font = { bold: true };
 
-        sheet.getRow(5).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-        sheet.getRow(5).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
-        sheet.getRow(5).alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+        columns.forEach((c, i) => {
+            if (!c.money) return;
+            for (let r = 6; r <= sheet.rowCount; r += 1) sheet.getCell(r, i + 1).numFmt = '#,##0.00';
+        });
 
-        for (let r = 6; r <= sheet.rowCount; r += 1) {
-            sheet.getCell(r, 5).numFmt = '#,##0.00';   // monthly_salary
-            sheet.getCell(r, 16).numFmt = '#,##0.00';  // deduction
-            sheet.getCell(r, 17).numFmt = '#,##0.00';  // net_salary
-        }
-              sheet.views = [{ state: 'frozen', xSplit: 3, ySplit: 5 }];
-        sheet.autoFilter = { from: 'A5', to: 'R5' };
+        sheet.views = [{ state: 'frozen', xSplit: 3, ySplit: 5 }];
+        sheet.autoFilter = { from: 'A5', to: `${lastCol}5` };
 
         const fileName = `staff_payroll_batch_${batchId}.xlsx`;
         res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -750,43 +822,11 @@ sheet.columns = [
     }
 }
 
-
-function drawSignaturesFooter() {
-    // تحديد ارتفاع وموقع قسم التوقيعات قبل الهامش السفلي بقليل
-    const footerY = doc.page.height - doc.page.margins.bottom - 45;
-    
-    doc.font('Helvetica').fontSize(8);
-    
-    // تقسيم عرض الصفحة الأفقية على 3 أقسام متساوية للتوقيعات الثلاثة
-    const sectionWidth = pageWidth / 3;
-    
-    const signaturesData = [
-        { title: 'Prepared by', name: batch.generated_by || '-' },
-        { title: 'Verified by', name: '-' }, // يمكنك استبدالها ببيانات من الـ batch إذا توفرت
-        { title: 'Approved by', name: batch.finalized_by || '-' }
-    ];
-
-    signaturesData.forEach((sig, index) => {
-        const startXPos = doc.page.margins.left + (index * sectionWidth);
-        
-        doc.font('Helvetica-Bold').text(`${sig.title}:`, startXPos, footerY, { width: sectionWidth - 20 });
-        doc.font('Helvetica').text(`Name: ${sig.name}`, startXPos, footerY + 12, { width: sectionWidth - 20 });
-        doc.text('Signature: ___________________', startXPos, footerY + 24, { width: sectionWidth - 20 });
-        doc.text(`Date: ____ / ____ / ________`, startXPos, footerY + 36, { width: sectionWidth - 20 });
-    });
-}
-
 // ============================================================
 // GET /api/staff-payroll/batch/:batchId/export.pdf
 // Formal one-document PDF report: company logo, period, status
-// (Finalized/Paid), full per-staff breakdown, and grand totals.
-// Meant to be handed directly to management.
-// ============================================================
-// ============================================================
-// GET /api/staff-payroll/batch/:batchId/export.pdf
-// Formal one-document PDF report: company logo, period, status
-// (Finalized/Paid), full per-staff breakdown, and grand totals.
-// Meant to be handed directly to management.
+// (Finalized/Paid), full per-staff breakdown, grand totals and the
+// signature block. Meant to be handed directly to management.
 // ============================================================
 async function exportStaffPayrollPdf(req, res) {
     const batchId = Number(req.params.batchId);
@@ -799,48 +839,32 @@ async function exportStaffPayrollPdf(req, res) {
         const path = require('path');
         const fs = require('fs');
 
-        const [batches] = await pool.execute(
-            `SELECT spb.*, u.full_name AS generated_by, fu.full_name AS finalized_by
-             FROM staff_payroll_batches spb
-             JOIN users u ON u.user_id = spb.generated_by_user_id
-             LEFT JOIN users fu ON fu.user_id = spb.finalized_by_user_id
-             WHERE spb.staff_payroll_batch_id = ?`,
-            [batchId]
-        );
-        if (!batches.length) return res.status(404).json({ status: 'error', message: 'Payroll batch not found.' });
-        const batch = batches[0];
-
-        const [rows] = await pool.execute(
-            `SELECT sp.*, sm.full_name, sm.staff_unique_id, sm.position
-             FROM staff_payroll sp
-             JOIN staff_members sm ON sm.staff_id = sp.staff_id
-             WHERE sp.staff_payroll_batch_id = ?
-             ORDER BY sm.full_name`,
-            [batchId]
-        );
+        const { batch, rows } = await loadBatchForExport(batchId);
+        if (!batch) return res.status(404).json({ status: 'error', message: 'Payroll batch not found.' });
         if (!rows.length) return res.status(404).json({ status: 'error', message: 'No staff found in this batch.' });
 
-        const dateOnly = (v) => (v instanceof Date ? v.toISOString().slice(0, 10) : String(v || '').slice(0, 10));
+        const currency = String(batch.currency || 'USD').toUpperCase();
         const num = (v) => Number(v || 0);
         const fmt = (v, digits = 2) => num(v).toFixed(digits);
-        const money = (v) => `$${num(v).toFixed(2)}`;
+        // Amounts are printed as numbers; the currency is stated in the
+        // column headers and the summary (never a hard-coded "$").
+        const amount = (v) => num(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
         const isFinalized = batch.is_finalized === 1 || batch.is_finalized === true;
         const statusText = batch.status === 'Superseded' ? 'SUPERSEDED'
+            : batch.status === 'Voided' ? 'VOIDED'
             : batch.status === 'Paid' ? 'PAID' : 'GENERATED';
         const finalizedText = isFinalized ? 'FINALIZED' : 'NOT FINALIZED';
 
-        // ---- Totals ----
-        let totalRegularHours = 0;
         let totalOtEarned = 0;
         let totalNet = 0;
-        let totalDeduction = 0;
+        let totalProrated = 0;
         rows.forEach((r) => {
-            totalRegularHours += num(r.present_days) > 0 ? num(r.required_hours) - num(r.shortage_hours) : num(r.actual_regular_hours || 0);
             totalOtEarned += num(r.ot_earned_hours);
             totalNet += num(r.net_salary);
-            totalDeduction += num(r.salary_deduction_amount);
+            totalProrated += num(r.prorated_base_salary ?? r.monthly_salary_snapshot);
         });
+        const partialCount = rows.filter((r) => isPartialPeriod(r, batch)).length;
 
         const logoPath = path.join(__dirname, '../assets/logo.png');
         const hasLogo = fs.existsSync(logoPath);
@@ -853,25 +877,28 @@ async function exportStaffPayrollPdf(req, res) {
 
         const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
 
-        // ==================== Column layout ====================
+        // Total width 766pt: fits the 770pt printable width of landscape A4.
         const columns = [
-            { key: 'no', label: 'No.', width: 25 },
-            { key: 'staff_id', label: 'Staff ID', width: 52 },
-            { key: 'full_name', label: 'Full Name', width: 115 },
-            { key: 'position', label: 'Position', width: 82 },
-            { key: 'monthly_salary', label: 'Monthly Salary', width: 62 },
-            { key: 'present_days', label: 'Present Days', width: 53 },
-            { key: 'paid_leave_days', label: 'Paid Leave', width: 45 },
-            { key: 'mgmt_paid_days', label: 'Mgmt-Paid Absence', width: 58 },
-            { key: 'unpaid_absence_days', label: 'Unpaid Absence', width: 55 },
-            { key: 'required_hours', label: 'Required Hrs', width: 55 },
-            { key: 'ot_earned_hours', label: 'OT Earned', width: 45 },
-            { key: 'ot_used_hours', label: 'OT Used', width: 42 },
-            { key: 'shortage_hours', label: 'Shortage Hrs', width: 53 },
-            { key: 'net_salary', label: 'Net Salary', width: 52 },
+            { key: 'no', label: 'No.', width: 22 },
+            { key: 'staff_id', label: 'Staff ID', width: 44 },
+            { key: 'full_name', label: 'Full Name', width: 92, align: 'left' },
+            { key: 'position', label: 'Position', width: 56, align: 'left' },
+            { key: 'monthly_salary', label: `Monthly Salary (${currency})`, width: 56 },
+            { key: 'employed', label: 'Employed', width: 62, wrap: true },
+            { key: 'prorated_base', label: `Prorated Base (${currency})`, width: 56 },
+            { key: 'present_days', label: 'Present Days', width: 38 },
+            { key: 'paid_leave_days', label: 'Paid Leave', width: 38 },
+            { key: 'mgmt_paid_days', label: 'Mgmt-Paid Absence', width: 42 },
+            { key: 'unpaid_absence_days', label: 'Unpaid Absence', width: 40 },
+            { key: 'required_hours', label: 'Required Hrs', width: 44 },
+            { key: 'ot_earned_hours', label: 'OT Earned', width: 40 },
+            { key: 'ot_used_hours', label: 'OT Used', width: 38 },
+            { key: 'shortage_hours', label: 'Shortage Hrs', width: 42 },
+            { key: 'net_salary', label: `Net Salary (${currency})`, width: 56 },
         ];
         const tableWidth = columns.reduce((s, c) => s + c.width, 0);
-        const startX = doc.page.margins.left + (pageWidth - tableWidth) / 2;
+        const startX = doc.page.margins.left + Math.max(0, (pageWidth - tableWidth) / 2);
+        const ROW_H = 24;
 
         function drawHeader() {
             let cursorY = doc.page.margins.top;
@@ -881,30 +908,24 @@ async function exportStaffPayrollPdf(req, res) {
             }
 
             doc.font('Helvetica-Bold').fontSize(16)
-                .text('STAFF PAYROLL REPORT', doc.page.margins.left, cursorY + 4, {
-                    width: pageWidth, align: 'center',
-                });
-
+                .text('STAFF PAYROLL REPORT', doc.page.margins.left, cursorY + 4, { width: pageWidth, align: 'center' });
             doc.font('Helvetica').fontSize(9)
-                .text('ASIK ENGINEERING CONSTRUCTION', doc.page.margins.left, cursorY + 24, {
-                    width: pageWidth, align: 'center',
-                });
+                .text('ASIK ENGINEERING CONSTRUCTION', doc.page.margins.left, cursorY + 24, { width: pageWidth, align: 'center' });
 
             cursorY += 52;
 
             doc.font('Helvetica-Bold').fontSize(10);
             doc.text(`Batch #${batchId}  (Version ${batch.version_number || 1})`, doc.page.margins.left, cursorY);
             doc.text(
-                `Period: ${dateOnly(batch.start_date)}   to   ${dateOnly(batch.end_date)}   |   Currency: ${batch.currency || 'USD'}`,
+                `Period: ${exportDateOnly(batch.start_date)}   to   ${exportDateOnly(batch.end_date)}   |   Currency: ${currency}`,
                 doc.page.margins.left, cursorY, { width: pageWidth, align: 'right' }
             );
             cursorY += 16;
 
-            // Status badges
             doc.font('Helvetica-Bold').fontSize(10);
             const finColor = isFinalized ? '#1a7a3c' : '#b21f1f';
-            const payColor = statusText === 'PAID' ? '#1a7a3c' : (statusText === 'SUPERSEDED' ? '#888888' : '#a06a00');
-
+            const payColor = statusText === 'PAID' ? '#1a7a3c'
+                : (statusText === 'SUPERSEDED' || statusText === 'VOIDED' ? '#888888' : '#a06a00');
             doc.fillColor(finColor).text(`Status: ${finalizedText}`, doc.page.margins.left, cursorY);
             doc.fillColor(payColor).text(`Payment: ${statusText}`, doc.page.margins.left + 160, cursorY);
             doc.fillColor('black');
@@ -916,115 +937,114 @@ async function exportStaffPayrollPdf(req, res) {
             );
             cursorY += 20;
 
-            // Summary strip
             doc.rect(doc.page.margins.left, cursorY, pageWidth, 22).fill('#f2f4fa');
             doc.fillColor('#1a2a6c').font('Helvetica-Bold').fontSize(9);
             const summaryText =
                 `Total Staff: ${rows.length}    |    ` +
                 `Total OT Earned: ${fmt(totalOtEarned)}h    |    ` +
-                `TOTAL NET SALARY: ${money(totalNet)}`;
+                `TOTAL NET SALARY: ${amount(totalNet)} ${currency}`;
             doc.text(summaryText, doc.page.margins.left + 10, cursorY + 6, { width: pageWidth - 20 });
             doc.fillColor('black');
-            cursorY += 34;
+            cursorY += 26;
 
+            if (partialCount) {
+                doc.font('Helvetica-Oblique').fontSize(8).fillColor('#7a5a00').text(
+                    `${partialCount} staff member(s) were employed for only part of this period (highlighted rows). ` +
+                    'Their Prorated Base covers only the days in the "Employed" column.',
+                    doc.page.margins.left, cursorY, { width: pageWidth }
+                );
+                doc.fillColor('black');
+                cursorY += 14;
+            } else {
+                cursorY += 4;
+            }
             return cursorY;
         }
 
         function drawTableHeaderRow(y) {
-            const rowHeight = 24;
+            const h = 28;
             let x = startX;
-            doc.rect(startX, y, tableWidth, rowHeight).fill('#1a2a6c');
-            doc.fillColor('white').font('Helvetica-Bold').fontSize(7.2);
-
+            doc.rect(startX, y, tableWidth, h).fill('#1a2a6c');
+            doc.fillColor('white').font('Helvetica-Bold').fontSize(7);
             columns.forEach((col) => {
-                doc.rect(x, y, col.width, rowHeight).stroke('#1a2a6c');
-                doc.text(col.label, x + 2, y + 6, {
-                    width: col.width - 4,
-                    align: 'center',
-                    lineBreak: false,
-                });
+                doc.rect(x, y, col.width, h).stroke('#1a2a6c');
+                doc.text(col.label, x + 2, y + 4, { width: col.width - 4, height: h - 4, align: 'center' });
                 x += col.width;
             });
-
             doc.fillColor('black');
-            return y + rowHeight;
+            return y + h;
         }
 
         function drawRow(y, values, opts = {}) {
-            const rowHeight = 24;
             let x = startX;
-
-            if (opts.zebra) {
-                doc.rect(startX, y, tableWidth, rowHeight).fill('#f7f9fc');
+            if (opts.fill) {
+                doc.rect(startX, y, tableWidth, ROW_H).fill(opts.fill);
                 doc.fillColor('black');
             }
-
             doc.font(opts.bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(7.2);
-
             columns.forEach((col) => {
-                doc.rect(x, y, col.width, rowHeight).stroke('#dfe3e8');
-
-                doc.text(String(values[col.key] ?? ''), x + 3, y + 6, {
+                doc.rect(x, y, col.width, ROW_H).stroke('#dfe3e8');
+                const text = String(values[col.key] ?? '');
+                doc.text(text, x + 3, col.wrap ? y + 3 : y + 8, {
                     width: col.width - 6,
-                    align: col.key === 'full_name' || col.key === 'position'
-                        ? 'left'
-                        : 'center',
-                    lineBreak: false,
+                    height: ROW_H - 4,
+                    align: col.align || 'center',
+                    lineBreak: Boolean(col.wrap),
                 });
-
                 x += col.width;
             });
-
-            return y + rowHeight;
+            return y + ROW_H;
         }
 
-        // دالة التوقيعات الثلاثية داخل النطاق الصحيح
-// تعديل دالة التواقيع لتبدأ مباشرة تحت الجدول بناءً على مؤشر الـ y الحالي
+        // Signature block. Always drawn: when it does not fit under the
+        // table, it moves to the top of a new page (previously the page was
+        // added and the function returned without drawing anything).
+        const SIGNATURE_BLOCK_H = 50;
         function drawSignaturesFooter(currentY) {
-            const footerY = currentY + 15; // مسافة بسيطة بعد الجدول
-            
-            // تحقق إذا كانت التواقيع ستنزل خارج الصفحة، إذاً انقلها لصفحة جديدة
-            if (footerY + 50 > doc.page.height - doc.page.margins.bottom) {
+            let footerY = currentY + 15;
+            if (footerY + SIGNATURE_BLOCK_H > doc.page.height - doc.page.margins.bottom) {
                 doc.addPage();
-                return doc.page.margins.top + 20;
+                footerY = doc.page.margins.top + 20;
             }
-
-            doc.font('Helvetica').fontSize(8);
             const sectionWidth = pageWidth / 3;
             const signaturesData = [
                 { title: 'Prepared by', name: batch.generated_by || '-' },
                 { title: 'Verified by', name: '-' },
-                { title: 'Approved by', name: batch.finalized_by || '-' }
+                { title: 'Approved by', name: batch.finalized_by || '-' },
             ];
-
             signaturesData.forEach((sig, index) => {
                 const startXPos = doc.page.margins.left + (index * sectionWidth);
-                doc.font('Helvetica-Bold').text(`${sig.title}:`, startXPos, footerY, { width: sectionWidth - 20 });
-                doc.font('Helvetica').text(`Name: ${sig.name}`, startXPos, footerY + 12, { width: sectionWidth - 20 });
-                doc.text('Signature: ___________________', startXPos, footerY + 24, { width: sectionWidth - 20 });
-                doc.text(`Date: ____ / ____ / ________`, startXPos, footerY + 36, { width: sectionWidth - 20 });
+                const w = sectionWidth - 20;
+                doc.font('Helvetica-Bold').fontSize(8).text(`${sig.title}:`, startXPos, footerY, { width: w });
+                doc.font('Helvetica').fontSize(8).text(`Name: ${sig.name}`, startXPos, footerY + 12, { width: w });
+                doc.text('Signature: ___________________', startXPos, footerY + 24, { width: w });
+                doc.text('Date: ____ / ____ / ________', startXPos, footerY + 36, { width: w });
             });
-
-            return footerY + 50;
+            return footerY + SIGNATURE_BLOCK_H;
         }
 
         let y = drawHeader();
         y = drawTableHeaderRow(y);
-
-        const bottomLimit = doc.page.height - doc.page.margins.bottom - 75;
+        const bottomLimit = doc.page.height - doc.page.margins.bottom - ROW_H;
+        const newPageWithHeader = () => {
+            doc.addPage();
+            return drawTableHeaderRow(doc.page.margins.top);
+        };
 
         rows.forEach((r, index) => {
-            if (y > bottomLimit) {
-                doc.addPage();
-                y = doc.page.margins.top;
-                y = drawTableHeaderRow(y);
-            }
+            if (y > bottomLimit) y = newPageWithHeader();
+            const partial = isPartialPeriod(r, batch);
+            const from = exportDateOnly(r.employed_from);
+            const to = exportDateOnly(r.employed_to);
             y = drawRow(y, {
                 no: index + 1,
                 staff_id: r.staff_unique_id,
                 full_name: r.full_name,
                 position: r.position || '-',
-                monthly_salary: money(r.prorated_base_salary ?? r.monthly_salary_snapshot),
+                monthly_salary: amount(r.monthly_salary_snapshot),
+                // Built-in Helvetica has no "→" glyph; one date per line instead.
+                employed: from || to ? `${from || '-'}\n${to || '-'}` : '-',
+                prorated_base: amount(r.prorated_base_salary ?? r.monthly_salary_snapshot),
                 present_days: fmt(r.present_days, 1),
                 paid_leave_days: fmt(r.paid_leave_days, 1),
                 mgmt_paid_days: fmt(r.management_paid_days || 0, 1),
@@ -1033,32 +1053,19 @@ async function exportStaffPayrollPdf(req, res) {
                 ot_earned_hours: fmt(r.ot_earned_hours),
                 ot_used_hours: fmt(r.ot_used_hours),
                 shortage_hours: fmt(r.shortage_hours),
-                net_salary: money(r.net_salary),
-            }, { zebra: index % 2 === 1 });
+                net_salary: amount(r.net_salary),
+            }, { fill: partial ? '#fff4cc' : (index % 2 === 1 ? '#f7f9fc' : null) });
         });
 
-        // Grand total row
-// Grand total row
-        if (y > bottomLimit) {
-            doc.addPage();
-            y = doc.page.margins.top;
-            y = drawTableHeaderRow(y);
-        }
+        if (y > bottomLimit) y = newPageWithHeader();
         y = drawRow(y, {
-            no: '', staff_id: '', full_name: 'GRAND TOTAL', position: '',
-            monthly_salary: '', present_days: '', paid_leave_days: '', mgmt_paid_days: '',
-            unpaid_absence_days: '', required_hours: '', ot_earned_hours: fmt(totalOtEarned),
-            ot_used_hours: '', shortage_hours: '', net_salary: money(totalNet),
-        }, { bold: true });
+            full_name: 'GRAND TOTAL',
+            prorated_base: amount(totalProrated),
+            ot_earned_hours: fmt(totalOtEarned),
+            net_salary: amount(totalNet),
+        }, { bold: true, fill: '#eef1f8' });
 
-        // Signature footer section
-        y += 40;
-        if (y > doc.page.height - doc.page.margins.bottom - 20) {
-            doc.addPage();
-            y = doc.page.margins.top + 20;
-        }
-        
-       drawSignaturesFooter(y);
+        drawSignaturesFooter(y + 25);
 
         doc.end();
     } catch (error) {
