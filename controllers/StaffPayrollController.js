@@ -160,7 +160,7 @@ const [batchResult] = await connection.execute(
 
             if (!acknowledgePending) {
                 const [pendingRows] = await connection.execute(
-                    `SELECT record_date, status
+                    `SELECT record_date, status, attendance_status, remarks
                      FROM staff_attendance
                      WHERE staff_id = ?
                        AND record_date BETWEEN ? AND ?
@@ -176,6 +176,8 @@ const [batchResult] = await connection.execute(
                             full_name: staff.full_name,
                             record_date: recordDate,
                             status: pending.status,
+                            attendance_status: pending.attendance_status,
+                            note: pending.remarks || null,
                         });
                     }
                 }

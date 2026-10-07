@@ -17,6 +17,7 @@ const sameMinute = (a, b) => Boolean(a && b) &&
   String(a).replace('T', ' ').slice(0, 16) === String(b).replace('T', ' ').slice(0, 16);
 
 const ATTENDANCE_STATUSES = ['Present', 'Absent', 'Sick', 'Vacation', 'Holiday'];
+const ABSENCE_NOTE_MAX = 500;
 
 // 'draft'  -> saved in DB with status 'Draft' (invisible to admin, ignored by payroll)
 // 'submit' -> status 'Submitted' (goes to the admin review queue) — the ORIGINAL behavior
@@ -65,7 +66,7 @@ exports.getDayView = async (req, res) => {
               sa.lunch_start_time, sa.lunch_end_time,
               COALESCE(sa.standard_minutes_snapshot, ROUND(sm.standard_daily_hours * 60)) AS standard_minutes_snapshot,
               sa.is_friday_worked, sa.status, sa.admin_rejection_notes,
-              sa.source, sa.anomaly_code, sa.anomaly_detail
+              sa.source, sa.anomaly_code, sa.anomaly_detail, sa.remarks
        FROM staff_members sm
        LEFT JOIN staff_attendance sa ON sa.staff_id = sm.staff_id AND sa.record_date = ?
        WHERE sm.staff_id IN (${placeholders})
@@ -323,7 +324,8 @@ if (record_date > maxAllowed) {
            admin_rejection_notes,
            standard_minutes_snapshot,
            status,
-           source
+           source,
+           remarks
          FROM staff_attendance
          WHERE staff_id = ? AND record_date = ?
          LIMIT 1
@@ -332,6 +334,20 @@ if (record_date > maxAllowed) {
       );
       const existingRow = existing.length > 0 ? existing[0] : null;
       const isBiometricRow = existingRow && existingRow.source === 'Biometric';
+
+      // Supervisor note for an Absent day (why the employee was absent),
+      // stored in staff_attendance.remarks and shown to the Admin in the
+      // review table and the pre-payroll absence review. Only kept for
+      // Absent; a request without a `note` key keeps the stored note.
+      let remarks = null;
+      if (status === 'Absent') {
+        if (entry.note === undefined || entry.note === null) {
+          remarks = existingRow ? existingRow.remarks || null : null;
+        } else {
+          const cleaned = String(entry.note).trim().slice(0, ABSENCE_NOTE_MAX);
+          remarks = cleaned || null;
+        }
+      }
 
       let regularHours = 0;
       let overtimeHours = 0;
@@ -494,6 +510,7 @@ if (status === 'Present' && !biometricInOnlyDraft) {
           standard_minutes_snapshot: existingRecord.standard_minutes_snapshot,
           lunch_start_time: existingRecord.lunch_start_time,
           lunch_end_time: existingRecord.lunch_end_time,
+          remarks: existingRecord.remarks || null,
         };
 
         const newValues = {
@@ -510,11 +527,13 @@ if (status === 'Present' && !biometricInOnlyDraft) {
           standard_minutes_snapshot: snapshotMinutes,
           lunch_start_time: lunchStart,
           lunch_end_time: lunchEnd,
+          remarks,
         };
 
         // Audit only when something meaningful changed (data OR workflow status).
         const attendanceChanged =
           oldValues.status !== newValues.status ||
+          String(oldValues.remarks || '') !== String(newValues.remarks || '') ||
           Number(oldValues.standard_minutes_snapshot || 0) !== Number(newValues.standard_minutes_snapshot || 0) ||
           String(oldValues.lunch_start_time || '') !== String(newValues.lunch_start_time || '') ||
           String(oldValues.lunch_end_time || '') !== String(newValues.lunch_end_time || '') ||
@@ -551,7 +570,7 @@ if (status === 'Present' && !biometricInOnlyDraft) {
                attendance_status = ?, check_in_time = ?, check_out_time = ?,
                regular_hours = ?, overtime_hours = ?, lunch_deducted_hours = ?,
                is_friday_worked = ?, friday_confirmed_by_user_id = ?, standard_minutes_snapshot = ?,
-               lunch_start_time = ?, lunch_end_time = ?,
+               lunch_start_time = ?, lunch_end_time = ?, remarks = ?,
                status = ?, recorded_by_user_id = ?,
                admin_rejection_notes = ?, approved_by_user_id = NULL, approval_date = NULL
            WHERE staff_attendance_id = ?`,
@@ -569,6 +588,7 @@ if (status === 'Present' && !biometricInOnlyDraft) {
             snapshotMinutes,
             lunchStart,
             lunchEnd,
+            remarks,
             targetStatus,
             supervisorId,
             rejectionNotes,
@@ -618,9 +638,9 @@ if (status === 'Present' && !biometricInOnlyDraft) {
              (staff_id, record_date, attendance_status, check_in_time, check_out_time,
               regular_hours, overtime_hours, lunch_deducted_hours,
               is_friday_worked, friday_confirmed_by_user_id, standard_minutes_snapshot,
-              lunch_start_time, lunch_end_time,
+              lunch_start_time, lunch_end_time, remarks,
               recorded_by_user_id, status, is_paid)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             staffId,
             record_date,
@@ -635,6 +655,7 @@ if (status === 'Present' && !biometricInOnlyDraft) {
             Math.round(standardHours * 60),
             lunchStart,
             lunchEnd,
+            remarks,
             supervisorId,
             targetStatus,
             status === 'Sick' ? 0 : 1,   // D-11: Sick unpaid by default
@@ -669,6 +690,7 @@ if (status === 'Present' && !biometricInOnlyDraft) {
               lunch_deducted_hours: Number(lunchHours.toFixed(2)),
               is_friday_worked: isFridayWorked,
               friday_confirmed_by_user_id: fridayConfirmedBy,
+              remarks,
             }),
           ]
         );

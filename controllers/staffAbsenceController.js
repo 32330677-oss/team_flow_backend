@@ -45,7 +45,7 @@ exports.getAbsenceSummary = async (req, res) => {
     try {
         const [rows] = await db.execute(
             `SELECT sa.staff_attendance_id, sa.record_date, sa.is_management_paid_absence,
-                    sa.management_paid_reason, sa.management_paid_at,
+                    sa.management_paid_reason, sa.management_paid_at, sa.remarks AS absence_note,
                     u.full_name AS management_paid_by_name,
                     sm.staff_id, sm.staff_unique_id, sm.full_name, sm.position
              FROM staff_attendance sa
@@ -94,6 +94,7 @@ exports.getAbsenceSummary = async (req, res) => {
                 management_paid_reason: row.management_paid_reason,
                 management_paid_at: row.management_paid_at,
                 management_paid_by_name: row.management_paid_by_name,
+                absence_note: row.absence_note || null,   // supervisor's note on the absence
             });
         }
 
