@@ -4,6 +4,7 @@ const controller = require('../controllers/StaffPayrollController');
 const authMiddleware = require('../middleware/authMiddleware');
 const restrictTo = require('../middleware/roleMiddleware');
 const staffMonthlyReport = require('../controllers/staffMonthlyReportController'); // with the other requires
+const staffPreliminaryReport = require('../controllers/staffPreliminaryReportController'); // ← جديد: كشف أولي غير رسمي
 
 router.use(authMiddleware);
 
@@ -14,6 +15,7 @@ router.post('/generate', controller.generateStaffPayrollBatch);
 router.get('/report', controller.getStaffPayrollReport);
 router.get('/monthly-report.xlsx', staffMonthlyReport.exportStaffMonthlyReport);
 router.get('/monthly-report.pdf', staffMonthlyReport.exportStaffMonthlyReportPdf);
+router.get('/preliminary-report.pdf', staffPreliminaryReport.exportStaffPreliminaryReportPdf); // ← جديد (قراءة فقط، Submitted + Approved)
 router.get('/batch/:batchId', controller.getStaffPayrollBatchDetails);
 router.get('/batch/:batchId/export.xlsx', controller.exportStaffPayrollExcel); // ← جديد
 router.get('/batch/:batchId/export.pdf', controller.exportStaffPayrollPdf); // ← جديد
