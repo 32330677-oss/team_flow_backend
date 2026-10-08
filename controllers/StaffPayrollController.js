@@ -533,6 +533,10 @@ const hourlyRate       = money(hourlyRateRaw); // هاد بس للعرض/الت�
 
 async function getStaffPayrollReport(req, res) {
     try {
+        // Same as worker payroll (C-08): Superseded/Voided only with ?include_history=1
+        const statusFilter = req.query.include_history === '1'
+            ? '1 = 1'
+            : "spb.status IN ('Generated','Paid')";
         const [rows] = await pool.execute(
             `SELECT spb.staff_payroll_batch_id, spb.start_date, spb.end_date,
                     spb.total_staff, spb.total_amount, spb.status, spb.generated_at,
@@ -541,6 +545,7 @@ async function getStaffPayrollReport(req, res) {
                     u.full_name AS generated_by
              FROM staff_payroll_batches spb
              JOIN users u ON u.user_id = spb.generated_by_user_id
+             WHERE ${statusFilter}
              ORDER BY spb.generated_at DESC`
         );
         return res.json({ status: 'success', data: rows });
