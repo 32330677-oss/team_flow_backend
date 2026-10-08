@@ -108,15 +108,27 @@ async function pendingWorkerDays(executor, { siteId, shiftType, recordDate }) {
     [siteId, shiftType, to, from]
   );
 
+  // Only REGULAR batches lock a whole day. An off-cycle batch (urgent payroll
+  // of one worker) never closes the day for the other workers; it only means
+  // that this one worker can no longer be recorded on its dates (see below).
   const [locks] = await executor.execute(
     `SELECT DATE_FORMAT(start_date, '%Y-%m-%d') AS s, DATE_FORMAT(end_date, '%Y-%m-%d') AS e
      FROM payrollbatches
-     WHERE status IN ('Generated', 'Paid') AND is_finalized = 1
+     WHERE batch_type = 'Regular' AND status IN ('Generated', 'Paid') AND is_finalized = 1
        AND start_date <= ? AND end_date >= ?
        AND (scope_site_id IS NULL OR scope_site_id = ?)`,
     [to, from, siteId]
   );
   const isLocked = (d) => locks.some((l) => l.s <= d && l.e >= d);
+
+  const [offLocks] = await executor.execute(
+    `SELECT scope_worker_id AS w, DATE_FORMAT(start_date, '%Y-%m-%d') AS s, DATE_FORMAT(end_date, '%Y-%m-%d') AS e
+     FROM payrollbatches
+     WHERE batch_type = 'OffCycle' AND status IN ('Generated', 'Paid') AND is_finalized = 1
+       AND start_date <= ? AND end_date >= ?`,
+    [to, from]
+  );
+  const paidOffCycle = (workerId, d) => offLocks.some((l) => Number(l.w) === workerId && l.s <= d && l.e >= d);
 
   for (const d of eachDay(from, to)) {
     if (result.days.length >= MAX_LISTED) break;
@@ -132,7 +144,7 @@ async function pendingWorkerDays(executor, { siteId, shiftType, recordDate }) {
     const candidates = [...new Set(assignments
       .filter((x) => x.a <= d && (x.u === null || x.u >= d))
       .map((x) => Number(x.worker_id))
-      .filter((id) => !covered.has(id)))];
+      .filter((id) => !covered.has(id) && !paidOffCycle(id, d)))];
     if (candidates.length === 0) continue;
     const active = await getActiveWorkerIdsOnDate(candidates, d, executor);
     if (active.size === 0) continue;

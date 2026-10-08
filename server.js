@@ -72,8 +72,10 @@ const PORT = process.env.PORT || 5000;
 async function start() {
     const db = require('./config/db');
     const { assertSemanticsMarker } = require('./services/assignmentDates');
+    const { assertOffCycleSchema } = require('./services/payrollLock');
     try {
         await assertSemanticsMarker(db);
+        await assertOffCycleSchema(db);   // migrations/2026_10_offcycle_payroll
     } catch (error) {
         console.error(`FATAL: ${error.message}`);
         process.exit(1);

@@ -1002,7 +1002,7 @@ exports.adminSubmitForReview = async (req, res) => {
       if (rec.status !== 'Draft') throw new OpError(`Only a Draft can be submitted (this record is ${rec.status}).`, 409);
       const [orphan] = await findOrphanWorkerDrafts(connection, { recordId });
       if (!orphan) throw new OpError('This draft has an active supervisor and an Active site. The supervisor must submit it through the normal day submission.', 409);
-      await assertWorkerDateEditable(connection, rec.site_id, rec.record_date);   // D-02
+      await assertWorkerDateEditable(connection, rec.site_id, rec.record_date, rec.worker_id);   // D-02
 
       // Normal submission validation (same rules as submitDay).
       if (rec.attendance_status === 'Present') {

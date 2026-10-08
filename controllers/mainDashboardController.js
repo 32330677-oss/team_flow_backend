@@ -226,7 +226,7 @@ async function loadSiteData(date, siteId) {
     SELECT s2.site_id,
            (SELECT DATE_FORMAT(MAX(pb.end_date), '%Y-%m-%d')
             FROM payrollbatches pb
-            WHERE pb.status <> 'Superseded'
+            WHERE pb.status IN ('Generated', 'Paid') AND pb.batch_type = 'Regular'
               AND (pb.scope_site_id IS NULL OR pb.scope_site_id = s2.site_id)) AS last_end
     FROM sites s2
     WHERE s2.site_status = 'Active'${scoped ? ' AND s2.site_id = ?' : ''}`;
@@ -641,12 +641,14 @@ async function loadPayrollGlobal() {
     const [rows] = await pool.query(
       `SELECT pb.payroll_batch_id, DATE_FORMAT(pb.start_date, '%Y-%m-%d') AS start_date,
               DATE_FORMAT(pb.end_date, '%Y-%m-%d') AS end_date, pb.scope_site_id,
-              s.site_name AS scope_site_name, pb.status, pb.is_finalized, pb.version_number
+              s.site_name AS scope_site_name, pb.status, pb.is_finalized, pb.version_number,
+              pb.batch_type, pb.scope_worker_id, sw.full_name AS scope_worker_name
        FROM payrollbatches pb
        LEFT JOIN sites s ON s.site_id = pb.scope_site_id
-       WHERE pb.status <> 'Superseded'
+       LEFT JOIN workers sw ON sw.worker_id = pb.scope_worker_id
+       WHERE pb.status IN ('Generated', 'Paid')
        ORDER BY pb.end_date DESC, pb.generated_at DESC, pb.payroll_batch_id DESC
-       LIMIT 10`
+       LIMIT 20`
     );
     const mapBatch = (r) => ({
       batch_id: num(r.payroll_batch_id),
@@ -657,12 +659,17 @@ async function loadPayrollGlobal() {
       status: str(r.status),
       is_finalized: Number(r.is_finalized) === 1,
       version_number: num(r.version_number),
+      batch_type: str(r.batch_type),
+      scope_worker_id: r.scope_worker_id === null ? null : num(r.scope_worker_id),
+      scope_worker_name: str(r.scope_worker_name),
       state: r.status === 'Paid' ? 'paid' : (Number(r.is_finalized) === 1 ? 'awaiting_payment' : 'awaiting_finalization'),
     });
     const batches = rows.map(mapBatch);
     return {
       available: true,
-      latest_batch: batches[0] || null,
+      // "Latest batch" = the latest period payroll; an urgent payroll of one
+      // worker never stands for the whole period.
+      latest_batch: batches.find((b) => b.batch_type !== 'OffCycle') || null,
       open_batches: batches.filter((b) => b.state !== 'paid'),
     };
   } catch (error) {

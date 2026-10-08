@@ -12,6 +12,11 @@ function isSpecificSite(value) {
 function money(value) {
   return Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 }
+function addDaysIso(dateStr, days) {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
 
 const DEFAULT_STANDARD_MINUTES = 600; // fallback: 10 hours, matches system default
 
@@ -54,14 +59,34 @@ const PAYROLL_LOCKING_STATUSES = "('Generated','Paid')"; // statuses that count 
 //       batch is inserted as version_number + 1, linked via
 //       supersedes_batch_id.
 // - A brand-new period gets version_number = 1.
+//
+// Off-cycle payroll (urgent payroll of ONE worker, batch_type = 'OffCycle'):
+// - Period identity = (start_date, end_date, batch_type, scope_worker_id), so
+//   a Regular batch never supersedes an off-cycle batch and vice versa.
+// - The off-cycle batch pays only that worker's Approved attendance in the
+//   period (all of it must be Approved: no "generate without them").
+// - A Regular batch skips every record of a worker whose own off-cycle batch
+//   covers that date, and refuses to run while such an off-cycle batch is
+//   not finalized yet (otherwise voiding it later would leave days unpaid).
+// - The amount is computed by exactly the same code below; only the set of
+//   attendance rows differs.
 // ============================================================
+const PAYROLL_GENERATE_LOCK = 'team_flow_worker_payroll_generate';
+
 async function generatePayrollBatch(req, res) {
   const { start_date, end_date, site_id } = req.body || {};
   const userId = req.user?.user_id;
   // D-03: set only by supersedeFinalizedBatch (atomic replacement of a
   // Finalized, unpaid batch). Never accepted from the request body.
   const supersede = req._supersede || null;
-  const acknowledgePending = req.body?.acknowledge_pending === true;
+  // Off-cycle: set only by generateOffCycleBatch / supersedeFinalizedBatch,
+  // never accepted from the body of POST /generate.
+  const offcycle = req._offcycle || null;
+  const batchType = offcycle ? 'OffCycle' : 'Regular';
+  const scopeWorkerId = offcycle ? Number(offcycle.workerId) : null;
+  const dryRun = Boolean(offcycle && offcycle.dryRun);
+  // An off-cycle batch must include every record of the worker in its period.
+  const acknowledgePending = !offcycle && req.body?.acknowledge_pending === true;
 
   if (!userId) return res.status(401).json({ success: false, message: 'Admin identification not found.' });
   if (!isValidDate(start_date) || !isValidDate(end_date)) {
@@ -70,30 +95,127 @@ async function generatePayrollBatch(req, res) {
   if (end_date < start_date) {
     return res.status(400).json({ success: false, message: 'End date must be after or equal to start date.' });
   }
+  if (offcycle && end_date > businessToday()) {
+    return res.status(400).json({
+      success: false,
+      code: 'OFFCYCLE_FUTURE_DATE',
+      message: `An off-cycle payroll cannot end in the future (today is ${businessToday()}). Days after today could not be recorded for this worker any more.`,
+    });
+  }
 
   const connection = await pool.getConnection();
+  let haveGenerateLock = false;
   try {
+    // One worker-payroll generation at a time (Regular, off-cycle, supersede):
+    // the overlap / coverage checks below and the INSERT must not interleave.
+    const [[lockRow]] = await connection.query('SELECT GET_LOCK(?, 15) AS ok', [PAYROLL_GENERATE_LOCK]);
+    haveGenerateLock = Number(lockRow && lockRow.ok) === 1;
+    if (!haveGenerateLock) {
+      return res.status(409).json({ success: false, code: 'PAYROLL_GENERATION_BUSY', message: 'Another payroll is being generated right now. Try again in a few seconds.' });
+    }
     await connection.beginTransaction();
-    const scopedSite = isSpecificSite(site_id);
+    const scopedSite = !offcycle && isSpecificSite(site_id);
     const scopeSiteId = scopedSite ? Number(site_id) : null;
 
-    const [overlapping] = await connection.execute(
-      `SELECT payroll_batch_id, start_date, end_date, scope_site_id
-       FROM payrollbatches
-       WHERE status IN ${PAYROLL_LOCKING_STATUSES}
-         AND start_date <= ? AND end_date >= ?
-         AND NOT (start_date = ? AND end_date = ? AND scope_site_id <=> ?)
-         AND (scope_site_id <=> ? OR scope_site_id IS NULL OR ? IS NULL)
-       LIMIT 1
-       FOR UPDATE`,
-      [end_date, start_date, start_date, end_date, scopeSiteId, scopeSiteId, scopeSiteId]
-    );
-    if (overlapping.length) {
-      await connection.rollback();
-      return res.status(409).json({
-        success: false,
-        message: `This period overlaps existing payroll batch #${overlapping[0].payroll_batch_id}. Adjust the dates or supersede/finalize the existing batch first.`
-      });
+    if (!offcycle) {
+      const [overlapping] = await connection.execute(
+        `SELECT payroll_batch_id, start_date, end_date, scope_site_id
+         FROM payrollbatches
+         WHERE batch_type = 'Regular'
+           AND status IN ${PAYROLL_LOCKING_STATUSES}
+           AND start_date <= ? AND end_date >= ?
+           AND NOT (start_date = ? AND end_date = ? AND scope_site_id <=> ?)
+           AND (scope_site_id <=> ? OR scope_site_id IS NULL OR ? IS NULL)
+         LIMIT 1
+         FOR UPDATE`,
+        [end_date, start_date, start_date, end_date, scopeSiteId, scopeSiteId, scopeSiteId]
+      );
+      if (overlapping.length) {
+        await connection.rollback();
+        return res.status(409).json({
+          success: false,
+          message: `This period overlaps existing payroll batch #${overlapping[0].payroll_batch_id}. Adjust the dates or supersede/finalize the existing batch first.`
+        });
+      }
+
+      // Off-cycle batches inside this period must be finalized first: the
+      // Regular batch skips their records, so they must not be voided later.
+      const [openOffCycle] = await connection.execute(
+        `SELECT ob.payroll_batch_id, ob.scope_worker_id AS worker_id, w.full_name AS worker_name,
+                DATE_FORMAT(ob.start_date, '%Y-%m-%d') AS start_date, DATE_FORMAT(ob.end_date, '%Y-%m-%d') AS end_date
+         FROM payrollbatches ob
+         JOIN workers w ON w.worker_id = ob.scope_worker_id
+         WHERE ob.batch_type = 'OffCycle' AND ob.status = 'Generated' AND ob.is_finalized = 0
+           AND ob.start_date <= ? AND ob.end_date >= ?
+           AND (? IS NULL OR EXISTS (
+                 SELECT 1 FROM attendance ax
+                 WHERE ax.worker_id = ob.scope_worker_id AND ax.site_id = ?
+                   AND ax.record_date BETWEEN GREATEST(ob.start_date, ?) AND LEAST(ob.end_date, ?)))
+         ORDER BY ob.payroll_batch_id
+         FOR UPDATE`,
+        [end_date, start_date, scopeSiteId, scopeSiteId, start_date, end_date]
+      );
+      if (openOffCycle.length) {
+        await connection.rollback();
+        const list = openOffCycle.map((b) => `#${b.payroll_batch_id} (${b.worker_name}, ${b.start_date} to ${b.end_date})`).join(', ');
+        return res.status(409).json({
+          success: false,
+          code: 'OFFCYCLE_NOT_FINALIZED',
+          message: `Off-cycle payroll ${list} inside this period is not finalized yet. Finalize it (or void it) first, then generate this period.`,
+          offcycle_batches: openOffCycle,
+        });
+      }
+    } else {
+      // Another active off-cycle batch of this worker overlapping the period
+      // (the exact same period is regenerated / superseded below instead).
+      const [otherOff] = await connection.execute(
+        `SELECT payroll_batch_id, DATE_FORMAT(start_date, '%Y-%m-%d') AS start_date, DATE_FORMAT(end_date, '%Y-%m-%d') AS end_date
+         FROM payrollbatches
+         WHERE batch_type = 'OffCycle' AND scope_worker_id = ?
+           AND status IN ${PAYROLL_LOCKING_STATUSES}
+           AND start_date <= ? AND end_date >= ?
+           AND NOT (start_date = ? AND end_date = ?)
+         LIMIT 1
+         FOR UPDATE`,
+        [scopeWorkerId, end_date, start_date, start_date, end_date]
+      );
+      if (otherOff.length) {
+        await connection.rollback();
+        return res.status(409).json({
+          success: false,
+          code: 'OFFCYCLE_OVERLAP',
+          message: `This worker already has off-cycle payroll batch #${otherOff[0].payroll_batch_id} (${otherOff[0].start_date} to ${otherOff[0].end_date}) overlapping this period. Choose dates outside it.`,
+        });
+      }
+      // A Regular batch that already covers this worker in the period.
+      const [regular] = await connection.execute(
+        `SELECT rb.payroll_batch_id, rb.status, rb.is_finalized,
+                DATE_FORMAT(rb.start_date, '%Y-%m-%d') AS start_date, DATE_FORMAT(rb.end_date, '%Y-%m-%d') AS end_date
+         FROM payrollbatches rb
+         WHERE rb.batch_type = 'Regular'
+           AND rb.status IN ${PAYROLL_LOCKING_STATUSES}
+           AND rb.start_date <= ? AND rb.end_date >= ?
+           AND (rb.scope_site_id IS NULL OR EXISTS (
+                 SELECT 1 FROM attendance ax
+                 WHERE ax.worker_id = ? AND ax.site_id = rb.scope_site_id
+                   AND ax.record_date BETWEEN GREATEST(rb.start_date, ?) AND LEAST(rb.end_date, ?)))
+         ORDER BY rb.end_date DESC
+         LIMIT 1
+         FOR UPDATE`,
+        [end_date, start_date, scopeWorkerId, start_date, end_date]
+      );
+      if (regular.length) {
+        await connection.rollback();
+        const r = regular[0];
+        return res.status(409).json({
+          success: false,
+          code: 'OFFCYCLE_COVERED_BY_REGULAR',
+          message: `Payroll batch #${r.payroll_batch_id} (${r.start_date} to ${r.end_date}) already covers this worker in this period. ` +
+            (supersede
+              ? 'This off-cycle batch can no longer be superseded; record any difference through the attendance correction / adjustment workflow.'
+              : `Start the off-cycle period after ${r.end_date}, or ${r.is_finalized ? 'pay the worker from that batch' : 'void that batch first'}.`),
+        });
+      }
     }
 
     // --- find any active batch(es) for this exact period + scope ---
@@ -103,15 +225,17 @@ async function generatePayrollBatch(req, res) {
        WHERE start_date = ? AND end_date = ?
          AND status IN ${PAYROLL_LOCKING_STATUSES}
          AND scope_site_id <=> ?
+         AND batch_type = ? AND scope_worker_id <=> ?
        ORDER BY version_number DESC
        FOR UPDATE`,
-      [start_date, end_date, scopeSiteId]
+      [start_date, end_date, scopeSiteId, batchType, scopeWorkerId]
     );
     // Version numbers continue across Voided/Superseded batches of the period.
     const [[maxVersionRow]] = await connection.execute(
       `SELECT MAX(version_number) AS max_version FROM payrollbatches
-       WHERE start_date = ? AND end_date = ? AND scope_site_id <=> ?`,
-      [start_date, end_date, scopeSiteId]
+       WHERE start_date = ? AND end_date = ? AND scope_site_id <=> ?
+         AND batch_type = ? AND scope_worker_id <=> ?`,
+      [start_date, end_date, scopeSiteId, batchType, scopeWorkerId]
     );
 
     if (existingBatches.length) {
@@ -138,6 +262,14 @@ async function generatePayrollBatch(req, res) {
       return res.status(409).json({ success: false, message: 'The batch to supersede is no longer the active batch of this period.' });
     }
 
+    // Records of a worker on a date already paid by his own off-cycle batch
+    // belong to that batch, never to a Regular batch.
+    const NOT_PAID_OFFCYCLE = `NOT EXISTS (
+        SELECT 1 FROM payrollbatches ob
+        WHERE ob.batch_type = 'OffCycle' AND ob.status IN ${PAYROLL_LOCKING_STATUSES}
+          AND ob.scope_worker_id = a.worker_id
+          AND a.record_date BETWEEN ob.start_date AND ob.end_date)`;
+
     // C-03: unresolved attendance (Draft / Submitted / Rejected) in the period
     // is reported before generating, exactly like staff payroll.
     {
@@ -147,8 +279,20 @@ async function generatePayrollBatch(req, res) {
                      FROM attendance a JOIN workers w ON w.worker_id = a.worker_id JOIN sites s ON s.site_id = a.site_id
                      WHERE a.record_date BETWEEN ? AND ? AND a.status IN ('Draft','Submitted','Rejected')`;
       if (scopedSite) { pendSql += ' AND a.site_id = ?'; pendParams.push(site_id); }
+      if (offcycle) { pendSql += ' AND a.worker_id = ?'; pendParams.push(scopeWorkerId); }
+      else pendSql += ` AND ${NOT_PAID_OFFCYCLE}`;
       pendSql += ' ORDER BY a.record_date, w.full_name LIMIT 500';
       const [pendingRows] = await connection.execute(pendSql, pendParams);
+      if (pendingRows.length > 0 && offcycle) {
+        await connection.rollback();
+        return res.status(409).json({
+          success: false,
+          code: 'OFFCYCLE_PENDING_ATTENDANCE',
+          message: `${pendingRows.length} attendance record(s) of this worker in this period are not approved yet (Draft/Submitted/Rejected). ` +
+            'An off-cycle payroll must include all of them: approve them first, or end the period before the first of these dates.',
+          pending_attendance: pendingRows,
+        });
+      }
       if (pendingRows.length > 0 && !acknowledgePending) {
         await connection.rollback();
         return res.status(409).json({
@@ -183,13 +327,20 @@ let attSql = `
     AND a.status = 'Approved'`;
 
     if (scopedSite) { attSql += ' AND a.site_id = ?'; attParams.push(site_id); }
+    if (offcycle) { attSql += ' AND a.worker_id = ?'; attParams.push(scopeWorkerId); }
+    else attSql += ` AND ${NOT_PAID_OFFCYCLE}`;
     attSql += ' ORDER BY w.full_name, a.record_date';
 
     const [attendanceRows] = await connection.execute(attSql, attParams);
 
     if (!attendanceRows.length) {
       await connection.rollback();
-      return res.status(404).json({ success: false, message: 'No Approved attendance found for this period.' });
+      return res.status(404).json({
+        success: false,
+        message: offcycle
+          ? 'This worker has no Approved attendance in this period.'
+          : 'No Approved attendance found for this period.',
+      });
     }
 
     const missingAssignment = attendanceRows.filter((r) => r.contract_id === null || r.contract_id === undefined);
@@ -390,7 +541,56 @@ let attSql = `
     }
     if (!byWorker.size) {
       await connection.rollback();
-      return res.status(404).json({ success: false, message: 'No payable attendance found for this period.' });
+      return res.status(404).json({
+        success: false,
+        message: offcycle
+          ? 'This worker has nothing payable in this period (all approved days are unpaid leave / absence).'
+          : 'No payable attendance found for this period.',
+      });
+    }
+
+    // Off-cycle preview: everything above ran exactly as for a real batch;
+    // nothing is written. The Admin sees the amount before confirming.
+    if (dryRun) {
+      const worker = byWorker.get(scopeWorkerId);
+      const siteIds = [...new Set(worker.breakdown.map((b) => b.siteId))];
+      const [siteRows] = await connection.query('SELECT site_id, site_name FROM sites WHERE site_id IN (?)', [siteIds]);
+      const siteName = new Map(siteRows.map((r) => [r.site_id, r.site_name]));
+      const [[wRow]] = await connection.execute(
+        'SELECT worker_id, full_name, worker_unique_id, status FROM workers WHERE worker_id = ?', [scopeWorkerId]);
+      const [allDays] = await connection.execute(
+        `SELECT DISTINCT DATE_FORMAT(record_date, '%Y-%m-%d') AS d FROM attendance
+         WHERE worker_id = ? AND record_date BETWEEN ? AND ?`, [scopeWorkerId, start_date, end_date]);
+      const anyRecord = new Set(allDays.map((r) => r.d));
+      const daysWithoutRecord = [];
+      for (let d = start_date; d <= end_date; d = addDaysIso(d, 1)) if (!anyRecord.has(d)) daysWithoutRecord.push(d);
+      await connection.rollback();
+      return res.status(200).json({
+        success: true,
+        dry_run: true,
+        currency: String(await settingsCache.getSetting('worker_payroll_currency', 'SYP') || 'SYP').toUpperCase(),
+        worker: wRow,
+        start_date,
+        end_date,
+        approved_records: attendanceRows.length,
+        net_salary: worker.gross,
+        lines: worker.breakdown.map((b) => ({
+          site_id: b.siteId,
+          site_name: siteName.get(b.siteId) || `Site #${b.siteId}`,
+          pay_type: b.payType,
+          daily_rate: b.dailyRate,
+          hourly_rate: b.hourlyRate,
+          days_worked: b.daysWorked,
+          regular_hours: money(b.regularHours),
+          overtime_hours: money(b.overtimeHours),
+          overtime_rate: b.overtimeHours > 0 ? b.overtimeRate : null,
+          base_salary: b.baseSalary,
+          overtime_pay: b.overtimePay,
+          from: b.attendance.reduce((m, a) => (a.record_date < m ? a.record_date : m), b.attendance[0].record_date),
+          to: b.attendance.reduce((m, a) => (a.record_date > m ? a.record_date : m), b.attendance[0].record_date),
+        })),
+        days_without_record: daysWithoutRecord,
+      });
     }
 
     // --- everything validated and computed: now supersede the old batch(es)
@@ -406,9 +606,10 @@ let attSql = `
     const [batchResult] = await connection.execute(
       `INSERT INTO payrollbatches
          (start_date, end_date, generated_by_user_id, status, scope_site_id, version_number, supersedes_batch_id,
-          currency, supersede_reason)
-       VALUES (?, ?, ?, 'Generated', ?, ?, ?, ?, ?)`,
-      [start_date, end_date, userId, scopeSiteId, nextVersion, supersedesId, currency, supersede ? supersede.reason : null]
+          currency, supersede_reason, batch_type, scope_worker_id, offcycle_reason)
+       VALUES (?, ?, ?, 'Generated', ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [start_date, end_date, userId, scopeSiteId, nextVersion, supersedesId, currency, supersede ? supersede.reason : null,
+        batchType, scopeWorkerId, offcycle ? String(offcycle.reason || '').slice(0, 500) : null]
     );
     const batchId = batchResult.insertId;
     let totalWorkers = 0;
@@ -494,17 +695,23 @@ let attSql = `
       success: true,
       message: supersedesId
         ? `Payroll generated successfully (version ${nextVersion}). Previous version (Batch #${supersedesId}) has been superseded.`
-        : 'Payroll generated successfully.',
+        : (offcycle ? 'Off-cycle payroll generated successfully.' : 'Payroll generated successfully.'),
       currency,
       batch_id: batchId,
+      batch_type: batchType,
+      scope_worker_id: scopeWorkerId,
+      total_amount: totalAmount,
       version_number: nextVersion,
       supersedes_batch_id: supersedesId
     });
   } catch (error) {
-    await connection.rollback();
+    try { await connection.rollback(); } catch (_) { /* nothing to roll back */ }
     console.error('generatePayrollBatch:', error);
     return res.status(500).json({ success: false, message: 'Failed to generate payroll. No batch was changed.' });
   } finally {
+    if (haveGenerateLock) {
+      try { await connection.query('SELECT RELEASE_LOCK(?)', [PAYROLL_GENERATE_LOCK]); } catch (_) { /* released with the session */ }
+    }
     connection.release();
   }
 }
@@ -598,8 +805,9 @@ async function getPayrollVersionChain(req, res) {
        JOIN users u ON u.user_id = pb.generated_by_user_id
        LEFT JOIN users fu ON fu.user_id = pb.finalized_by_user_id
        WHERE pb.start_date = ? AND pb.end_date = ? AND pb.scope_site_id <=> ?
+         AND pb.batch_type = ? AND pb.scope_worker_id <=> ?
        ORDER BY pb.version_number ASC`,
-      [anchor.start_date, anchor.end_date, anchor.scope_site_id]
+      [anchor.start_date, anchor.end_date, anchor.scope_site_id, anchor.batch_type, anchor.scope_worker_id]
     );
 
     return res.json({ success: true, data: all });
@@ -625,17 +833,22 @@ async function getPayrollReport(req, res) {
         SELECT pb.payroll_batch_id, pb.start_date, pb.end_date, pb.status, pb.generated_at,
                pb.version_number, pb.is_finalized, pb.finalized_at, pb.currency, pb.scope_site_id,
                pb.supersedes_batch_id, pb.void_reason, pb.supersede_reason,
+               pb.batch_type, pb.scope_worker_id, pb.offcycle_reason,
+               sw.full_name AS scope_worker_name, sw.worker_unique_id AS scope_worker_unique_id,
                u.full_name AS generated_by,
                COUNT(DISTINCT p.worker_id) AS total_workers,
                COALESCE(SUM(pi.base_salary + pi.overtime_pay), 0) AS total_amount
         FROM payrollbatches pb
         JOIN users u ON u.user_id = pb.generated_by_user_id
+        LEFT JOIN workers sw ON sw.worker_id = pb.scope_worker_id
         JOIN payroll p ON p.payroll_batch_id = pb.payroll_batch_id
         JOIN payrollitems pi ON pi.payroll_id = p.payroll_id AND pi.site_id = ?
         WHERE ${statusFilter}
         GROUP BY pb.payroll_batch_id, pb.start_date, pb.end_date, pb.status, pb.generated_at,
                  pb.version_number, pb.is_finalized, pb.finalized_at, pb.currency, pb.scope_site_id,
-                 pb.supersedes_batch_id, pb.void_reason, pb.supersede_reason, u.full_name
+                 pb.supersedes_batch_id, pb.void_reason, pb.supersede_reason,
+                 pb.batch_type, pb.scope_worker_id, pb.offcycle_reason, sw.full_name, sw.worker_unique_id,
+                 u.full_name
         ORDER BY pb.generated_at DESC`;
       params.push(site_id);
     } else {
@@ -644,9 +857,12 @@ async function getPayrollReport(req, res) {
                pb.total_workers, pb.total_amount, pb.status, pb.generated_at,
                pb.version_number, pb.is_finalized, pb.finalized_at, pb.currency, pb.scope_site_id,
                pb.supersedes_batch_id, pb.void_reason, pb.supersede_reason,
+               pb.batch_type, pb.scope_worker_id, pb.offcycle_reason,
+               sw.full_name AS scope_worker_name, sw.worker_unique_id AS scope_worker_unique_id,
                u.full_name AS generated_by
         FROM payrollbatches pb
         JOIN users u ON u.user_id = pb.generated_by_user_id
+        LEFT JOIN workers sw ON sw.worker_id = pb.scope_worker_id
         WHERE ${statusFilter}
         ORDER BY pb.generated_at DESC`;
     }
@@ -659,11 +875,62 @@ async function getPayrollReport(req, res) {
   }
 }
 
+// ============================================================
+// Off-cycle payroll paid inside a Regular batch's period.
+// For a Regular batch: every active (Generated/Paid) off-cycle batch whose
+// period overlaps it (for a site-scoped batch: only off-cycle pay at that
+// site). Amounts come from the stored off-cycle payroll, never recomputed.
+// Returns [] for an off-cycle batch.
+// ============================================================
+async function loadOffCyclePaidInPeriod(executor, batch) {
+  if (!batch || batch.batch_type === 'OffCycle') return [];
+  const scopeSite = batch.scope_site_id == null ? null : Number(batch.scope_site_id);
+  const [rows] = await executor.execute(
+    `SELECT ob.payroll_batch_id, DATE_FORMAT(ob.start_date, '%Y-%m-%d') AS start_date,
+            DATE_FORMAT(ob.end_date, '%Y-%m-%d') AS end_date, ob.status, ob.is_finalized,
+            ob.version_number, ob.offcycle_reason, ob.currency,
+            DATE_FORMAT(ob.paid_at, '%Y-%m-%d') AS paid_at,
+            w.worker_id, w.full_name AS worker_name, w.worker_unique_id,
+            COALESCE(SUM(pi.base_salary + pi.overtime_pay), 0) AS amount,
+            GROUP_CONCAT(DISTINCT s.site_name ORDER BY s.site_name SEPARATOR ', ') AS sites
+     FROM payrollbatches ob
+     JOIN workers w ON w.worker_id = ob.scope_worker_id
+     JOIN payroll p ON p.payroll_batch_id = ob.payroll_batch_id
+     JOIN payrollitems pi ON pi.payroll_id = p.payroll_id AND (? IS NULL OR pi.site_id = ?)
+     LEFT JOIN sites s ON s.site_id = pi.site_id
+     WHERE ob.batch_type = 'OffCycle' AND ob.status IN ${PAYROLL_LOCKING_STATUSES}
+       AND ob.start_date <= ? AND ob.end_date >= ?
+     GROUP BY ob.payroll_batch_id, ob.start_date, ob.end_date, ob.status, ob.is_finalized, ob.version_number,
+              ob.offcycle_reason, ob.currency, ob.paid_at, w.worker_id, w.full_name, w.worker_unique_id
+     ORDER BY w.full_name, ob.start_date`,
+    [scopeSite, scopeSite, batch.end_date, batch.start_date]
+  );
+  return rows.map((r) => ({
+    payroll_batch_id: r.payroll_batch_id,
+    worker_id: r.worker_id,
+    worker_name: r.worker_name,
+    worker_unique_id: r.worker_unique_id,
+    start_date: r.start_date,
+    end_date: r.end_date,
+    status: r.status,
+    is_finalized: Number(r.is_finalized) === 1,
+    paid_at: r.paid_at,
+    version_number: r.version_number,
+    reason: r.offcycle_reason,
+    sites: r.sites || '',
+    amount: money(r.amount),
+    currency: r.currency,
+  }));
+}
+
 async function getPayrollBatchDetails(req, res) {
   const batchId = Number(req.params.batchId);
   if (!Number.isInteger(batchId) || batchId <= 0) return res.status(400).json({ success: false, message: 'Invalid batch id.' });
   try {
-    const [batches] = await pool.execute('SELECT * FROM payrollbatches WHERE payroll_batch_id = ?', [batchId]);
+    const [batches] = await pool.execute(
+      `SELECT pb.*, sw.full_name AS scope_worker_name, sw.worker_unique_id AS scope_worker_unique_id
+       FROM payrollbatches pb LEFT JOIN workers sw ON sw.worker_id = pb.scope_worker_id
+       WHERE pb.payroll_batch_id = ?`, [batchId]);
     if (!batches.length) return res.status(404).json({ success: false, message: 'Batch not found.' });
 
     const [payrolls] = await pool.execute(
@@ -722,7 +989,32 @@ async function getPayrollBatchDetails(req, res) {
       };
     });
 
-    return res.json({ success: true, batch: batches[0], workers });
+    // Off-cycle payroll already paid inside this (Regular) period: shown next
+    // to the worker and in its own section; never added to this batch total.
+    const offcyclePaid = await loadOffCyclePaidInPeriod(pool, batches[0]);
+    const offByWorker = new Map();
+    for (const o of offcyclePaid) {
+      if (!offByWorker.has(o.worker_id)) offByWorker.set(o.worker_id, []);
+      offByWorker.get(o.worker_id).push(o);
+    }
+    const inBatch = new Set(workers.map((w) => Number(w.worker_id)));
+    for (const w of workers) w.offcycle_batches = offByWorker.get(Number(w.worker_id)) || [];
+    for (const o of offcyclePaid) o.in_this_batch = inBatch.has(Number(o.worker_id));
+    const batchTotal = money(workers.reduce((sum, w) => sum + Number(w.net_salary || 0), 0));
+    const offcycleTotal = money(offcyclePaid.reduce((sum, o) => sum + o.amount, 0));
+
+    return res.json({
+      success: true,
+      batch: batches[0],
+      workers,
+      offcycle_paid: offcyclePaid,
+      offcycle_summary: {
+        count: offcyclePaid.length,
+        total: offcycleTotal,
+        batch_total: batchTotal,
+        period_total: money(batchTotal + offcycleTotal),
+      },
+    });
   } catch (error) {
     console.error('getPayrollBatchDetails:', error);
     return res.status(500).json({ success: false, message: 'Failed to load batch details.' });
@@ -835,6 +1127,10 @@ async function supersedeFinalizedBatch(req, res) {
       acknowledge_pending: req.body?.acknowledge_pending === true,
     };
     req._supersede = { batchId, reason: reason.slice(0, 500) };
+    if (batch.batch_type === 'OffCycle') {
+      // Same worker and period; the original off-cycle reason is kept.
+      req._offcycle = { workerId: batch.scope_worker_id, reason: batch.offcycle_reason || '', dryRun: false };
+    }
     return generatePayrollBatch(req, res);
   } catch (error) {
     console.error('supersedeFinalizedBatch:', error);
@@ -846,13 +1142,14 @@ async function getLastBatchEndDate(req, res) {
   try {
     const { site_id } = req.query || {};
     const params = [];
-    let sql = `SELECT MAX(pb.end_date) AS last_end_date FROM payrollbatches pb WHERE pb.status IN ('Generated','Paid')`;
+    // Off-cycle batches (one worker) never move the start of the next period.
+    let sql = `SELECT MAX(pb.end_date) AS last_end_date FROM payrollbatches pb WHERE pb.status IN ('Generated','Paid') AND pb.batch_type = 'Regular'`;
     if (isSpecificSite(site_id)) {
       sql = `SELECT MAX(pb.end_date) AS last_end_date
              FROM payrollbatches pb
              JOIN payroll p ON p.payroll_batch_id = pb.payroll_batch_id
              JOIN payrollitems pi ON pi.payroll_id = p.payroll_id
-             WHERE pb.status IN ('Generated','Paid') AND pi.site_id = ?`;
+             WHERE pb.status IN ('Generated','Paid') AND pb.batch_type = 'Regular' AND pi.site_id = ?`;
       params.push(site_id);
     }
     const [rows] = await pool.execute(sql, params);
@@ -873,9 +1170,11 @@ async function exportPayrollExcel(req, res) {
     const fs = require('fs');
 
     const [batches] = await pool.execute(
-      `SELECT payroll_batch_id, start_date, end_date, total_workers, total_amount, status,
-              version_number, is_finalized, scope_site_id, currency
-       FROM payrollbatches WHERE payroll_batch_id = ?`,
+      `SELECT pb.payroll_batch_id, pb.start_date, pb.end_date, pb.total_workers, pb.total_amount, pb.status,
+              pb.version_number, pb.is_finalized, pb.scope_site_id, pb.currency,
+              pb.batch_type, pb.scope_worker_id, pb.offcycle_reason, sw.full_name AS scope_worker_name
+       FROM payrollbatches pb LEFT JOIN workers sw ON sw.worker_id = pb.scope_worker_id
+       WHERE pb.payroll_batch_id = ?`,
       [batchId]
     );
     if (!batches.length) return res.status(404).json({ success: false, message: 'Batch not found.' });
@@ -1020,13 +1319,18 @@ async function exportPayrollExcel(req, res) {
     ];
 
     summarySheet.mergeCells('C1:I1');
-    summarySheet.getCell('C1').value = `Payroll Batch #${batchId} (v${batch.version_number}${batch.is_finalized ? ' - Finalized' : ''})`;
+    const isOffCycle = batch.batch_type === 'OffCycle';
+    summarySheet.getCell('C1').value = isOffCycle
+      ? `Off-cycle (individual) Payroll Batch #${batchId} (v${batch.version_number}${batch.is_finalized ? ' - Finalized' : ''}) - ${batch.scope_worker_name || ''}`
+      : `Payroll Batch #${batchId} (v${batch.version_number}${batch.is_finalized ? ' - Finalized' : ''})`;
     summarySheet.mergeCells('C2:I2');
     summarySheet.getCell('C2').value = `Period: ${dateOnly(batch.start_date)} - ${dateOnly(batch.end_date)}`;
     summarySheet.mergeCells('C3:I3');
     summarySheet.getCell('C3').value = `Currency: ${currencyLabel}${hoursFromSnapshot ? '' : ' — hours as currently recorded (batch generated before hour snapshots)'}`;
     summarySheet.mergeCells('C4:I4');
-    summarySheet.getCell('C4').value = `Total Workers Paid: ${totalWorkerCount}`;
+    summarySheet.getCell('C4').value = isOffCycle
+      ? `Total Workers Paid: ${totalWorkerCount}    Reason: ${batch.offcycle_reason || '-'}`
+      : `Total Workers Paid: ${totalWorkerCount}`;
     summarySheet.getCell('C4').font = { bold: true };
 
     summarySheet.getRow(1).height = 28;
@@ -1086,6 +1390,46 @@ async function exportPayrollExcel(req, res) {
       summarySheet.getCell(r, 9).border = thinBorder;      // Signature (I)
     }
     summarySheet.views = [{ state: 'frozen', ySplit: 5 }];
+
+    // ---- Off-cycle payroll already paid inside this period (Regular batch) ----
+    // Listed for information only: NOT part of the GRAND TOTAL above and no
+    // signature column (the worker signed the off-cycle batch's own sheet).
+    const offcyclePaid = await loadOffCyclePaidInPeriod(pool, batch);
+    if (offcyclePaid.length) {
+      summarySheet.addRow([]);
+      const titleRow = summarySheet.addRow({ number: 'Paid off-cycle in this period (not included in the GRAND TOTAL above)' });
+      summarySheet.mergeCells(titleRow.number, 3, titleRow.number, 9);
+      titleRow.font = { bold: true, color: { argb: 'FF8A4B00' } };
+      titleRow.height = 24;
+      const head = summarySheet.addRow({
+        number: 'No.', worker_id: 'Worker ID', worker_name: 'Worker Name', sites: 'Off-cycle batch / period',
+        net_salary: 'Amount paid', total_hours: 'Status', signature: 'Also in this batch',
+      });
+      head.font = { bold: true };
+      head.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF4E0' } };
+      head.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+      let offTotal = 0;
+      offcyclePaid.forEach((o, i) => {
+        const inThis = byWorker.has(o.worker_id);
+        const r = summarySheet.addRow({
+          number: i + 1,
+          worker_id: o.worker_unique_id,
+          worker_name: o.worker_name,
+          sites: `#${o.payroll_batch_id}: ${o.start_date} - ${o.end_date}`,
+          net_salary: o.amount,
+          total_hours: o.status === 'Paid' ? 'Paid' : (o.is_finalized ? 'Finalized, not paid' : 'Not finalized'),
+          signature: inThis ? 'Yes (remaining days)' : 'No (whole period)',
+        });
+        r.getCell(7).numFmt = moneyFmt;
+        offTotal += o.amount;
+      });
+      const offTotalRow = summarySheet.addRow({ worker_name: 'OFF-CYCLE TOTAL', net_salary: Math.round(offTotal * 100) / 100 });
+      offTotalRow.font = { bold: true };
+      offTotalRow.getCell(7).numFmt = moneyFmt;
+      const periodRow = summarySheet.addRow({ worker_name: 'PERIOD TOTAL (this batch + off-cycle)', net_salary: Math.round((grandTotalNet + offTotal) * 100) / 100 });
+      periodRow.font = { bold: true, color: { argb: 'FF1A2A6C' } };
+      periodRow.getCell(7).numFmt = moneyFmt;
+    }
 
     // ---------------- One worksheet per site (بدون أي تغيير) ----------------
     const usedNames = new Set(['Summary']);
@@ -1314,8 +1658,10 @@ function shapeArabicAware(str) {
     const [batches] = await pool.execute(
       `SELECT pb.payroll_batch_id, pb.start_date, pb.end_date, pb.total_workers, pb.total_amount, pb.status,
               pb.version_number, pb.is_finalized, pb.currency,
+              pb.batch_type, pb.scope_site_id, pb.scope_worker_id, pb.offcycle_reason, sw.full_name AS scope_worker_name,
               u.full_name AS generated_by, fu.full_name AS finalized_by
        FROM payrollbatches pb
+       LEFT JOIN workers sw ON sw.worker_id = pb.scope_worker_id
        JOIN users u ON u.user_id = pb.generated_by_user_id
        LEFT JOIN users fu ON fu.user_id = pb.finalized_by_user_id
        WHERE pb.payroll_batch_id = ?`,
@@ -1342,6 +1688,8 @@ function shapeArabicAware(str) {
       [batchId]
     );
     if (!rows.length) return res.status(404).json({ success: false, message: 'No payroll items found for this batch.' });
+    const isOffCycle = batch.batch_type === 'OffCycle';
+    const offcyclePaid = await loadOffCyclePaidInPeriod(pool, batch);
 
     const num = (v) => Number(v || 0);
     const fmt2 = (v) => num(v).toFixed(2);
@@ -1491,7 +1839,7 @@ for (const a of attRows) {
       if (hasLogo) doc.image(logoPath, VL, y, { width: 85, height: 38 });
 
       doc.font('Helvetica-Bold').fontSize(16).fillColor('black')
-        .text('WORKERS PAYROLL REPORT', VL, y + 2, { width: pageWidth, align: 'center' });
+        .text(isOffCycle ? 'WORKERS PAYROLL REPORT - OFF-CYCLE (INDIVIDUAL)' : 'WORKERS PAYROLL REPORT', VL, y + 2, { width: pageWidth, align: 'center' });
       doc.font('Helvetica').fontSize(9)
         .text('ASIK ENGINEERING CONSTRUCTION', VL, y + 22, { width: pageWidth, align: 'center' });
 
@@ -1507,6 +1855,14 @@ for (const a of attRows) {
       doc.fillColor(payColor).text(`Payment: ${statusText}`, VL + 170, y);
       doc.fillColor('black');
       y += 18;
+
+      if (isOffCycle) {
+        const reasonText = `Off-cycle reason: ${batch.offcycle_reason || '-'}`;
+        doc.font(fontNameFor(reasonText, false)).fontSize(9).fillColor('#8a4b00')
+          .text(shapeArabicAware(reasonText), VL, y, { width: pageWidth });
+        doc.fillColor('black');
+        y += 14;
+      }
 
       if (truncated) {
         doc.font('Helvetica-Oblique').fontSize(8).fillColor('#b21f1f')
@@ -1894,6 +2250,52 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
 doc.fillColor('black');
     y += 26;
 
+    // ---- Off-cycle payroll already paid inside this period (Regular batch) ----
+    // Information only: not part of GRAND TOTAL NET above.
+    if (offcyclePaid.length) {
+      const cols = [
+        { label: '#', w: 24 }, { label: 'ID', w: 60 }, { label: 'Worker', w: 170 },
+        { label: 'Off-cycle batch / period', w: 190 }, { label: 'Amount paid', w: 110 },
+        { label: 'Status', w: 110 }, { label: 'Also in this batch', w: 120 },
+      ];
+      const rowH = 15;
+      const needed = 18 + rowH * (offcyclePaid.length + 1) + 34;
+      if (y + Math.min(needed, 120) > VBOTTOM - 70) { doc.addPage(); y = VT; }
+      doc.font('Helvetica-Bold').fontSize(9).fillColor('#8a4b00')
+        .text('PAID OFF-CYCLE IN THIS PERIOD (not included in GRAND TOTAL NET above)', VL, y);
+      y += 14;
+      const drawRow = (cells, opts = {}) => {
+        let x = VL;
+        if (opts.fill) doc.rect(VL, y, cols.reduce((sum, c) => sum + c.w, 0), rowH).fill(opts.fill);
+        cols.forEach((c, i) => {
+          const text = String(cells[i] ?? '');
+          doc.font(fontNameFor(text, Boolean(opts.bold))).fontSize(8).fillColor('black')
+            .text(shapeArabicAware(text), x + 3, y + 4, { width: c.w - 6, lineBreak: false, ellipsis: true });
+          x += c.w;
+        });
+        y += rowH;
+      };
+      drawRow(cols.map((c) => c.label), { bold: true, fill: COLOR_SUMMARY_BG });
+      let offTotal = 0;
+      offcyclePaid.forEach((o, i) => {
+        if (y + rowH > VBOTTOM - 40) { doc.addPage(); y = VT; }
+        drawRow([
+          i + 1, o.worker_unique_id, o.worker_name, `#${o.payroll_batch_id}: ${o.start_date} to ${o.end_date}`,
+          Math.round(o.amount).toLocaleString('en-US'),
+          o.status === 'Paid' ? 'Paid' : (o.is_finalized ? 'Finalized, not paid' : 'Not finalized'),
+          netByWorker.has(o.worker_id) ? 'Yes (remaining days)' : 'No (whole period)',
+        ]);
+        offTotal += o.amount;
+      });
+      y += 4;
+      doc.font('Helvetica-Bold').fontSize(8).fillColor(COLOR_ACCENT)
+        .text(`OFF-CYCLE TOTAL: ${Math.round(offTotal).toLocaleString('en-US')} ${CURRENCY_CODE}     ` +
+          `PERIOD TOTAL (this batch + off-cycle): ${Math.round(num(grandTotalNet) + offTotal).toLocaleString('en-US')} ${CURRENCY_CODE}`,
+        VL, y, { lineBreak: false });
+      doc.fillColor('black');
+      y += 18;
+    }
+
     // ---- Signature footer ----
     function drawSignaturesFooter(currentY) {
       const footerY = currentY + 15; // مسافة بسيطة بعد الجدول
@@ -2052,6 +2454,111 @@ rows.forEach((row, index) => {
   }
 }
 
+// ============================================================
+// Off-cycle (urgent) payroll of ONE worker
+//
+// POST /api/admin/payroll/generate-offcycle
+//   { worker_id, start_date, end_date, reason, dry_run? }
+// dry_run = true runs every check and the full calculation, writes nothing,
+// and returns the amount (preview). Otherwise a Generated off-cycle batch is
+// created; it is finalized / marked paid / voided / superseded exactly like a
+// normal batch.
+// ============================================================
+async function generateOffCycleBatch(req, res) {
+  const body = req.body || {};
+  const workerId = Number(body.worker_id);
+  const dryRun = body.dry_run === true;
+  const reason = String(body.reason || '').trim();
+  if (!Number.isInteger(workerId) || workerId <= 0) {
+    return res.status(400).json({ success: false, message: 'Select the worker to pay.' });
+  }
+  if (!dryRun && reason.length < 5) {
+    return res.status(400).json({ success: false, message: 'A reason (at least 5 characters) is required for an off-cycle payroll.' });
+  }
+  try {
+    const [[worker]] = await pool.execute('SELECT worker_id FROM workers WHERE worker_id = ?', [workerId]);
+    if (!worker) return res.status(404).json({ success: false, message: 'Worker not found.' });
+  } catch (error) {
+    console.error('generateOffCycleBatch:', error);
+    return res.status(500).json({ success: false, message: 'Failed to load the worker.' });
+  }
+  req.body = { start_date: body.start_date, end_date: body.end_date };
+  req._offcycle = { workerId, reason: reason.slice(0, 500), dryRun };
+  return generatePayrollBatch(req, res);
+}
+
+// ============================================================
+// GET /api/admin/payroll/offcycle/candidates?start_date&end_date&q
+// Workers with attendance in the period, with how many records are approved
+// / still pending and whether they are already covered by a payroll batch.
+// Read-only; used by the off-cycle dialog.
+// ============================================================
+async function getOffCycleCandidates(req, res) {
+  const { start_date, end_date } = req.query || {};
+  if (!isValidDate(start_date) || !isValidDate(end_date) || end_date < start_date) {
+    return res.status(400).json({ success: false, message: 'Choose a valid period first.' });
+  }
+  try {
+    const params = [start_date, end_date];
+    let where = '';
+    const q = String(req.query.q || '').trim();
+    if (q) { where = ' AND (w.full_name LIKE ? OR w.worker_unique_id LIKE ?)'; params.push(`%${q}%`, `%${q}%`); }
+    const [rows] = await pool.execute(
+      `SELECT w.worker_id, w.full_name, w.worker_unique_id, w.status AS worker_status,
+              SUM(a.status = 'Approved') AS approved,
+              SUM(a.status IN ('Draft','Submitted','Rejected')) AS pending,
+              DATE_FORMAT(MIN(a.record_date), '%Y-%m-%d') AS first_date,
+              DATE_FORMAT(MAX(a.record_date), '%Y-%m-%d') AS last_date,
+              GROUP_CONCAT(DISTINCT s.site_name ORDER BY s.site_name SEPARATOR ', ') AS sites
+       FROM attendance a
+       JOIN workers w ON w.worker_id = a.worker_id
+       LEFT JOIN sites s ON s.site_id = a.site_id
+       WHERE a.record_date BETWEEN ? AND ?${where}
+       GROUP BY w.worker_id, w.full_name, w.worker_unique_id, w.status
+       ORDER BY w.full_name
+       LIMIT 100`,
+      params
+    );
+    const ids = rows.map((r) => r.worker_id);
+    const covered = new Map();
+    if (ids.length) {
+      const [off] = await pool.query(
+        `SELECT payroll_batch_id, scope_worker_id FROM payrollbatches
+         WHERE batch_type = 'OffCycle' AND status IN ${PAYROLL_LOCKING_STATUSES}
+           AND start_date <= ? AND end_date >= ? AND scope_worker_id IN (?)`,
+        [end_date, start_date, ids]
+      );
+      for (const o of off) covered.set(Number(o.scope_worker_id), o.payroll_batch_id);
+    }
+    const [regular] = await pool.execute(
+      `SELECT payroll_batch_id, scope_site_id FROM payrollbatches
+       WHERE batch_type = 'Regular' AND status IN ${PAYROLL_LOCKING_STATUSES}
+         AND start_date <= ? AND end_date >= ?`,
+      [end_date, start_date]
+    );
+    const regularAll = regular.find((r) => r.scope_site_id == null) || null;
+    return res.json({
+      success: true,
+      data: rows.map((r) => ({
+        worker_id: r.worker_id,
+        full_name: r.full_name,
+        worker_unique_id: r.worker_unique_id,
+        worker_status: r.worker_status,
+        approved: Number(r.approved || 0),
+        pending: Number(r.pending || 0),
+        first_date: r.first_date,
+        last_date: r.last_date,
+        sites: r.sites || '',
+        offcycle_batch_id: covered.get(Number(r.worker_id)) || null,
+      })),
+      regular_batch_in_period: regularAll ? regularAll.payroll_batch_id : null,
+    });
+  } catch (error) {
+    console.error('getOffCycleCandidates:', error);
+    return res.status(500).json({ success: false, message: 'Failed to load workers for this period.' });
+  }
+}
+
 module.exports = {
   generatePayrollBatch,
   finalizePayrollBatch,
@@ -2065,4 +2572,6 @@ module.exports = {
   exportPayrollExcel,
   exportPayrollPdf,           // ← جديد
   exportDailyAttendanceExcel,
+  generateOffCycleBatch,
+  getOffCycleCandidates,
 };

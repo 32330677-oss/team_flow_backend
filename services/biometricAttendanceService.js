@@ -316,7 +316,7 @@ async function workerIn(workerId, punchWall, userId, executor, override) {
   const siteIssue = await siteCheck(assignment.siteId, punchDate, executor);
   if (siteIssue) return outcome('NeedsReview', siteIssue.result, { message: siteIssue.message });
 
-  if (await findLockedWorkerBatch(executor, { siteId: assignment.siteId, date: punchDate })) {
+  if (await findLockedWorkerBatch(executor, { siteId: assignment.siteId, date: punchDate, workerId })) {
     return outcome('NeedsReview', 'payroll_period_finalized');
   }
 
@@ -459,7 +459,7 @@ async function applyOut(kind, ownerId, punchWall, executor, override) {
 
   // D-02: never change attendance inside a finalized/paid payroll period.
   const lockedBatch = kind === 'Worker'
-    ? await findLockedWorkerBatch(executor, { siteId: rec.site_id, date: sessionDate })
+    ? await findLockedWorkerBatch(executor, { siteId: rec.site_id, date: sessionDate, workerId: rec.worker_id })
     : await findLockedStaffBatch(executor, { date: sessionDate });
   if (lockedBatch) {
     if (override.useAsCheckout) throw serviceError(MESSAGES.payroll_period_finalized, 409);

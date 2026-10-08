@@ -111,7 +111,7 @@ async function editRecord(req, res, kind) {
     // D-02: finalized/paid payroll periods are locked for normal edits.
     const recDate = String(rec.record_date).slice(0, 10);
     const lockedBatch = isWorker
-      ? await findLockedWorkerBatch(connection, { siteId: rec.site_id, date: recDate })
+      ? await findLockedWorkerBatch(connection, { siteId: rec.site_id, date: recDate, workerId: rec.worker_id })
       : await findLockedStaffBatch(connection, { date: recDate });
     if (lockedBatch) throw new OpError(`${recDate} is inside a finalized/paid payroll period. Use "Correct attendance" instead.`, 409);
 

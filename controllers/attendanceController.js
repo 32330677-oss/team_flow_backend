@@ -2,7 +2,7 @@ const db = require('../config/db');
 const attendanceService = require('../services/attendanceService');
 const settingsCache = require('../services/settingsCache');
 const { activeOn } = require('../services/assignmentDates');
-const { assertWorkerDateEditable, findLockedWorkerBatch } = require('../services/payrollLock');
+const { assertWorkerDateEditable, findLockedWorkerBatch, offCycleLockedWorkerIds } = require('../services/payrollLock');
 const { getWorkerStatusOnDate, getActiveWorkerIdsOnDate } = require('../services/workerStatusService');
 const weekGate = require('../services/weekGate');
 const dailyGate = require('../services/dailyGate');
@@ -325,7 +325,7 @@ exports.checkIn = async (req, res) => {
     const connection = await db.getConnection();
     try {
         await connection.beginTransaction();
-        await assertWorkerDateEditable(connection, site_id, recordDate);   // D-02
+        await assertWorkerDateEditable(connection, site_id, recordDate, worker_id);   // D-02
         // Daily gate: earlier days of this site/shift must be finished first (Supervisor).
         await dailyGate.assertPreviousDaysDone(connection, req, { siteId: site_id, shiftType: shift_type, recordDate });
 
@@ -497,6 +497,10 @@ async function runBulkAttendance(req, res, mode) {
                 failedWorker = { worker_id: workerId, message: 'Worker is not active or is not assigned to this site/shift.' };
                 throw new AppError(`Bulk ${mode} aborted: worker ${workerId} is not active or not assigned to this site/shift. No changes were saved.`);
             }
+            // Off-cycle payroll: this worker alone may already be paid for the date.
+            failedWorker = { worker_id: workerId, message: 'Worker was already paid for this date (off-cycle payroll).' };
+            await assertWorkerDateEditable(connection, site_id, record_date, workerId);
+            failedWorker = null;
 
             if (mode === 'checkin') {
                 const openShiftId = await getAttendanceId(workerId, site_id, shift_type, record_date, connection, true);
@@ -670,6 +674,10 @@ exports.bulkEditTimes = async (req, res) => {
 
         for (const workerId of workerIds) {
             if (!validWorkers.has(workerId)) throw fail(workerId, 'Worker is not active or is not assigned to this site/shift.');
+            // Off-cycle payroll: this worker alone may already be paid for the date.
+            failedWorker = { worker_id: workerId, message: 'Worker was already paid for this date (off-cycle payroll).' };
+            await assertWorkerDateEditable(connection, site_id, record_date, workerId);
+            failedWorker = null;
 
             const [rows] = await connection.execute(
                 `SELECT attendance_id, attendance_status, check_in_time, check_out_time, status
@@ -798,6 +806,10 @@ async function runBulkSetStatus(req, res) {
                 failedWorker = { worker_id: workerId, message: 'Worker is not active or is not assigned to this site/shift.' };
                 throw new AppError(`Bulk status update aborted: worker ${workerId} is not active or not assigned to this site/shift. No changes were saved.`);
             }
+            // Off-cycle payroll: this worker alone may already be paid for the date.
+            failedWorker = { worker_id: workerId, message: 'Worker was already paid for this date (off-cycle payroll).' };
+            await assertWorkerDateEditable(connection, site_id, record_date, workerId);
+            failedWorker = null;
 
             const [rows] = await connection.execute(
                 `SELECT attendance_id, status, attendance_status, check_in_time, check_out_time
@@ -913,7 +925,7 @@ exports.setAttendanceStatus = async (req, res) => {
     const connection = await db.getConnection();
     try {
         await connection.beginTransaction();
-        await assertWorkerDateEditable(connection, site_id, record_date);   // D-02
+        await assertWorkerDateEditable(connection, site_id, record_date, worker_id);   // D-02
         await dailyGate.assertPreviousDaysDone(connection, req, { siteId: site_id, shiftType: shift_type, recordDate: record_date });
         const [existingRows] = await connection.execute(
             `SELECT attendance_id, status, attendance_status, check_in_time, check_out_time
@@ -997,7 +1009,7 @@ exports.editAttendanceTimes = async (req, res) => {
         if (record.status !== 'Draft') {
             throw new AppError('Only records still in Draft status can be edited here.');
         }
-        await assertWorkerDateEditable(connection, record.site_id, record.record_date);   // D-02
+        await assertWorkerDateEditable(connection, record.site_id, record.record_date, record.worker_id);   // D-02
         // ✅ FIX: مرّر shift_type الفعلي للسجل، وليس الافتراضي
         if (!(await verifySiteAction(req, record.site_id, record.shift_type))) {
             throw new AppError('You are not authorized to edit attendance for this site.');
@@ -1092,7 +1104,7 @@ exports.checkOut = async (req, res) => {
         const [[row]] = await connection.execute(
             'SELECT check_in_time, check_out_time, record_date FROM attendance WHERE attendance_id = ? FOR UPDATE', [attId]
         );
-        await assertWorkerDateEditable(connection, site_id, row.record_date);   // D-02
+        await assertWorkerDateEditable(connection, site_id, row.record_date, worker_id);   // D-02
         const checkInDate = parseAttendanceDate(row?.check_in_time);
         const checkOutDate = parseAttendanceDate(formattedCheckOut);
         if (!checkInDate || !checkOutDate || checkOutDate <= checkInDate) throw new AppError('Check-out time must be after check-in time.');
@@ -1199,7 +1211,7 @@ async function hasOverlappingLeave(executor, attendanceId, start, end, excludeLe
 // period is not locked. Audited; hours are recalculated when the shift is closed.
 async function loadDraftForLunch(connection, req, attendanceId) {
     const [rows] = await connection.execute(
-        `SELECT attendance_id, site_id, shift_type, status, check_in_time, check_out_time,
+        `SELECT attendance_id, worker_id, site_id, shift_type, status, check_in_time, check_out_time,
                 DATE_FORMAT(record_date, '%Y-%m-%d') AS record_date
          FROM attendance WHERE attendance_id = ? FOR UPDATE`,
         [attendanceId]
@@ -1210,7 +1222,7 @@ async function loadDraftForLunch(connection, req, attendanceId) {
         throw new AppError('You are not authorized to edit attendance for this site.', 403);
     }
     if (record.status !== 'Draft') throw new AppError('Lunch can only be changed while the day is not submitted (Draft).');
-    await assertWorkerDateEditable(connection, record.site_id, record.record_date);   // D-02
+    await assertWorkerDateEditable(connection, record.site_id, record.record_date, record.worker_id);   // D-02
     return record;
 }
 
@@ -1383,6 +1395,8 @@ exports.saveLunchBulk = async (req, res) => {
         try {
             await connection.beginTransaction();
             for (const record of recordsToUpdate) {
+                // Off-cycle payroll: this worker alone may already be paid for the date.
+                await assertWorkerDateEditable(connection, siteId, record.record_date, record.worker_id);
                 const override = safeOverrides[String(record.worker_id)] || safeOverrides[record.worker_id] || {};
                 const rawStart = override.start_time || default_start_time;
                 const rawEnd = override.end_time || default_end_time;
@@ -1578,7 +1592,10 @@ exports.submitDay = async (req, res) => {
             [siteId, shiftType, record_date, record_date, record_date, record_date]
         );
         const activeOnDay = await getActiveWorkerIdsOnDate(missingCandidates.map((r) => r.worker_id), record_date, connection);
-        const missingAttendance = missingCandidates.filter((r) => activeOnDay.has(r.worker_id));
+        // Off-cycle payroll: a worker already paid for this date can no longer get a
+        // record for it, so he is not "missing" (his pay for the date is settled).
+        const paidOffCycle = await offCycleLockedWorkerIds(connection, missingCandidates.map((r) => r.worker_id), record_date);
+        const missingAttendance = missingCandidates.filter((r) => activeOnDay.has(r.worker_id) && !paidOffCycle.has(Number(r.worker_id)));
         if (missingAttendance.length > 0) {
             await connection.rollback();
             transactionStarted = false;
@@ -1832,7 +1849,7 @@ exports.startLeave = async (req, res) => {
         const att_id = await getAttendanceId(worker_id, site_id, shift_type, record_date);
         if (!att_id) return res.status(404).json({ status: 'error', message: 'No active attendance record found!' });
         assertNotFutureTime(formattedStart, 'Break start time');
-        await assertWorkerDateEditable(db, site_id, record_date);   // D-02
+        await assertWorkerDateEditable(db, site_id, record_date, worker_id);   // D-02
 
         const [attendanceRows] = await db.execute(
             'SELECT check_in_time, check_out_time FROM attendance WHERE attendance_id = ? LIMIT 1',
@@ -1910,7 +1927,7 @@ exports.endLeave = async (req, res) => {
         const att_id = await getAttendanceId(worker_id, site_id, shift_type, record_date);
         if (!att_id) return res.status(404).json({ status: 'error', message: 'Attendance record not found!' });
         assertNotFutureTime(formattedEnd, 'Break end time');
-        await assertWorkerDateEditable(db, site_id, record_date);   // D-02
+        await assertWorkerDateEditable(db, site_id, record_date, worker_id);   // D-02
 
         const [openLeaves] = await db.execute(
             `SELECT leave_id, leave_start_time FROM attendanceleaveperiods
@@ -2006,7 +2023,7 @@ exports.setManagementLeaveHours = async (req, res) => {
         if (!['Draft', 'Submitted', 'Rejected'].includes(oldRecord.status)) {
             throw new AppError(`Management leave can only be set on Draft, Submitted or Rejected records (this record is ${oldRecord.status}). Use "Correct attendance" for approved records.`, 409);
         }
-        await assertWorkerDateEditable(connection, oldRecord.site_id, oldRecord.record_date);   // D-02
+        await assertWorkerDateEditable(connection, oldRecord.site_id, oldRecord.record_date, oldRecord.worker_id);   // D-02
 
         const hasCheckIn = Boolean(oldRecord.check_in_time);
         const hasCheckOut = Boolean(oldRecord.check_out_time);
@@ -2122,7 +2139,7 @@ exports.resubmitAttendance = async (req, res) => {
         if (!(await verifySiteAction(req, oldRecord.site_id, oldRecord.shift_type))) {
             throw new AppError('You are not authorized to resubmit attendance for this site.', 403);
         }
-        await assertWorkerDateEditable(connection, oldRecord.site_id, oldRecord.record_date);   // D-02
+        await assertWorkerDateEditable(connection, oldRecord.site_id, oldRecord.record_date, oldRecord.worker_id);   // D-02
         if (!(await verifyWorkerAssignedToSite(oldRecord.worker_id, oldRecord.site_id, oldRecord.shift_type, oldRecord.record_date, connection))) {
             throw new AppError('Worker was not active or not assigned to this site/shift on this date.');
         }

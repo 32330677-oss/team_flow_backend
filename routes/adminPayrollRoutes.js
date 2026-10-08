@@ -9,6 +9,9 @@ router.use(authMiddleware);
 router.use(restrictTo('Admin'));
 
 router.post('/generate', controller.generatePayrollBatch);
+// Off-cycle (urgent) payroll of one worker, and the worker picker for it.
+router.post('/generate-offcycle', controller.generateOffCycleBatch);
+router.get('/offcycle/candidates', controller.getOffCycleCandidates);
 router.get('/report', controller.getPayrollReport);
 router.get('/batch/:batchId', controller.getPayrollBatchDetails);
 router.get('/batch/:batchId/export.xlsx', controller.exportPayrollExcel);

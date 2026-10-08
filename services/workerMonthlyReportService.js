@@ -23,9 +23,9 @@ async function loadData(monthStart, monthEnd) {
     `SELECT payroll_batch_id,
             DATE_FORMAT(start_date, '%Y-%m-%d') AS start_date,
             DATE_FORMAT(end_date, '%Y-%m-%d') AS end_date,
-            scope_site_id, status, is_finalized, version_number
+            scope_site_id, status, is_finalized, version_number, batch_type, scope_worker_id
      FROM payrollbatches
-     WHERE status <> 'Superseded' AND start_date <= ? AND end_date >= ?`,
+     WHERE status IN ('Generated', 'Paid') AND start_date <= ? AND end_date >= ?`,
     [monthEnd, monthStart]
   );
 
@@ -110,9 +110,16 @@ function aggregate({ attendance, batches, payrolls, items, workers, rates = [] }
     ratesByWorker.get(r.worker_id).push(r);
   }
 
-  const covering = (date, siteId) => batches.filter((b) =>
-    b.start_date <= date && date <= b.end_date &&
-    (b.scope_site_id == null || Number(b.scope_site_id) === Number(siteId)));
+  // A worker's own off-cycle batch owns his dates: the Regular batch of the
+  // same period does not pay them, so it does not "cover" them a second time.
+  const covering = (date, siteId, workerId) => {
+    const own = batches.filter((b) => b.batch_type === 'OffCycle' &&
+      Number(b.scope_worker_id) === Number(workerId) && b.start_date <= date && date <= b.end_date);
+    if (own.length) return own;
+    return batches.filter((b) => b.batch_type !== 'OffCycle' &&
+      b.start_date <= date && date <= b.end_date &&
+      (b.scope_site_id == null || Number(b.scope_site_id) === Number(siteId)));
+  };
 
   for (const a of attendance) {
     const r = get(a.worker_id);
@@ -127,7 +134,7 @@ function aggregate({ attendance, batches, payrolls, items, workers, rates = [] }
     if (a.site_name) r.sites.add(a.site_name);
     if (Number(a.supports_shifts) === 1) r.shifts.add(a.shift_type);
 
-    const cov = covering(a.record_date, a.site_id);
+    const cov = covering(a.record_date, a.site_id, a.worker_id);
     if (cov.length === 0) r.uncovered += 1;
     else {
       r.covOt += ot;
@@ -297,4 +304,4 @@ async function generateWorkerMonthlyReportPdf(month, year, from, to) {
   return { buffer, fileName: `labor_hours_payroll_${spec.period.fileSuffix}.pdf` };
 }
 
-module.exports = { generateWorkerMonthlyReport, generateWorkerMonthlyReportPdf };
+module.exports = { generateWorkerMonthlyReport, generateWorkerMonthlyReportPdf, _internal: { loadData, aggregate } };

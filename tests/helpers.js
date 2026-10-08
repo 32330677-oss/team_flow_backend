@@ -27,6 +27,9 @@ function resetDatabase({ migrate = true } = {}) {
     for (const f of ['02_backup', '03_t2_consolidation', '04_ddl', '05_data']) {
       sh(`${MYSQL} ${DB_NAME} < migrations/2026_10_hardening/${f}.sql`);
     }
+    for (const f of ['02_backup', '03_ddl']) {
+      sh(`${MYSQL} ${DB_NAME} < migrations/2026_10_offcycle_payroll/${f}.sql`);
+    }
   }
 }
 

@@ -171,7 +171,7 @@ exports.reviewRecord = async (req, res) => {
         if (oldRecord.status !== 'Submitted') {
             throw new OpError('Record cannot be reviewed as it is not in pending status.', 409);
         }
-        await assertWorkerDateEditable(connection, oldRecord.site_id, oldRecord.record_date);   // D-02
+        await assertWorkerDateEditable(connection, oldRecord.site_id, oldRecord.record_date, oldRecord.worker_id);   // D-02
 
         let ackNote = null;
         if (status === 'Approved' && oldRecord.anomaly_code && !oldRecord.anomaly_ack_at) {

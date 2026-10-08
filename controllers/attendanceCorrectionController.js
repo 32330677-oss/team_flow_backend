@@ -183,7 +183,7 @@ exports.correctWorkerAttendance = async (req, res) => {
       if (!Number.isFinite(mgmt) || mgmt < 0 || mgmt > 24) throw new OpError('management_leave_hours must be between 0 and 24.');
     }
 
-    const locked = await findLockedWorkerBatch(connection, { siteId: original.site_id, date: recordDate });
+    const locked = await findLockedWorkerBatch(connection, { siteId: original.site_id, date: recordDate, workerId: original.worker_id });
     const lunch = status === 'Present' ? await resolveCorrectionLunch(connection, original, checkIn, checkOut, req.body) : null;
 
     // A status change replaces the old remark (e.g. "Absent - recorded by supervisor").
