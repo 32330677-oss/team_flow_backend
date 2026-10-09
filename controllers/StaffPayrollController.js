@@ -288,9 +288,12 @@ const addTo = (map, key, v) => map.set(key, (map.get(key) || 0) + v);
 
 // الجمعة: خارج requiredDays/requiredHours تمامًا. تُحسب أوفر تايم كامل
 // فقط إذا فيها سجل Present معتمد مع is_friday_worked = 1.
-for (const record of relevantRecords) {
+// Fix: Fridays are not in calendarDates, so relevantRecords never contains a
+// Friday. Read them from `records` and keep only Fridays inside an employment span.
+for (const record of records) {
     const recordDateStr = String(record.record_date).slice(0, 10);
-    if (isFriday(recordDateStr) && record.attendance_status === 'Present' && Number(record.is_friday_worked) === 1) {
+    if (isFriday(recordDateStr) && isDateInEmployment(recordDateStr)
+        && record.attendance_status === 'Present' && Number(record.is_friday_worked) === 1) {
         dailyOtEarned += Number(record.regular_hours || 0) + Number(record.overtime_hours || 0);
         presentDaysCount += 1;
     }

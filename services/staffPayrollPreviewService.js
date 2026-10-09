@@ -150,10 +150,12 @@ async function calculateStaff(staff, startDate, endDate, batchNonFridayDays, exe
   const addTo = (map, key, v) => map.set(key, (map.get(key) || 0) + v);
   const dayOutcome = new Map(); // date -> 'present' | 'paid_leave' | 'mgmt_paid' | 'unpaid'
 
-  // MIRROR: payroll iterates relevantRecords here (non-Friday dates only).
-  for (const record of relevantRecords) {
+  // MIRROR: confirmed Fridays inside an employment span count entirely as OT.
+  const isDateInEmployment = (ds) => employmentSpans.some((span) => ds >= span.start && ds <= span.end);
+  for (const record of records) {
     const ds = String(record.record_date).slice(0, 10);
-    if (isFriday(ds) && record.attendance_status === 'Present' && Number(record.is_friday_worked) === 1) {
+    if (isFriday(ds) && isDateInEmployment(ds)
+        && record.attendance_status === 'Present' && Number(record.is_friday_worked) === 1) {
       dailyOtEarned += Number(record.regular_hours || 0) + Number(record.overtime_hours || 0);
       presentDaysCount += 1;
     }
@@ -398,10 +400,6 @@ async function buildStaffPreliminaryReport(startDate, endDate) {
     }
     if (result.skipped === 'no_counted_records') {
       flags.push('No Submitted/Approved day in the period — payroll would skip this employee');
-    }
-    if (fridayHours > 0) {
-      attention.push({ uid, name, date: '', kind: 'Friday OT',
-        detail: `${round2(fridayHours)} confirmed Friday hour(s) are shown in the grid but the current payroll calculation does not add them to OT` });
     }
 
     rows.push({
