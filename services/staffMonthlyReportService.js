@@ -33,7 +33,7 @@ async function loadData(monthStart, monthEnd) {
   if (batches.length) {
     const r = await pool.query(
       `SELECT staff_payroll_batch_id, staff_id, prorated_base_salary, monthly_salary_snapshot,
-              salary_deduction_amount, net_salary, ot_earned_hours
+              salary_deduction_amount, net_salary, ot_earned_hours, adjustments_amount
        FROM staff_payroll WHERE staff_payroll_batch_id IN (?)`,
       [batches.map((b) => b.staff_payroll_batch_id)]
     );
@@ -121,6 +121,11 @@ function aggregate({ attendance, batches, payrolls, staff }, monthStart, monthEn
       r.flags.push(`Batch #${b.staff_payroll_batch_id} (${b.start_date} → ${b.end_date}) extends outside the selected period; pay covers the whole batch`);
     }
     if (!b.is_finalized) r.flags.push(`Batch #${b.staff_payroll_batch_id} is not finalized`);
+    // Retro pay: TOTAL = BASIC - DEDUCTION + adjustments for earlier paid months.
+    const adj = Number(p.adjustments_amount || 0);
+    if (Math.abs(adj) > 0.005) {
+      r.flags.push(`Batch #${b.staff_payroll_batch_id}: total includes payroll adjustment(s) for earlier paid months (${adj > 0 ? '+' : ''}${adj})`);
+    }
   }
 
   for (const r of rows.values()) {

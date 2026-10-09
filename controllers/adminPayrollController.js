@@ -1,5 +1,6 @@
 const pool = require('../config/db');
 const payrollAdjustments = require('../services/payrollAdjustmentService');
+const { BRAND } = require('../services/pdfBrand');
 const settingsCache = require('../services/settingsCache');
 const { activeOn } = require('../services/assignmentDates');
 const { businessToday } = require('../services/businessDate');
@@ -1846,13 +1847,13 @@ for (const a of attRows) {
     for (const r of rows) if (!netByWorker.has(r.worker_id)) netByWorker.set(r.worker_id, num(r.net_salary));
     for (const v of netByWorker.values()) grandTotalNet += v;
 
-    const COLOR_HEADER_BG = '#0b5b52';
-    const COLOR_HEADER_TEXT = '#ffffff';
-    const COLOR_ACCENT = '#0b5b52';
-    const COLOR_ZEBRA = '#f7faf9';
-    const COLOR_OT_TEXT = '#b26a00';
-    const COLOR_GRID = '#dfe3e8';
-    const COLOR_SUMMARY_BG = '#fff4e0';
+    const COLOR_HEADER_BG = BRAND.charcoal;
+    const COLOR_HEADER_TEXT = BRAND.white;
+    const COLOR_ACCENT = BRAND.goldDark;
+    const COLOR_ZEBRA = BRAND.goldPale;
+    const COLOR_OT_TEXT = BRAND.goldDark;
+    const COLOR_GRID = BRAND.grid;
+    const COLOR_SUMMARY_BG = BRAND.goldLight;
 
     // ---- Fit-to-width layout ----
     // Natural table width = fixed columns + one column per day + totals. When
@@ -1903,42 +1904,42 @@ for (const a of attRows) {
       let y = VT;
       if (hasLogo) doc.image(logoPath, VL, y, { width: 85, height: 38 });
 
-      doc.font('Helvetica-Bold').fontSize(16).fillColor('black')
+      doc.font('Helvetica-Bold').fontSize(16).fillColor(BRAND.ink)
         .text(isOffCycle ? 'WORKERS PAYROLL REPORT - OFF-CYCLE (INDIVIDUAL)' : 'WORKERS PAYROLL REPORT', VL, y + 2, { width: pageWidth, align: 'center' });
       doc.font('Helvetica').fontSize(9)
         .text('ASIK ENGINEERING CONSTRUCTION', VL, y + 22, { width: pageWidth, align: 'center' });
 
       y += 48;
-      doc.font('Helvetica-Bold').fontSize(10).fillColor('black');
+      doc.font('Helvetica-Bold').fontSize(10).fillColor(BRAND.ink);
       doc.text(`Batch #${batchId}  (Version ${batch.version_number || 1})`, VL, y);
       doc.text(`Period: ${String(batch.start_date).slice(0, 10)}   to   ${String(batch.end_date).slice(0, 10)}`,
         VL, y, { width: pageWidth, align: 'right' });
       y += 15;
 
-      const payColor = statusText === 'PAID' ? '#1a7a3c' : statusText === 'SUPERSEDED' ? '#888888' : COLOR_OT_TEXT;
-      doc.fillColor(isFinalized ? '#1a7a3c' : '#b21f1f').text(`Status: ${isFinalized ? 'FINALIZED' : 'NOT FINALIZED'}`, VL, y);
+      const payColor = statusText === 'PAID' ? BRAND.goldDark : statusText === 'SUPERSEDED' ? BRAND.muted : COLOR_OT_TEXT;
+      doc.fillColor(isFinalized ? BRAND.goldDark : BRAND.charcoalDark).text(`Status: ${isFinalized ? 'FINALIZED' : 'NOT FINALIZED'}`, VL, y);
       doc.fillColor(payColor).text(`Payment: ${statusText}`, VL + 170, y);
-      doc.fillColor('black');
+      doc.fillColor(BRAND.ink);
       y += 18;
 
       if (isOffCycle) {
         const reasonText = `Off-cycle reason: ${batch.offcycle_reason || '-'}`;
-        doc.font(fontNameFor(reasonText, false)).fontSize(9).fillColor('#8a4b00')
+        doc.font(fontNameFor(reasonText, false)).fontSize(9).fillColor(BRAND.goldDark)
           .text(shapeArabicAware(reasonText), VL, y, { width: pageWidth });
-        doc.fillColor('black');
+        doc.fillColor(BRAND.ink);
         y += 14;
       }
 
       if (truncated) {
-        doc.font('Helvetica-Oblique').fontSize(8).fillColor('#b21f1f')
+        doc.font('Helvetica-Oblique').fontSize(8).fillColor(BRAND.charcoalDark)
           .text(`Showing first ${MAX_DAYS} of ${dateList.length} days in this period (generate shorter periods for full detail).`, VL, y);
-        doc.fillColor('black');
+        doc.fillColor(BRAND.ink);
         y += 12;
       }
       if (!hoursFromSnapshot) {
-        doc.font('Helvetica-Oblique').fontSize(8).fillColor('#b21f1f')
+        doc.font('Helvetica-Oblique').fontSize(8).fillColor(BRAND.charcoalDark)
           .text('Daily hours shown as currently recorded (this batch was generated before hour snapshots). Amounts are the stored batch amounts.', VL, y);
-        doc.fillColor('black');
+        doc.fillColor(BRAND.ink);
         y += 12;
       }
 
@@ -1986,7 +1987,7 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
       lineBreak: false,
     });
 }
-      doc.fillColor('black');
+      doc.fillColor(BRAND.ink);
       y += 30;
       return y;
     }
@@ -2028,8 +2029,8 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
       for (const d of usedDates) {
         doc.rect(dx, y, dayColWidth, rowH1).fill(COLOR_HEADER_BG);
         doc.fillColor(COLOR_HEADER_TEXT).text(d.slice(5), dx, y + 3, { width: dayColWidth, align: 'center' });
-        doc.rect(dx, y + rowH1, dayColWidth / 2, rowH2).fill('#0e7568');
-        doc.rect(dx + dayColWidth / 2, y + rowH1, dayColWidth / 2, rowH2).fill('#b8792a');
+        doc.rect(dx, y + rowH1, dayColWidth / 2, rowH2).fill(BRAND.charcoal);
+        doc.rect(dx + dayColWidth / 2, y + rowH1, dayColWidth / 2, rowH2).fill(BRAND.gold);
         doc.fillColor(COLOR_HEADER_TEXT).fontSize(6)
           .text('R', dx, y + rowH1 + 4, { width: dayColWidth / 2, align: 'center' })
           .text('OT', dx + dayColWidth / 2, y + rowH1 + 4, { width: dayColWidth / 2, align: 'center' });
@@ -2044,7 +2045,7 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
         x += c.width;
       }
 
-      doc.fillColor('black');
+      doc.fillColor(BRAND.ink);
       return y + rowH1 + rowH2;
     }
 
@@ -2075,7 +2076,7 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
 
       if (opts.zebra) {
         doc.rect(x, y, tableTotalWidth, rowH).fill(COLOR_ZEBRA);
-        doc.fillColor('black');
+        doc.fillColor(BRAND.ink);
       }
       if (opts.mergedFixed) {
         // No. / ID / Name / Site are drawn once for the whole worker group.
@@ -2086,7 +2087,7 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
       doc.font(opts.bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(6.6);
       for (const c of [fixedCols[0], fixedCols[1]]) {
         doc.rect(x, y, c.width, rowH).stroke(COLOR_GRID);
-        doc.fillColor('black').text(String(item[c.key] ?? ''), x + 2, y + rowH / 2 - 4, {
+        doc.fillColor(BRAND.ink).text(String(item[c.key] ?? ''), x + 2, y + rowH / 2 - 4, {
           width: c.width - 4, align: 'center', lineBreak: false,
         });
         x += c.width;
@@ -2098,7 +2099,7 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
         doc.rect(x, y, c.width, rowH).stroke(COLOR_GRID);
         const raw = item.full_name || '';
         doc.font(fontNameFor(raw, opts.bold));
-        doc.fillColor('black').text(shapeArabicAware(raw), x + 3, y + 3, {
+        doc.fillColor(BRAND.ink).text(shapeArabicAware(raw), x + 3, y + 3, {
           width: c.width - 6,
           align: isArabicText(raw) ? 'right' : 'left',
           lineBreak: true,
@@ -2112,7 +2113,7 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
         doc.rect(x, y, c.width, rowH).stroke(COLOR_GRID);
         const raw = item.site_name || '';
         doc.font(fontNameFor(raw, opts.bold));
-        doc.fillColor('black').text(shapeArabicAware(raw), x + 3, y + 3, {
+        doc.fillColor(BRAND.ink).text(shapeArabicAware(raw), x + 3, y + 3, {
           width: c.width - 6,
           align: isArabicText(raw) ? 'right' : 'left',
           lineBreak: true,
@@ -2132,10 +2133,10 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
         }
         const daily = item.dailyByDate[d] || { reg: 0, ot: 0 };
         doc.rect(x, y, half, rowH).stroke(COLOR_GRID);
-        doc.fillColor('black').text(daily.reg > 0 ? hoursCell(daily.reg) : '-', x, y + rowH / 2 - 4, { width: half, align: 'center', lineBreak: false });
+        doc.fillColor(BRAND.ink).text(daily.reg > 0 ? hoursCell(daily.reg) : '-', x, y + rowH / 2 - 4, { width: half, align: 'center', lineBreak: false });
         x += half;
         doc.rect(x, y, half, rowH).stroke(COLOR_GRID);
-        doc.fillColor(daily.ot > 0 ? COLOR_OT_TEXT : 'black')
+        doc.fillColor(daily.ot > 0 ? COLOR_OT_TEXT : BRAND.ink)
           .text(daily.ot > 0 ? hoursCell(daily.ot) : '-', x, y + rowH / 2 - 4, { width: half, align: 'center', lineBreak: false });
         x += half;
       }
@@ -2144,7 +2145,7 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
       doc.font(opts.bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(6.6);
       for (const c of [totalsCols[0], totalsCols[1]]) {
         doc.rect(x, y, c.width, rowH).stroke(COLOR_GRID);
-        doc.fillColor(c.key === 'total_ot' ? COLOR_OT_TEXT : 'black')
+        doc.fillColor(c.key === 'total_ot' ? COLOR_OT_TEXT : BRAND.ink)
           .text(String(item[c.key] ?? ''), x + 2, y + rowH / 2 - 4, { width: c.width - 4, align: 'center', lineBreak: false });
         x += c.width;
       }
@@ -2152,17 +2153,17 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
         doc.rect(x, y, c.width, rowH).stroke(COLOR_GRID);
         const raw = String(item[c.key] ?? '');
         doc.font(fontNameFor(raw, opts.bold));
-        doc.fillColor(c.key === 'net' ? COLOR_ACCENT : 'black')
+        doc.fillColor(c.key === 'net' ? COLOR_ACCENT : BRAND.ink)
           .text(shapeArabicAware(raw), x + 3, y + 3, { width: c.width - 6, align: 'center', lineBreak: true });
         if (c.key === 'daily_wage' && item.period) {
           const rh = doc.heightOfString(shapeArabicAware(raw), { width: c.width - 6 });
-          doc.font('Helvetica').fontSize(5.8).fillColor('#5b6770')
+          doc.font('Helvetica').fontSize(5.8).fillColor(BRAND.muted)
             .text(item.period, x + 3, y + 3 + rh, { width: c.width - 6, align: 'center', lineBreak: false });
           doc.fontSize(6.6);
         }
         x += c.width;
       }
-      doc.fillColor('black');
+      doc.fillColor(BRAND.ink);
 
       return y + rowH;
     }
@@ -2196,16 +2197,16 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
         if (c.key === 'full_name' || c.key === 'site_name') {
           doc.font(fontNameFor(raw));
           const th = doc.heightOfString(shapeArabicAware(raw), { width: c.width - 6 });
-          doc.fillColor('black').text(shapeArabicAware(raw), x + 3, y + Math.max(3, (h - th) / 2), {
+          doc.fillColor(BRAND.ink).text(shapeArabicAware(raw), x + 3, y + Math.max(3, (h - th) / 2), {
             width: c.width - 6, align: isArabicText(raw) ? 'right' : 'left', lineBreak: true,
           });
           doc.font('Helvetica');
         } else {
-          doc.fillColor('black').text(raw, x + 2, y + h / 2 - 4, { width: c.width - 4, align: 'center', lineBreak: false });
+          doc.fillColor(BRAND.ink).text(raw, x + 2, y + h / 2 - 4, { width: c.width - 4, align: 'center', lineBreak: false });
         }
         x += c.width;
       }
-      doc.fillColor('black');
+      doc.fillColor(BRAND.ink);
     }
 
     groups.forEach((g, gi) => {
@@ -2312,7 +2313,7 @@ if (hasArabicFont && CURRENCY_CODE === 'SYP') {
     });
 }
 
-doc.fillColor('black');
+doc.fillColor(BRAND.ink);
     y += 26;
 
     // ---- Off-cycle payroll already paid inside this period (Regular batch) ----
@@ -2326,7 +2327,7 @@ doc.fillColor('black');
       const rowH = 15;
       const needed = 18 + rowH * (offcyclePaid.length + 1) + 34;
       if (y + Math.min(needed, 120) > VBOTTOM - 70) { doc.addPage(); y = VT; }
-      doc.font('Helvetica-Bold').fontSize(9).fillColor('#8a4b00')
+      doc.font('Helvetica-Bold').fontSize(9).fillColor(BRAND.goldDark)
         .text('PAID OFF-CYCLE IN THIS PERIOD (not included in GRAND TOTAL NET above)', VL, y);
       y += 14;
       const drawRow = (cells, opts = {}) => {
@@ -2334,7 +2335,7 @@ doc.fillColor('black');
         if (opts.fill) doc.rect(VL, y, cols.reduce((sum, c) => sum + c.w, 0), rowH).fill(opts.fill);
         cols.forEach((c, i) => {
           const text = String(cells[i] ?? '');
-          doc.font(fontNameFor(text, Boolean(opts.bold))).fontSize(8).fillColor('black')
+          doc.font(fontNameFor(text, Boolean(opts.bold))).fontSize(8).fillColor(BRAND.ink)
             .text(shapeArabicAware(text), x + 3, y + 4, { width: c.w - 6, lineBreak: false, ellipsis: true });
           x += c.w;
         });
@@ -2357,7 +2358,7 @@ doc.fillColor('black');
         .text(`OFF-CYCLE TOTAL: ${Math.round(offTotal).toLocaleString('en-US')} ${CURRENCY_CODE}     ` +
           `PERIOD TOTAL (this batch + off-cycle): ${Math.round(num(grandTotalNet) + offTotal).toLocaleString('en-US')} ${CURRENCY_CODE}`,
         VL, y, { lineBreak: false });
-      doc.fillColor('black');
+      doc.fillColor(BRAND.ink);
       y += 18;
     }
 
@@ -2380,7 +2381,7 @@ doc.fillColor('black');
         if (opts.fill) doc.rect(VL, y, cols.reduce((sum, c) => sum + c.w, 0), rowH).fill(opts.fill);
         cols.forEach((c, i) => {
           const text = String(cells[i] ?? '');
-          doc.font(fontNameFor(text, Boolean(opts.bold))).fontSize(8).fillColor('black')
+          doc.font(fontNameFor(text, Boolean(opts.bold))).fontSize(8).fillColor(BRAND.ink)
             .text(shapeArabicAware(text), x + 3, y + 4, { width: c.w - 6, lineBreak: false, ellipsis: true });
           x += c.w;
         });
@@ -2398,7 +2399,7 @@ doc.fillColor('black');
       y += 4;
       doc.font('Helvetica-Bold').fontSize(8).fillColor(COLOR_ACCENT)
         .text(`TOTAL ADJUSTMENTS: ${adjTotal > 0 ? '+' : ''}${Math.round(adjTotal).toLocaleString('en-US')} ${CURRENCY_CODE}`, VL, y, { lineBreak: false });
-      doc.fillColor('black');
+      doc.fillColor(BRAND.ink);
       y += 18;
     }
 

@@ -18,12 +18,12 @@ const P = {
   charcoal: '#4B4A4D', charcoalDark: '#2F2E31', ink: '#2B2A2E', muted: '#6E6D72', white: '#FFFFFF',
   gold: '#CBAB5A', goldDark: '#8A6A1F', goldLight: '#F4ECD6', goldPale: '#FBF8EF',
   grey: '#F1F1F2', greyMid: '#E2E1E3', grid: '#D6D4D0', zebra: '#FAFAFA', friday: '#EDECEE',
-  red: '#B3261E', redLight: '#FCE4E2', pending: '#D97706',
+  red: '#2F2E31', redLight: '#E2E1E3', pending: '#8A6A1F', // logo palette only
 };
 
 const TONES = {
-  A: ['#FDE2E1', '#9C0006'], 'A*': ['#FCE4D6', '#843C0C'], S: ['#E4DFEC', '#5B3E8A'],
-  V: ['#E2F0D9', '#375623'], H: ['#DDEBF7', '#1F4E79'],
+  A: ['#4B4A4D', '#FFFFFF'], 'A*': ['#E3CF9C', '#2F2E31'], S: ['#E2E1E3', '#2F2E31'],
+  V: ['#FBF8EF', '#8A6A1F'], H: ['#F4ECD6', '#2F2E31'],
   missing: [P.redLight, P.red], draft: [P.greyMid, P.red], rejected: [P.greyMid, P.red],
   friq: [P.goldLight, P.goldDark], ot: [P.goldLight, P.goldDark],
 };
@@ -259,7 +259,7 @@ function renderPreliminaryReportPdf(report) {
           if (c.k === 'money') { bg = P.goldLight; fg = P.goldDark; }
           else if (c.k === 'net') { bg = P.gold; fg = P.white; }
           else if (c.k === 'abs') { bg = P.redLight; fg = P.red; }
-          else if (c.k === 'pend') { bg = '#FDEBD3'; fg = '#9A4F00'; }
+          else if (c.k === 'pend') { bg = P.goldLight; fg = P.goldDark; }
           else { bg = P.greyMid; }
         }
         rect(c.x, y, c.cw, H1 + H2, bg);
@@ -310,7 +310,7 @@ function renderPreliminaryReportPdf(report) {
           } else if (e.kind === 'na') {
             fill = P.greyMid;
           } else if (e.kind === 'future') {
-            fill = '#F7F7F8';
+            fill = P.zebra;
           }
           rect(c.x, y, c.cw, RH, fill);
           strokeRect(c.x, y, c.cw, RH);
@@ -331,7 +331,7 @@ function renderPreliminaryReportPdf(report) {
         } else {
           s = v === '' ? '' : String(v);
           if (c.k === 'abs' && Number(v) > 0) { color = P.red; bold = true; }
-          if (c.k === 'pend' && Number(v) > 0) { color = '#9A4F00'; bold = true; bg = '#FEF5EA'; }
+          if (c.k === 'pend' && Number(v) > 0) { color = P.goldDark; bold = true; bg = P.goldPale; }
         }
         rect(c.x, y, c.cw, RH, bg);
         strokeRect(c.x, y, c.cw, RH);

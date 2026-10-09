@@ -33,7 +33,7 @@ async function loadData(monthStart, monthEnd) {
   let items = [];
   if (batches.length) {
     const r1 = await pool.query(
-      `SELECT payroll_id, payroll_batch_id, worker_id, net_salary
+      `SELECT payroll_id, payroll_batch_id, worker_id, net_salary, adjustments_amount
        FROM payroll WHERE payroll_batch_id IN (?)`,
       [batches.map((b) => b.payroll_batch_id)]
     );
@@ -160,7 +160,13 @@ function aggregate({ attendance, batches, payrolls, items, workers, rates = [] }
     r.total += Number(p.net_salary || 0);
     r.payOt += its.reduce((s, i) => s + Number(i.overtime_hours_worked || 0), 0);
 
-    if (Math.abs(Number(p.net_salary || 0) - (base + otPay)) > 0.01) {
+    // Retro pay: payroll adjustments for earlier paid periods are part of the
+    // net, on purpose. They are listed, and not reported as a mismatch.
+    const adj = Number(p.adjustments_amount || 0);
+    if (Math.abs(adj) > 0.005) {
+      r.flags.push(`Batch #${b.payroll_batch_id}: total includes payroll adjustment(s) for earlier paid periods (${adj > 0 ? '+' : ''}${adj})`);
+    }
+    if (Math.abs(Number(p.net_salary || 0) - (base + otPay + adj)) > 0.01) {
       r.flags.push(`Batch #${b.payroll_batch_id}: net salary differs from base + OT pay (bonus/penalty/deduction present)`);
     }
     if (b.start_date < monthStart || b.end_date > monthEnd) {

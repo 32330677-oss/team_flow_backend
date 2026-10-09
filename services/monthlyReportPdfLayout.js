@@ -5,7 +5,8 @@
 const path = require('path');
 const fs = require('fs');
 const PDFDocument = require('pdfkit');
-const { TONES, C } = require('./monthlyReportExcelLayout');
+// PDF uses the logo palette (the Excel report keeps its own colours).
+const { BRAND, BRAND_TONES: TONES } = require('./pdfBrand');
 
 const COMPANY_NAME = 'ASIK ENGINEERING CONSTRUCTION';
 const LOGO_PATH = path.join(__dirname, '../assets/logo.png');
@@ -13,11 +14,11 @@ const ARABIC_FONT_PATH = path.join(__dirname, '../assets/fonts/NotoNaskhArabic-R
 
 const hex = (argb) => `#${String(argb).slice(-6)}`;
 const P = {
-  navy: hex(C.navy), navy2: hex(C.navy2), ink: hex(C.ink), muted: hex(C.muted), white: '#FFFFFF',
-  headLight: hex(C.headLight), zebra: hex(C.zebra), grid: hex(C.grid), friday: hex(C.friday),
-  hoursHead: hex(C.hoursHead), moneyHead: hex(C.moneyHead), moneyInk: hex(C.moneyInk),
-  totalCell: hex(C.totalCell), totalsRow: hex(C.totalsRow), amber: hex(C.amber), amberInk: hex(C.amberInk),
-  okInk: hex(C.okInk),
+  navy: BRAND.charcoal, navy2: BRAND.charcoal2, ink: BRAND.ink, muted: BRAND.muted, white: BRAND.white,
+  headLight: BRAND.goldLight, zebra: BRAND.zebra, grid: BRAND.grid, friday: BRAND.friday,
+  hoursHead: BRAND.greyMid, moneyHead: BRAND.goldLight, moneyInk: BRAND.goldDark,
+  totalCell: BRAND.goldPale, totalsRow: BRAND.goldMid, amber: BRAND.goldLight, amberInk: BRAND.goldDark,
+  okInk: BRAND.goldDark,
 };
 
 const isArabic = (s) => /[؀-ۿ]/.test(String(s || ''));
@@ -282,7 +283,7 @@ function renderReportPdf(spec) {
       doc.font('Helvetica-Bold').fontSize(8).fillColor(P.navy).text('LEGEND', L, y + 3);
       let lx = L + 50;
       spec.legend.forEach((l) => {
-        const t = l.tone === 'friday' ? { fill: C.friday, font: C.navy } : TONES[l.tone];
+        const t = l.tone === 'friday' ? { fill: BRAND.friday, font: BRAND.charcoal } : TONES[l.tone];
         rect(lx, y, 22, 13, hex(t.fill));
         strokeRect(lx, y, 22, 13);
         text(l.code, lx, y, 22, 13, { size: 7, bold: true, color: hex(t.font) });
