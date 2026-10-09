@@ -1,6 +1,7 @@
 // tests/helpers.js — test harness (local MySQL 8 only, never production).
 const { execSync } = require('child_process');
 const path = require('path');
+const fs = require('fs');
 const jwt = require('jsonwebtoken');
 
 const DB_NAME = process.env.TEST_DB_NAME || 'team_flow_test';
@@ -27,9 +28,16 @@ function resetDatabase({ migrate = true } = {}) {
     for (const f of ['02_backup', '03_t2_consolidation', '04_ddl', '05_data']) {
       sh(`${MYSQL} ${DB_NAME} < migrations/2026_10_hardening/${f}.sql`);
     }
-    for (const f of ['02_backup', '03_ddl']) {
-      sh(`${MYSQL} ${DB_NAME} < migrations/2026_10_offcycle_payroll/${f}.sql`);
+    const offcycleDir = path.join(ROOT, 'migrations', '2026_10_offcycle_payroll');
+    if (fs.existsSync(offcycleDir)) {
+      for (const f of ['02_backup', '03_ddl']) {
+        sh(`${MYSQL} ${DB_NAME} < migrations/2026_10_offcycle_payroll/${f}.sql`);
+      }
+    } else {
+      // The off-cycle migration folder is not committed; use the test-only patch.
+      sh(`${MYSQL} ${DB_NAME} < tests/schema/offcycle_test_patch.sql`);
     }
+    sh(`${MYSQL} ${DB_NAME} < migrations/2026_10_recycle_bin/01_ddl.sql`);
   }
 }
 

@@ -293,6 +293,8 @@ async function buildStaffPreliminaryReport(startDate, endDate) {
      LEFT JOIN sites s ON s.site_id = sm.site_id
      WHERE COALESCE(sm.first_hire_date, sm.hire_date) IS NOT NULL
        AND COALESCE(sm.first_hire_date, sm.hire_date) <= ?
+       AND NOT EXISTS (SELECT 1 FROM entity_deletion_holds h
+                       WHERE h.entity_type = 'Staff' AND h.entity_id = sm.staff_id AND h.released_at IS NULL)
      ORDER BY sm.full_name`,
     [endDate]
   );

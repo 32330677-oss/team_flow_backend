@@ -85,7 +85,12 @@ async function generateStaffPayrollBatch(req, res) {
                     hire_date, first_hire_date, termination_date, status
              FROM staff_members
              WHERE COALESCE(first_hire_date, hire_date) IS NOT NULL
-               AND COALESCE(first_hire_date, hire_date) <= ?`,
+               AND COALESCE(first_hire_date, hire_date) <= ?
+               -- Recycle bin: a staff member on deletion hold is excluded from
+               -- new payroll (used to supersede a finalized batch before delete).
+               AND NOT EXISTS (SELECT 1 FROM entity_deletion_holds h
+                               WHERE h.entity_type = 'Staff' AND h.entity_id = staff_members.staff_id
+                                 AND h.released_at IS NULL)`,
             [end_date]
         );
         if (!staffList.length) {

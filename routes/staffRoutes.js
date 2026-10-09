@@ -7,6 +7,7 @@ const staffAssignmentController = require('../controllers/staffAssignmentControl
 // 1. استيراد الـ Controller الخاص بالمشرفين في الأعلى مع البقية
 const staffSupervisorAssignmentController = require('../controllers/staffSupervisorAssignmentController');
 
+const recycleBinController = require('../controllers/recycleBinController');
 const authMiddleware = require('../middleware/authMiddleware');
 const restrictTo = require('../middleware/roleMiddleware');
 
@@ -16,6 +17,12 @@ router.get('/', restrictTo('Admin'), staffController.getAllStaff);
 router.post('/', restrictTo('Admin'), staffController.createStaff);
 router.put('/:id', restrictTo('Admin'), staffController.updateStaff);
 router.get('/:id/compensation-history', restrictTo('Admin'), staffController.getCompensationHistory);
+
+// Recycle bin: safe delete with a 30-day undo window (Admin only).
+router.get('/:id/deletion-check', restrictTo('Admin'), recycleBinController.staff.check);
+router.post('/:id/deletion-hold', restrictTo('Admin'), recycleBinController.staff.hold);
+router.delete('/:id/deletion-hold', restrictTo('Admin'), recycleBinController.staff.releaseHold);
+router.delete('/:id', restrictTo('Admin'), recycleBinController.staff.remove);
 
 // NEW — lifecycle tracking
 router.patch('/:id/lifecycle', restrictTo('Admin'), staffLifecycleController.changeStatus);

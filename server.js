@@ -59,6 +59,7 @@ app.use('/api/staff-attendance', staffAttendanceRoutes);
 app.use('/api/staff-payroll', staffPayrollRoutes);
 app.use('/api/staff-overtime', staffOvertimeRoutes);
 app.use('/api/main-dashboard', mainDashboardRoutes);
+app.use('/api/recycle-bin', require('./routes/recycleBinRoutes'));
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });
 });
@@ -76,10 +77,19 @@ async function start() {
     try {
         await assertSemanticsMarker(db);
         await assertOffCycleSchema(db);   // migrations/2026_10_offcycle_payroll
+        await require('./services/recycleBinService').assertRecycleBinSchema(db); // migrations/2026_10_recycle_bin
     } catch (error) {
         console.error(`FATAL: ${error.message}`);
         process.exit(1);
     }
+    // Recycle bin: purge entries whose 30-day undo window ended. Runs at start
+    // and every 6 hours; safe with several instances (named lock in the service).
+    const { purgeExpired } = require('./services/recycleBinService');
+    const runPurge = () => purgeExpired()
+        .then((n) => { if (n > 0) console.log(`Recycle bin: ${n} expired entr${n === 1 ? 'y' : 'ies'} purged.`); })
+        .catch((e) => console.error('Recycle bin purge failed:', e.message));
+    runPurge();
+    setInterval(runPurge, 6 * 60 * 60 * 1000).unref();
     return app.listen(PORT, '0.0.0.0', () => {
         console.log(`Server is running on port ${PORT}`);
     });
