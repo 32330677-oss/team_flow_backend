@@ -61,6 +61,8 @@ const ENTITIES = {
     codeColumn: 'staff_unique_id',
     nameColumn: 'full_name',
     tables: [
+      // Cancelled payroll adjustments only (open ones block the delete, see deletionCheck).
+      { table: 'payroll_adjustments', pk: 'adjustment_id', where: "person_type = 'Staff' AND person_id = ?" },
       { table: 'attendance_corrections_log', pk: 'correction_id', where: "record_table = 'staff_attendance' AND person_id = ?" },
       { table: 'staff_overtime_compensations', pk: 'compensation_id', where: 'staff_id = ?' },
       { table: 'staff_monthly_overtime_ledger', pk: 'ledger_id', where: 'staff_id = ?' },
@@ -176,6 +178,20 @@ async function deletionCheck(executor, type, rawId, { lock = false } = {}) {
       });
     }
     // Voided / Superseded: history only, the lines go to the bin.
+  }
+
+  // 1b. Payroll adjustments still to be paid / deducted (money owed).
+  {
+    const adjTables = await existingTables(executor, ['payroll_adjustments']);
+    if (adjTables.has('payroll_adjustments')) {
+      const [[pa]] = await executor.execute(
+        `SELECT COUNT(*) AS c FROM payroll_adjustments
+         WHERE person_type = ? AND person_id = ? AND status IN ('AwaitingConfirmation','Pending','Included','Applied')`, [type, id]);
+      if (Number(pa.c) > 0) {
+        blockers.push({ code: 'PAYROLL_ADJUSTMENTS', action: null,
+          message: `This person has ${pa.c} payroll adjustment(s) not cancelled (money owed or paid). Cancel the pending ones in Payroll adjustments first; paid ones keep the person.` });
+      }
+    }
   }
 
   // 2. Biometric data (not in use yet; handled when biometric goes live).

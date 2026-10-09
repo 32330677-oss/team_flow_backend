@@ -1,4 +1,5 @@
 const pool = require('../config/db');
+const payrollAdjustments = require('../services/payrollAdjustmentService');
 const { countNonFridayDays, listNonFridayDates, isFriday, round2 } = require('../services/staffAttendanceService');
 const { getActiveSpansOverlapping } = require('../services/staffEmploymentService');
 const { buildStaffCompensationTimeline } = require('../services/staffCompensationService');
@@ -128,6 +129,13 @@ const [batchResult] = await connection.execute(
         const batchId = batchResult.insertId;
         let totalStaff = 0;
         let totalAmount = 0;
+        // Retro pay: Pending staff adjustments are carried by this batch. What
+        // the batch being superseded carried goes back to Pending first.
+        if (supersede) await payrollAdjustments.releaseBatches(connection, 'Staff', [supersede.batchId]);
+        const adjByStaff = await payrollAdjustments.loadPendingForPeople(
+            connection, 'Staff', staffList.map((st) => st.staff_id), staffCurrency);
+        const includedAdjustmentIds = [];
+        const adjustmentWarnings = [];
         const pendingAttendance = [];
         // D3: dates whose historical salary / hours / paid leave types cannot be
         // reconstructed reliably (never silently replaced by today's profile).
@@ -405,8 +413,22 @@ if (segments.length === 1) {
     const uncoveredShare = workedDayShortfall > 0 ? uncoveredWorked / workedDayShortfall : 0;
     salaryDeduction = money(absenceAmount + workedAmount * uncoveredShare);
 }
-const netSalary        = money(proratedBaseSalary - salaryDeduction);
+const calculatedNet    = money(proratedBaseSalary - salaryDeduction);
 const hourlyRate       = money(hourlyRateRaw); // هاد بس للعرض/التخزين بالتقرير
+// Retro pay: net = this period's salary + pending adjustments (never below 0).
+let adjustmentsAmount = 0;
+let adjustmentIdsForStaff = [];
+const pendingAdj = adjByStaff.get(Number(staff.staff_id));
+if (pendingAdj) {
+    if (money(calculatedNet + pendingAdj.total) >= 0) {
+        adjustmentsAmount = pendingAdj.total;
+        adjustmentIdsForStaff = pendingAdj.ids;
+    } else {
+        adjustmentWarnings.push({ staff_id: staff.staff_id, pending_total: pendingAdj.total,
+            message: 'Pending deductions exceed this pay: they stay Pending for a later batch.' });
+    }
+}
+const netSalary        = money(calculatedNet + adjustmentsAmount);
 
             const [payrollResult] = await connection.execute(
                 `INSERT INTO staff_payroll
@@ -415,18 +437,19 @@ const hourlyRate       = money(hourlyRateRaw); // هاد بس للعرض/الت�
                      overtime_hours, daily_rate, net_salary,
                      required_hours, ot_earned_hours, ot_used_hours, ot_remaining_hours,
                      shortage_hours, salary_deduction_amount,
-                     employed_from, employed_to, prorated_base_salary, period_required_hours)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                     employed_from, employed_to, prorated_base_salary, period_required_hours, adjustments_amount)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                              [
                     batchId, staff.staff_id, staff.monthly_salary, requiredDays,
                     presentDaysCount, paidLeaveDays, managementPaidDays, unpaidAbsenceDays,
                     otEarnedHours, hourlyRate, netSalary,
                     requiredHours, otEarnedHours, otUsedHours, otRemainingHours,
                     shortageHours, salaryDeduction,
-                    effectiveStart, effectiveEnd, proratedBaseSalary, periodRequiredHours,
+                    effectiveStart, effectiveEnd, proratedBaseSalary, periodRequiredHours, adjustmentsAmount.toFixed(2),
                 ]
             );
             if (!payrollResult.insertId) continue;
+            includedAdjustmentIds.push(...adjustmentIdsForStaff);
             if (segmentDetails) {
                 // The row's single monthly_salary_snapshot (the last segment) cannot
                 // describe every date; the full split is kept in the audit log and
@@ -504,6 +527,7 @@ const hourlyRate       = money(hourlyRateRaw); // هاد بس للعرض/الت�
             `UPDATE staff_payroll_batches SET total_staff = ?, total_amount = ? WHERE staff_payroll_batch_id = ?`,
             [totalStaff, totalAmount, batchId]
         );
+        await payrollAdjustments.markIncluded(connection, includedAdjustmentIds, batchId);
 
         if (supersede) {
             // Verified replacement exists -> supersede the old batch (same transaction).
@@ -518,6 +542,7 @@ const hourlyRate       = money(hourlyRateRaw); // هاد بس للعرض/الت�
                  VALUES ('staff_payroll_batches', ?, 'SUPERSEDED', ?, ?, ?)`,
                 [supersede.batchId, userId, JSON.stringify({ status: 'Generated' }),
                     JSON.stringify({ status: 'Superseded', replaced_by_batch_id: batchId, reason: supersede.reason })]);
+            await payrollAdjustments.resolveCorrectionsSuperseded(connection, 'Staff', [supersede.batchId], batchId, userId);
         }
 
         await connection.commit();
@@ -528,6 +553,8 @@ const hourlyRate       = money(hourlyRateRaw); // هاد بس للعرض/الت�
                 : 'Staff payroll batch generated successfully',
             batch_id: batchId,
             currency: staffCurrency,
+            adjustments_included: includedAdjustmentIds.length,
+            ...(adjustmentWarnings.length ? { adjustment_warnings: adjustmentWarnings } : {}),
             ...(segmentAudits.length ? { compensation_segments: segmentAudits } : {}),
         });
     } catch (error) {
@@ -578,7 +605,11 @@ async function getStaffPayrollBatchDetails(req, res) {
              ORDER BY sm.full_name`,
             [batchId]
         );
-        return res.json({ status: 'success', batch: batches[0], staff: items });
+        // Retro pay: adjustments carried by this batch (already inside net_salary).
+        const adjustments = await payrollAdjustments.listForBatch(pool, 'Staff', batchId);
+        for (const it of items) it.adjustments = adjustments.filter((a) => Number(a.person_id) === Number(it.staff_id));
+        return res.json({ status: 'success', batch: batches[0], staff: items, adjustments,
+            adjustments_total: money(adjustments.reduce((sum, a) => sum + Number(a.amount || 0), 0)) });
     } catch (error) {
         console.error('getStaffPayrollBatchDetails:', error);
         return res.status(500).json({ status: 'error', message: 'Failed to load batch details' });
@@ -619,8 +650,20 @@ await connection.execute(
      VALUES ('staff_payroll_batches', ?, 'MARKED_PAID', ?, ?, ?)`,
     [batchId, req.user?.user_id, JSON.stringify({ status: batches[0].status }), JSON.stringify({ status: 'Paid' })]
 );
+        // Retro pay: carried adjustments are paid now; corrections made while
+        // this batch was only finalized become adjustments for the next batch.
+        const applied = await payrollAdjustments.applyBatch(connection, 'Staff', batchId);
+        const converted = await payrollAdjustments.convertOpenCorrectionsForPaidBatch(connection, 'Staff', batchId, req.user?.user_id);
         await connection.commit();
-        return res.json({ status: 'success', message: 'Payroll batch marked as paid successfully' });
+        const created = converted.filter((c) => c.adjustment_id);
+        return res.json({
+            status: 'success',
+            message: 'Payroll batch marked as paid successfully' +
+                (applied ? `. ${applied} payroll adjustment(s) paid with it` : '') +
+                (created.length ? `. ${created.length} correction(s) made after finalizing became payroll adjustment(s) for the next batch` : ''),
+            adjustments_applied: applied,
+            adjustments_created: created,
+        });
     } catch (error) {
         await connection.rollback();
         console.error('markStaffBatchAsPaid:', error);
@@ -823,6 +866,9 @@ async function exportStaffPayrollExcel(req, res) {
 
         sheet.views = [{ state: 'frozen', xSplit: 3, ySplit: 5 }];
         sheet.autoFilter = { from: 'A5', to: `${lastCol}5` };
+
+        // Retro pay: adjustments carried by this batch (already inside Net Salary).
+        payrollAdjustments.addAdjustmentsSheet(workbook, await payrollAdjustments.listForBatch(pool, 'Staff', batchId), '#,##0.00');
 
         const fileName = `staff_payroll_batch_${batchId}.xlsx`;
         res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -1079,6 +1125,33 @@ async function exportStaffPayrollPdf(req, res) {
             ot_earned_hours: fmt(totalOtEarned),
             net_salary: amount(totalNet),
         }, { bold: true, fill: '#eef1f8' });
+
+        // Retro pay: list of adjustments included in the nets above.
+        const pdfAdjustments = await payrollAdjustments.listForBatch(pool, 'Staff', batchId);
+        if (pdfAdjustments.length) {
+            y += 10;
+            const left = doc.page.margins.left;
+            const width = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+            if (y > bottomLimit - 30) { doc.addPage(); y = doc.page.margins.top; }
+            doc.font('Helvetica-Bold').fontSize(8.5).fillColor('#1a2a6c')
+                .text('PAYROLL ADJUSTMENTS FOR EARLIER PAID PERIODS (included in Net Salary above)', left, y, { width });
+            y = doc.y + 3;
+            let adjTotal = 0;
+            pdfAdjustments.forEach((a, i) => {
+                if (y > bottomLimit) { doc.addPage(); y = doc.page.margins.top; }
+                const line = `${i + 1}. ${a.person_code} ${a.full_name} | ${a.origin_date || 'Manual'}` +
+                    `${a.origin_batch_id ? ` (paid batch #${a.origin_batch_id})` : ''} | ` +
+                    `${a.before_amount !== null ? `${amount(a.before_amount)} -> ${amount(a.after_amount)} | ` : ''}` +
+                    `${num(a.amount) > 0 ? '+' : ''}${amount(a.amount)} ${currency} | ${a.reason}`;
+                doc.font('Helvetica').fontSize(7.5).fillColor('black').text(line, left, y, { width });
+                y = doc.y + 2;
+                adjTotal += num(a.amount);
+            });
+            doc.font('Helvetica-Bold').fontSize(8).fillColor('#1a2a6c')
+                .text(`TOTAL ADJUSTMENTS: ${adjTotal > 0 ? '+' : ''}${amount(adjTotal)} ${currency}`, left, y, { width });
+            doc.fillColor('black');
+            y = doc.y;
+        }
 
         drawSignaturesFooter(y + 25);
 

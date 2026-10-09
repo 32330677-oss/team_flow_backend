@@ -38,6 +38,7 @@ function resetDatabase({ migrate = true } = {}) {
       sh(`${MYSQL} ${DB_NAME} < tests/schema/offcycle_test_patch.sql`);
     }
     sh(`${MYSQL} ${DB_NAME} < migrations/2026_10_recycle_bin/01_ddl.sql`);
+    sh(`${MYSQL} ${DB_NAME} < migrations/2026_10_payroll_adjustments/01_ddl.sql`);
   }
 }
 

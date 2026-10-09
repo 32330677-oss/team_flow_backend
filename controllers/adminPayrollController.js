@@ -1,4 +1,5 @@
 const pool = require('../config/db');
+const payrollAdjustments = require('../services/payrollAdjustmentService');
 const settingsCache = require('../services/settingsCache');
 const { activeOn } = require('../services/assignmentDates');
 const { businessToday } = require('../services/businessDate');
@@ -615,14 +616,38 @@ let attSql = `
     let totalWorkers = 0;
     let totalAmount = 0;
 
+    // Retro pay: Pending payroll adjustments of the workers paid in this
+    // REGULAR batch are carried by it (never by an off-cycle batch). What a
+    // batch being replaced here carried goes back to Pending first, so the
+    // replacement carries it instead.
+    let adjByWorker = new Map();
+    const includedAdjustmentIds = [];
+    const adjustmentWarnings = [];
+    if (batchType === 'Regular') {
+      await payrollAdjustments.releaseBatches(connection, 'Worker', existingBatches.map((b) => b.payroll_batch_id));
+      adjByWorker = await payrollAdjustments.loadPendingForPeople(connection, 'Worker', [...byWorker.keys()], currency);
+    }
+
     for (const worker of byWorker.values()) {
+      let adjustmentsAmount = 0;
+      const adj = adjByWorker.get(Number(worker.worker_id));
+      if (adj) {
+        if (money(worker.gross + adj.total) >= 0) {
+          adjustmentsAmount = adj.total;
+          includedAdjustmentIds.push(...adj.ids);
+        } else {
+          adjustmentWarnings.push({ worker_id: worker.worker_id, pending_total: adj.total,
+            message: 'Pending deductions exceed this pay: they stay Pending for a later batch.' });
+        }
+      }
+      const workerNet = money(worker.gross + adjustmentsAmount);
       const [payrollResult] = await connection.execute(
         `INSERT INTO payroll
           (payroll_batch_id, worker_id, start_date, end_date,
-           bonus_amount, penalty_amount, deductions_amount,
+           bonus_amount, penalty_amount, deductions_amount, adjustments_amount,
            gross_salary, net_salary, status, generated_by_user_id)
-         VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?, 'Generated', ?)`,
-        [batchId, worker.worker_id, start_date, end_date, worker.gross, worker.gross, userId]
+         VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?, ?, 'Generated', ?)`,
+        [batchId, worker.worker_id, start_date, end_date, adjustmentsAmount.toFixed(2), worker.gross, workerNet, userId]
       );
       const payrollId = payrollResult.insertId;
 
@@ -663,8 +688,9 @@ let attSql = `
         }
       }
       totalWorkers += 1;
-      totalAmount = money(totalAmount + worker.gross);
+      totalAmount = money(totalAmount + workerNet);
     }
+    await payrollAdjustments.markIncluded(connection, includedAdjustmentIds, batchId);
 
     await connection.execute(
       `UPDATE payrollbatches SET total_workers = ?, total_amount = ? WHERE payroll_batch_id = ?`,
@@ -689,6 +715,9 @@ let attSql = `
           JSON.stringify({ status: 'Superseded', replaced_by_batch_id: batchId, reason: supersede ? supersede.reason : 'Regenerated (not finalized)' })]
       );
     }
+    // Corrections waiting on a superseded finalized batch are now in the replacement.
+    await payrollAdjustments.resolveCorrectionsSuperseded(connection, 'Worker',
+      existingBatches.map((b) => b.payroll_batch_id), batchId, userId);
     await connection.commit();
 
     return res.status(201).json({
@@ -702,7 +731,9 @@ let attSql = `
       scope_worker_id: scopeWorkerId,
       total_amount: totalAmount,
       version_number: nextVersion,
-      supersedes_batch_id: supersedesId
+      supersedes_batch_id: supersedesId,
+      adjustments_included: includedAdjustmentIds.length,
+      ...(adjustmentWarnings.length ? { adjustment_warnings: adjustmentWarnings } : {}),
     });
   } catch (error) {
     try { await connection.rollback(); } catch (_) { /* nothing to roll back */ }
@@ -935,7 +966,7 @@ async function getPayrollBatchDetails(req, res) {
 
     const [payrolls] = await pool.execute(
       `SELECT p.payroll_id, p.gross_salary, p.net_salary,
-              p.bonus_amount, p.penalty_amount, p.deductions_amount,
+              p.bonus_amount, p.penalty_amount, p.deductions_amount, p.adjustments_amount,
               w.worker_id, w.full_name AS worker_name
        FROM payroll p
        JOIN workers w ON w.worker_id = p.worker_id
@@ -999,6 +1030,14 @@ async function getPayrollBatchDetails(req, res) {
     }
     const inBatch = new Set(workers.map((w) => Number(w.worker_id)));
     for (const w of workers) w.offcycle_batches = offByWorker.get(Number(w.worker_id)) || [];
+    // Retro pay: adjustments carried by this batch (already inside net_salary).
+    const adjustments = await payrollAdjustments.listForBatch(pool, 'Worker', batchId);
+    const adjByWorker = new Map();
+    for (const a of adjustments) {
+      if (!adjByWorker.has(Number(a.person_id))) adjByWorker.set(Number(a.person_id), []);
+      adjByWorker.get(Number(a.person_id)).push(a);
+    }
+    for (const w of workers) w.adjustments = adjByWorker.get(Number(w.worker_id)) || [];
     for (const o of offcyclePaid) o.in_this_batch = inBatch.has(Number(o.worker_id));
     const batchTotal = money(workers.reduce((sum, w) => sum + Number(w.net_salary || 0), 0));
     const offcycleTotal = money(offcyclePaid.reduce((sum, o) => sum + o.amount, 0));
@@ -1008,6 +1047,8 @@ async function getPayrollBatchDetails(req, res) {
       batch: batches[0],
       workers,
       offcycle_paid: offcyclePaid,
+      adjustments,
+      adjustments_total: money(adjustments.reduce((sum, a) => sum + Number(a.amount || 0), 0)),
       offcycle_summary: {
         count: offcyclePaid.length,
         total: offcycleTotal,
@@ -1045,8 +1086,20 @@ async function markBatchAsPaid(req, res) {
        VALUES ('payrollbatches', ?, 'MARKED_PAID', ?, ?, ?)`,
       [batchId, userId, JSON.stringify({ status: batches[0].status }), JSON.stringify({ status: 'Paid', paid_date: businessToday() })]
     );
+    // Retro pay: adjustments carried by this batch are now paid; corrections
+    // made while it was only finalized (not in the paid amount) become adjustments.
+    const applied = await payrollAdjustments.applyBatch(connection, 'Worker', batchId);
+    const converted = await payrollAdjustments.convertOpenCorrectionsForPaidBatch(connection, 'Worker', batchId, userId);
     await connection.commit();
-    return res.json({ success: true, message: 'Batch marked as paid.' });
+    const created = converted.filter((c) => c.adjustment_id);
+    return res.json({
+      success: true,
+      message: 'Batch marked as paid.' +
+        (applied ? ` ${applied} payroll adjustment(s) paid with it.` : '') +
+        (created.length ? ` ${created.length} correction(s) made after finalizing became payroll adjustment(s) for the next batch.` : ''),
+      adjustments_applied: applied,
+      adjustments_created: created,
+    });
   } catch (error) {
     await connection.rollback();
     console.error('markBatchAsPaid:', error);
@@ -1091,8 +1144,10 @@ async function voidPayrollBatch(req, res) {
        VALUES ('payrollbatches', ?, 'VOIDED', ?, ?, ?)`,
       [batchId, userId, JSON.stringify({ status: batch.status }), JSON.stringify({ status: 'Voided', reason })]
     );
+    const released = await payrollAdjustments.releaseBatches(connection, 'Worker', [batchId]);
     await connection.commit();
-    return res.json({ success: true, message: `Batch #${batchId} voided. It stays in the history; its period can be generated again.` });
+    return res.json({ success: true, message: `Batch #${batchId} voided. It stays in the history; its period can be generated again.` +
+      (released ? ` ${released} payroll adjustment(s) it carried are Pending again.` : '') });
   } catch (error) {
     await connection.rollback();
     console.error('voidPayrollBatch:', error);
@@ -1431,8 +1486,18 @@ async function exportPayrollExcel(req, res) {
       periodRow.getCell(7).numFmt = moneyFmt;
     }
 
+    // Retro pay: adjustments carried by this batch (already inside Net Salary).
+    const batchAdjustments = await payrollAdjustments.listForBatch(pool, 'Worker', batchId);
+    if (batchAdjustments.length) {
+      summarySheet.addRow([]);
+      const adjNote = summarySheet.addRow({ number: `Net Salary includes ${batchAdjustments.length} payroll adjustment(s) for earlier paid periods: see the "Adjustments" sheet.` });
+      summarySheet.mergeCells(adjNote.number, 3, adjNote.number, 9);
+      adjNote.font = { italic: true, color: { argb: 'FF1A2A6C' } };
+    }
+    payrollAdjustments.addAdjustmentsSheet(workbook, batchAdjustments, moneyFmt);
+
     // ---------------- One worksheet per site (بدون أي تغيير) ----------------
-    const usedNames = new Set(['Summary']);
+    const usedNames = new Set(['Summary', 'Adjustments']);
     for (const [siteKey, { siteName, rows: siteRows }] of bySite.entries()) {
       let safeName = siteName.replace(/[\\/*?:[\]]/g, ' ').trim().slice(0, 28) || 'Site';
       let finalName = safeName;
@@ -2292,6 +2357,47 @@ doc.fillColor('black');
         .text(`OFF-CYCLE TOTAL: ${Math.round(offTotal).toLocaleString('en-US')} ${CURRENCY_CODE}     ` +
           `PERIOD TOTAL (this batch + off-cycle): ${Math.round(num(grandTotalNet) + offTotal).toLocaleString('en-US')} ${CURRENCY_CODE}`,
         VL, y, { lineBreak: false });
+      doc.fillColor('black');
+      y += 18;
+    }
+
+    // ---- Payroll adjustments carried by this batch (retro pay) ----
+    // Already INCLUDED in GRAND TOTAL NET above (they are part of each net).
+    const pdfAdjustments = await payrollAdjustments.listForBatch(pool, 'Worker', batchId);
+    if (pdfAdjustments.length) {
+      const cols = [
+        { label: '#', w: 22 }, { label: 'ID', w: 58 }, { label: 'Worker', w: 150 }, { label: 'Date', w: 62 },
+        { label: 'Paid batch', w: 56 }, { label: 'Before', w: 70 }, { label: 'After', w: 70 }, { label: 'Adjustment', w: 78 },
+        { label: 'Reason', w: 218 },
+      ];
+      const rowH = 15;
+      if (y + Math.min(18 + rowH * (pdfAdjustments.length + 1) + 30, 120) > VBOTTOM - 70) { doc.addPage(); y = VT; }
+      doc.font('Helvetica-Bold').fontSize(9).fillColor(COLOR_ACCENT)
+        .text('PAYROLL ADJUSTMENTS FOR EARLIER PAID PERIODS (included in GRAND TOTAL NET above)', VL, y);
+      y += 14;
+      const drawAdjRow = (cells, opts = {}) => {
+        let x = VL;
+        if (opts.fill) doc.rect(VL, y, cols.reduce((sum, c) => sum + c.w, 0), rowH).fill(opts.fill);
+        cols.forEach((c, i) => {
+          const text = String(cells[i] ?? '');
+          doc.font(fontNameFor(text, Boolean(opts.bold))).fontSize(8).fillColor('black')
+            .text(shapeArabicAware(text), x + 3, y + 4, { width: c.w - 6, lineBreak: false, ellipsis: true });
+          x += c.w;
+        });
+        y += rowH;
+      };
+      const fmt = (v) => (v === null || v === undefined ? '' : Math.round(num(v)).toLocaleString('en-US'));
+      drawAdjRow(cols.map((c) => c.label), { bold: true, fill: COLOR_SUMMARY_BG });
+      let adjTotal = 0;
+      pdfAdjustments.forEach((a, i) => {
+        if (y + rowH > VBOTTOM - 40) { doc.addPage(); y = VT; }
+        drawAdjRow([i + 1, a.person_code, a.full_name, a.origin_date || '', a.origin_batch_id ? `#${a.origin_batch_id}` : 'Manual',
+          fmt(a.before_amount), fmt(a.after_amount), `${num(a.amount) > 0 ? '+' : ''}${fmt(a.amount)}`, a.reason]);
+        adjTotal += num(a.amount);
+      });
+      y += 4;
+      doc.font('Helvetica-Bold').fontSize(8).fillColor(COLOR_ACCENT)
+        .text(`TOTAL ADJUSTMENTS: ${adjTotal > 0 ? '+' : ''}${Math.round(adjTotal).toLocaleString('en-US')} ${CURRENCY_CODE}`, VL, y, { lineBreak: false });
       doc.fillColor('black');
       y += 18;
     }

@@ -11,6 +11,7 @@
 //   Paid                      -> never reopened / superseded (API-enforced).
 
 const pool = require('../config/db');
+const payrollAdjustments = require('../services/payrollAdjustmentService');
 const { generateStaffPayrollBatch } = require('./StaffPayrollController');
 
 // PATCH /api/staff-payroll/batch/:batchId/finalize
@@ -125,8 +126,10 @@ async function voidBatch(req, res) {
        VALUES ('staff_payroll_batches', ?, 'VOIDED', ?, ?, ?)`,
       [batchId, userId, JSON.stringify({ status: batch.status }), JSON.stringify({ status: 'Voided', reason })]
     );
+    const released = await payrollAdjustments.releaseBatches(connection, 'Staff', [batchId]);
     await connection.commit();
-    return res.json({ status: 'success', message: `Batch #${batchId} voided. It stays in the history; its period can be generated again.` });
+    return res.json({ status: 'success', message: `Batch #${batchId} voided. It stays in the history; its period can be generated again.` +
+      (released ? ` ${released} payroll adjustment(s) it carried are Pending again.` : '') });
   } catch (error) {
     await connection.rollback();
     console.error('voidBatch:', error);

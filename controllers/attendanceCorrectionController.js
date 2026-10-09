@@ -24,6 +24,7 @@ const { findLockedWorkerBatch, findLockedStaffBatch } = require('../services/pay
 const { calculateStaffShiftHours } = require('../services/staffAttendanceService');
 const { getStaffCompensationForDate } = require('../services/staffCompensationService');
 const anomalyService = require('../services/anomalyService');
+const payrollAdjustments = require('../services/payrollAdjustmentService');
 
 class OpError extends Error {
   constructor(message, statusCode = 400) {
@@ -58,6 +59,24 @@ function send(res, error, fallback) {
   }
   console.error(fallback, error);
   return res.status(500).json({ status: 'error', message: fallback });
+}
+
+function correctionMessage(effect, batchId, batchStatus, correctionId, adjustment) {
+  if (effect !== 'AdjustmentRequired') return 'Correction saved.';
+  if (batchStatus !== 'Paid') {
+    return `Correction saved. Payroll batch #${batchId} is finalized and was NOT changed: supersede it to include this correction.`;
+  }
+  if (adjustment && adjustment.adjustment_id) {
+    const sign = adjustment.amount > 0 ? '+' : '';
+    return `Correction saved. Paid batch #${batchId} was NOT changed. Payroll adjustment #${adjustment.adjustment_id}: ` +
+      `${sign}${Number(adjustment.amount).toFixed(2)} ${adjustment.currency}` +
+      (adjustment.status === 'AwaitingConfirmation' ? ' (a deduction: confirm it in Payroll adjustments).' : ' will be paid in the next payroll batch.');
+  }
+  if (adjustment && adjustment.amount === 0) {
+    return `Correction saved. Paid batch #${batchId} was NOT changed. No pay difference: nothing to adjust.`;
+  }
+  return `Correction saved. Paid batch #${batchId} was NOT changed. The pay difference could not be computed` +
+    `${adjustment && adjustment.error ? ` (${adjustment.error})` : ''}: add a manual payroll adjustment (correction #${correctionId}).`;
 }
 
 function requireReason(body) {
@@ -252,14 +271,25 @@ exports.correctWorkerAttendance = async (req, res) => {
           removed_breaks: removedBreaks.length ? removedBreaks : undefined,
           lunch: lunch ? { action: lunch.action, start: lunch.start || null, end: lunch.end || null, from_site: Boolean(lunch.fromSite) } : null })]
     );
+    // Payroll follow-up (retro pay): Paid -> adjustment for the next batch;
+    // Finalized -> supersede hint; not finalized batch -> regenerate hint.
+    let payrollAdjustment = null;
+    let payrollHint = null;
+    if (effect === 'AdjustmentRequired' && locked.status === 'Paid') {
+      payrollAdjustment = await payrollAdjustments.createFromCorrection(connection, log.insertId, userId);
+    } else if (effect === 'AdjustmentRequired') {
+      payrollHint = payrollAdjustments.finalizedHint(locked.payroll_batch_id);
+    } else if (!locked && original.status === 'Approved') {
+      payrollHint = await payrollAdjustments.openBatchHint(connection, 'Worker',
+        { date: recordDate, siteId: original.site_id, personId: original.worker_id });
+    }
     await connection.commit();
 
     return res.status(200).json({
       status: 'success',
-      message: effect === 'AdjustmentRequired'
-        ? `Correction saved. Payroll batch #${locked.payroll_batch_id} is ${locked.status === 'Paid' ? 'Paid' : 'Finalized'} and was NOT changed; an open payroll adjustment item was recorded (#${log.insertId}).`
-        : 'Correction saved.',
-      data: { correction_id: log.insertId, payroll_effect: effect, locked_batch_id: locked ? locked.payroll_batch_id : null, record: corrected },
+      message: correctionMessage(effect, locked ? locked.payroll_batch_id : null, locked ? locked.status : null, log.insertId, payrollAdjustment),
+      data: { correction_id: log.insertId, payroll_effect: effect, locked_batch_id: locked ? locked.payroll_batch_id : null, record: corrected,
+        payroll_adjustment: payrollAdjustment, payroll_hint: payrollHint },
     });
   } catch (error) {
     try { await connection.rollback(); } catch (_) {}
@@ -292,6 +322,7 @@ exports.correctStaffAttendance = async (req, res) => {
 
     let checkIn = null; let checkOut = null; let lunchStart = null; let lunchEnd = null;
     let regular = 0; let overtime = 0; let lunchHours = 0;
+    let completedDay = false;
     if (status === 'Present') {
       checkIn = req.body.check_in_time !== undefined ? wall(req.body.check_in_time) : wall(original.check_in_time);
       checkOut = req.body.check_out_time !== undefined ? wall(req.body.check_out_time) : wall(original.check_out_time);
@@ -310,6 +341,19 @@ exports.correctStaffAttendance = async (req, res) => {
         throw new OpError(calcError.message);
       }
       regular = shift.regularHours; overtime = shift.overtimeHours; lunchHours = shift.lunchHours;
+      // Management decision: pay the missing hours of this day (the real times
+      // are kept; only the paid regular hours are completed to the standard).
+      if (req.body.complete_day === true || req.body.complete_day === 1) {
+        regular = Math.max(regular, snapshot / 60);
+        completedDay = true;
+      }
+    }
+
+    // Management-paid absence (Absent days only), decided by the Admin here.
+    let mgmtPaid = status === 'Absent' ? Number(original.is_management_paid_absence || 0) : 0;
+    if (status === 'Absent' && (req.body.is_management_paid_absence === 0 || req.body.is_management_paid_absence === 1
+      || req.body.is_management_paid_absence === true || req.body.is_management_paid_absence === false)) {
+      mgmtPaid = req.body.is_management_paid_absence === true || req.body.is_management_paid_absence === 1 ? 1 : 0;
     }
 
     let isPaid = Number(original.is_paid);
@@ -319,21 +363,33 @@ exports.correctStaffAttendance = async (req, res) => {
 
     const locked = await findLockedStaffBatch(connection, { date: recordDate });
 
+    // MySQL evaluates SET assignments left to right: the "changed?" checks read
+    // the OLD is_paid / is_management_paid_absence, so those two are assigned last.
     await connection.execute(
       `UPDATE staff_attendance
        SET attendance_status = ?, check_in_time = ?, check_out_time = ?, lunch_start_time = ?, lunch_end_time = ?,
-           regular_hours = ?, overtime_hours = ?, lunch_deducted_hours = ?, is_paid = ?,
+           regular_hours = ?, overtime_hours = ?, lunch_deducted_hours = ?,
            paid_decision_by_user_id = CASE WHEN is_paid <> ? THEN ? ELSE paid_decision_by_user_id END,
-           paid_decision_at = CASE WHEN is_paid <> ? THEN NOW() ELSE paid_decision_at END
+           paid_decision_at = CASE WHEN is_paid <> ? THEN NOW() ELSE paid_decision_at END,
+           management_paid_reason = CASE WHEN is_management_paid_absence <> ? THEN ? ELSE management_paid_reason END,
+           management_paid_by_user_id = CASE WHEN is_management_paid_absence <> ? THEN ? ELSE management_paid_by_user_id END,
+           management_paid_at = CASE WHEN is_management_paid_absence <> ? THEN NOW() ELSE management_paid_at END,
+           remarks = CASE WHEN ? = 1 THEN LEFT(CONCAT_WS(' | ', NULLIF(remarks, ''), ?), 1000) ELSE remarks END,
+           is_paid = ?,
+           is_management_paid_absence = ?
        WHERE staff_attendance_id = ?`,
       [status, checkIn, checkOut, lunchStart, lunchEnd, regular.toFixed(2), overtime.toFixed(2), lunchHours.toFixed(2),
-        isPaid, isPaid, userId, isPaid, id]
+        isPaid, userId, isPaid,
+        mgmtPaid, mgmtPaid ? reason.slice(0, 500) : null, mgmtPaid, mgmtPaid ? userId : null, mgmtPaid,
+        completedDay ? 1 : 0, `Day completed by management decision: ${reason}`.slice(0, 255),
+        isPaid, mgmtPaid,
+        id]
     );
     const anomaly = status === 'Present' ? await anomalyService.evaluateSession(checkIn, checkOut, recordDate) : null;
     await anomalyService.applyAnomalyFlag(connection, 'staff_attendance', 'staff_attendance_id', id, anomaly);
 
     const [[corrected]] = await connection.execute('SELECT * FROM staff_attendance WHERE staff_attendance_id = ?', [id]);
-    const changedMoneyFields = ['attendance_status', 'regular_hours', 'overtime_hours', 'is_paid']
+    const changedMoneyFields = ['attendance_status', 'regular_hours', 'overtime_hours', 'is_paid', 'is_management_paid_absence']
       .some((k) => String(original[k] ?? '') !== String(corrected[k] ?? ''));
     const effect = locked && changedMoneyFields && original.status === 'Approved' ? 'AdjustmentRequired' : 'None';
 
@@ -350,15 +406,24 @@ exports.correctStaffAttendance = async (req, res) => {
       `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
        VALUES ('staff_attendance', ?, 'ADMIN_CORRECTION', ?, ?, ?)`,
       [id, userId, JSON.stringify(original), JSON.stringify({ correction_id: log.insertId, reason, attendance_status: status,
-        check_in_time: checkIn, check_out_time: checkOut, is_paid: isPaid, locked_batch_id: locked ? locked.staff_payroll_batch_id : null })]
+        check_in_time: checkIn, check_out_time: checkOut, is_paid: isPaid, is_management_paid_absence: mgmtPaid,
+        complete_day: completedDay, locked_batch_id: locked ? locked.staff_payroll_batch_id : null })]
     );
+    let payrollAdjustment = null;
+    let payrollHint = null;
+    if (effect === 'AdjustmentRequired' && locked.status === 'Paid') {
+      payrollAdjustment = await payrollAdjustments.createFromCorrection(connection, log.insertId, userId);
+    } else if (effect === 'AdjustmentRequired') {
+      payrollHint = payrollAdjustments.finalizedHint(locked.staff_payroll_batch_id);
+    } else if (!locked && original.status === 'Approved') {
+      payrollHint = await payrollAdjustments.openBatchHint(connection, 'Staff', { date: recordDate });
+    }
     await connection.commit();
     return res.status(200).json({
       status: 'success',
-      message: effect === 'AdjustmentRequired'
-        ? `Correction saved. Staff payroll batch #${locked.staff_payroll_batch_id} was NOT changed; an open payroll adjustment item was recorded (#${log.insertId}).`
-        : 'Correction saved.',
-      data: { correction_id: log.insertId, payroll_effect: effect, record: corrected },
+      message: correctionMessage(effect, locked ? locked.staff_payroll_batch_id : null, locked ? locked.status : null, log.insertId, payrollAdjustment),
+      data: { correction_id: log.insertId, payroll_effect: effect, locked_batch_id: locked ? locked.staff_payroll_batch_id : null, record: corrected,
+        payroll_adjustment: payrollAdjustment, payroll_hint: payrollHint },
     });
   } catch (error) {
     try { await connection.rollback(); } catch (_) {}

@@ -70,7 +70,14 @@ function listDates(start, end) {
  * Returns null when payroll would skip the staff member, otherwise the
  * figures payroll would store (plus `unresolved` when payroll would refuse).
  */
-async function calculateStaff(staff, startDate, endDate, batchNonFridayDays, executor) {
+// options (used by payrollAdjustmentService to recompute a PAID month):
+//   statuses  : attendance statuses counted (default: the preview's Submitted + Approved;
+//               ['Approved'] reproduces official payroll exactly)
+//   overrides : Map(staff_attendance_id -> field values) applied in memory only,
+//               to compute the month "as if" one record had other values.
+async function calculateStaff(staff, startDate, endDate, batchNonFridayDays, executor, options = {}) {
+  const countedStatuses = Array.isArray(options.statuses) && options.statuses.length ? options.statuses : COUNTED_STATUSES;
+  const overrides = options.overrides instanceof Map ? options.overrides : null;
   const resolveComp = await buildStaffCompensationTimeline(staff.staff_id, executor);
 
   const employmentSpans = await getActiveSpansOverlapping(staff.staff_id, startDate, endDate, executor);
@@ -84,14 +91,25 @@ async function calculateStaff(staff, startDate, endDate, batchNonFridayDays, exe
   const requiredDays = calendarDates.length;
   if (requiredDays <= 0) return { skipped: 'no_working_days', employmentSpans };
 
-  const [records] = await executor.query(
+  const [rawRecords] = await executor.query(
     `SELECT staff_attendance_id, DATE_FORMAT(record_date, '%Y-%m-%d') AS record_date, attendance_status, is_paid,
             is_management_paid_absence, regular_hours, overtime_hours, is_friday_worked,
             standard_minutes_snapshot
      FROM staff_attendance
      WHERE staff_id = ? AND record_date BETWEEN ? AND ? AND status IN (?)`,
-    [staff.staff_id, effectiveStart, effectiveEnd, COUNTED_STATUSES]
+    [staff.staff_id, effectiveStart, effectiveEnd, countedStatuses]
   );
+  const OVERRIDABLE = ['attendance_status', 'is_paid', 'is_management_paid_absence', 'regular_hours',
+    'overtime_hours', 'is_friday_worked', 'standard_minutes_snapshot'];
+  const records = overrides
+    ? rawRecords.map((r) => {
+      const o = overrides.get(Number(r.staff_attendance_id));
+      if (!o) return r;
+      const merged = { ...r };
+      for (const k of OVERRIDABLE) if (o[k] !== undefined) merged[k] = o[k];
+      return merged;
+    })
+    : rawRecords;
 
   const relevantRecords = records.filter((r) => calendarDateSet.has(String(r.record_date).slice(0, 10)));
   if (relevantRecords.length === 0) return { skipped: 'no_counted_records', employmentSpans };

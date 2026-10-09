@@ -31,6 +31,7 @@ router.post('/admin/:id/paid', restrictTo('Admin'), staffAttendanceController.se
 // D-02: explicit Admin correction (finalized periods / approved records)
 const correctionController = require('../controllers/attendanceCorrectionController');
 router.post('/admin/:id/correction', restrictTo('Admin'), correctionController.correctStaffAttendance);
+router.get('/admin/records', restrictTo('Admin'), require('../controllers/staffApprovedRecordsController').listRecords);
 
 // ==================== B4: Lunch for biometric staff records (Admin) ====================
 const staffLunchAdminController = require('../controllers/staffLunchAdminController');

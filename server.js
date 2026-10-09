@@ -60,6 +60,7 @@ app.use('/api/staff-payroll', staffPayrollRoutes);
 app.use('/api/staff-overtime', staffOvertimeRoutes);
 app.use('/api/main-dashboard', mainDashboardRoutes);
 app.use('/api/recycle-bin', require('./routes/recycleBinRoutes'));
+app.use('/api/payroll-adjustments', require('./routes/payrollAdjustmentRoutes'));
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });
 });
@@ -78,6 +79,16 @@ async function start() {
         await assertSemanticsMarker(db);
         await assertOffCycleSchema(db);   // migrations/2026_10_offcycle_payroll
         await require('./services/recycleBinService').assertRecycleBinSchema(db); // migrations/2026_10_recycle_bin
+        {
+            const [[c]] = await db.query(
+                `SELECT COUNT(*) AS n FROM information_schema.COLUMNS
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('payroll','staff_payroll') AND COLUMN_NAME = 'adjustments_amount'`);
+            const [[t]] = await db.query(
+                "SELECT COUNT(*) AS n FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'payroll_adjustments'");
+            if (Number(c.n) !== 2 || Number(t.n) !== 1) {
+                throw new Error('Payroll adjustment tables are missing. Run migrations/2026_10_payroll_adjustments/01_ddl.sql before starting this version.');
+            }
+        }
     } catch (error) {
         console.error(`FATAL: ${error.message}`);
         process.exit(1);
