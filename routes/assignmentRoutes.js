@@ -13,6 +13,7 @@
 //   POST   /api/assignments/:id/end             End Assignment: { last_day, reason }
 //   POST   /api/assignments/:id/transfer        Direct Transfer: { transfer_date, target_site_id,
 //                                               target_shift_type, reason } — one transaction
+//   POST   /api/assignments/:id/start-date      Change the FIRST day: { new_start_date, reason }
 //   DELETE /api/assignments/:id                 kept for old clients: same as /end, requires last_day
 const express = require('express');
 const router = express.Router();
@@ -21,6 +22,7 @@ const { businessToday, isValidDateOnly, addDays } = require('../services/busines
 const { activeOn, currentOrFuture, overlaps } = require('../services/assignmentDates');
 const authMiddleware = require('../middleware/authMiddleware');
 const restrictTo = require('../middleware/roleMiddleware');
+const { getWorkerStatusOnDate } = require('../services/workerStatusService');
 
 class OpError extends Error {
     constructor(message, statusCode = 400, extra = null) {
@@ -327,6 +329,169 @@ router.post('/:assignment_id/transfer', authMiddleware, restrictTo('Admin'), asy
     } catch (err) {
         try { await connection.rollback(); } catch (_) {}
         sendError(res, err, 'An error occurred while transferring the worker.');
+    } finally {
+        connection.release();
+    }
+});
+
+// 5. Change the start date (first assigned day) of an assignment.
+//    Used when attendance is found before the recorded start, or the start was
+//    entered too early. Checks, all inside ONE transaction (worker row locked):
+//      * date valid, not in the future, different from the current start;
+//      * the assignment is not cancelled and the new start <= its last day;
+//      * EARLIER start: not before the hire date, worker Active on every added
+//        day (status history), no other assignment of the worker on the added
+//        days;
+//      * LATER start: no attendance of the worker at this site/shift on the
+//        removed days (it would lose its assignment and block payroll);
+//      * no Finalized/Paid payroll batch covers the added/removed days
+//        (Regular batch of this site or all sites, or this worker's off-cycle);
+//      * reason required; audited (ASSIGNMENT_START_CHANGED).
+//    A Generated (not finalized) batch covering those days is not blocked; the
+//    response returns it so the Admin regenerates it.
+async function payrollBatchesCovering(executor, { siteId, workerId, from, to }) {
+    const [rows] = await executor.execute(
+        `SELECT payroll_batch_id, DATE_FORMAT(start_date, '%Y-%m-%d') AS start_date,
+                DATE_FORMAT(end_date, '%Y-%m-%d') AS end_date, status, is_finalized, batch_type
+         FROM payrollbatches
+         WHERE status IN ('Generated', 'Paid')
+           AND start_date <= ? AND end_date >= ?
+           AND ((batch_type = 'Regular' AND (scope_site_id IS NULL OR scope_site_id = ?))
+                OR (batch_type = 'OffCycle' AND scope_worker_id = ?))
+         ORDER BY start_date`,
+        [to, from, siteId, workerId]
+    );
+    return rows;
+}
+
+router.post('/:assignment_id/start-date', authMiddleware, restrictTo('Admin'), async (req, res) => {
+    const connection = await db.getConnection();
+    try {
+        const assignmentId = Number(req.params.assignment_id);
+        if (!Number.isInteger(assignmentId) || assignmentId <= 0) throw new OpError('Invalid assignment id.');
+        const newStart = req.body?.new_start_date ? String(req.body.new_start_date).trim() : '';
+        if (!isValidDateOnly(newStart)) throw new OpError('new_start_date (YYYY-MM-DD) is required: the new FIRST day of the assignment.');
+        if (newStart > businessToday()) throw new OpError('The start date cannot be in the future.');
+        const reason = requireText(req.body?.reason, 'reason');
+        const userId = req.user.user_id;
+
+        await connection.beginTransaction();
+        // Lock order: worker first (same as create), then the assignment.
+        const [[peek]] = await connection.execute(
+            'SELECT worker_id FROM workersiteassignments WHERE assignment_id = ?', [assignmentId]);
+        if (!peek) throw new OpError('Assignment not found.', 404);
+        const [[worker]] = await connection.execute(
+            `SELECT worker_id, full_name, status, DATE_FORMAT(hire_date, '%Y-%m-%d') AS hire_date
+             FROM workers WHERE worker_id = ? FOR UPDATE`, [peek.worker_id]);
+        const [[a]] = await connection.execute(
+            `SELECT wsa.assignment_id, wsa.worker_id, wsa.site_id, wsa.shift_type, s.site_name,
+                    DATE_FORMAT(wsa.assigned_date, '%Y-%m-%d') AS assigned_date,
+                    DATE_FORMAT(wsa.unassigned_date, '%Y-%m-%d') AS last_day
+             FROM workersiteassignments wsa JOIN sites s ON s.site_id = wsa.site_id
+             WHERE wsa.assignment_id = ? FOR UPDATE`, [assignmentId]);
+        if (!a || !worker || Number(a.worker_id) !== Number(worker.worker_id)) throw new OpError('Assignment not found.', 404);
+
+        const oldStart = a.assigned_date;
+        if (a.last_day !== null && a.last_day < oldStart) {
+            throw new OpError('This assignment was cancelled (it has no assigned day); create a new assignment instead.', 409);
+        }
+        if (newStart === oldStart) throw new OpError(`The assignment already starts on ${oldStart}.`);
+        if (a.last_day !== null && newStart > a.last_day) {
+            throw new OpError(`The new start cannot be after the assignment's last day (${a.last_day}).`, 409);
+        }
+
+        const earlier = newStart < oldStart;
+        // Days that change: added (earlier) or removed (later).
+        const from = earlier ? newStart : oldStart;
+        const to = earlier ? addDays(oldStart, -1) : addDays(newStart, -1);
+
+        if (earlier) {
+            if (worker.hire_date && newStart < worker.hire_date) {
+                throw new OpError(`The new start (${newStart}) cannot be earlier than the worker's hire date (${worker.hire_date}).`, 409);
+            }
+            const statusAtStart = await getWorkerStatusOnDate(worker.worker_id, newStart, connection);
+            if (statusAtStart.status !== 'Active') {
+                throw new OpError(`The worker was not Active on ${newStart} (status: ${statusAtStart.status}).`, 409);
+            }
+            const [inactiveChanges] = await connection.execute(
+                `SELECT DATE_FORMAT(effective_date, '%Y-%m-%d') AS effective_date
+                 FROM worker_status_history
+                 WHERE worker_id = ? AND new_status <> 'Active' AND effective_date > ? AND effective_date <= ?
+                 ORDER BY effective_date LIMIT 1`,
+                [worker.worker_id, newStart, to]);
+            if (inactiveChanges.length) {
+                throw new OpError(`The worker became Inactive on ${inactiveChanges[0].effective_date}, inside the added days. Choose a later start.`, 409);
+            }
+            const overlapping = await findOverlaps(connection, worker.worker_id, from, to, assignmentId);
+            if (overlapping.length) {
+                const o = overlapping[0];
+                throw new OpError(
+                    `The worker is assigned to "${o.site_name}" (${o.shift_type}) from ${o.assigned_date}` +
+                    `${o.last_day ? ` to ${o.last_day}` : ' (open)'}, which overlaps ${from} to ${to}. ` +
+                    'End that assignment earlier first, or choose a later start.',
+                    409, { conflicts: overlapping });
+            }
+        } else {
+            const [orphans] = await connection.execute(
+                `SELECT attendance_id, DATE_FORMAT(record_date, '%Y-%m-%d') AS record_date, status
+                 FROM attendance
+                 WHERE worker_id = ? AND site_id = ? AND shift_type = ? AND record_date BETWEEN ? AND ?
+                 ORDER BY record_date`,
+                [worker.worker_id, a.site_id, a.shift_type, from, to]);
+            if (orphans.length) {
+                throw new OpError(
+                    `The worker has ${orphans.length} attendance record(s) at this site/shift between ${from} and ${to} ` +
+                    `(${orphans.slice(0, 5).map((o) => o.record_date).join(', ')}). They would lose their assignment. ` +
+                    'Choose an earlier start or correct those records first.',
+                    409, { conflicts: orphans });
+            }
+        }
+
+        const batches = await payrollBatchesCovering(connection, { siteId: a.site_id, workerId: worker.worker_id, from, to });
+        const locked = batches.find((b) => Number(b.is_finalized) === 1 || b.status === 'Paid');
+        if (locked) {
+            throw new OpError(
+                `Payroll batch #${locked.payroll_batch_id} (${locked.start_date} to ${locked.end_date}) is ` +
+                `${locked.status === 'Paid' ? 'Paid' : 'Finalized'} and covers ${from} to ${to}. ` +
+                'The start date cannot change inside a locked payroll period.',
+                409, { code: 'PAYROLL_PERIOD_FINALIZED', batch_id: locked.payroll_batch_id });
+        }
+
+        await connection.execute(
+            'UPDATE workersiteassignments SET assigned_date = ?, updated_at = NOW() WHERE assignment_id = ?',
+            [newStart, assignmentId]);
+
+        // Attendance of this worker at this site/shift on the added days (now covered).
+        let nowCovered = 0;
+        if (earlier) {
+            const [[c]] = await connection.execute(
+                `SELECT COUNT(*) AS cnt FROM attendance
+                 WHERE worker_id = ? AND site_id = ? AND shift_type = ? AND record_date BETWEEN ? AND ?`,
+                [worker.worker_id, a.site_id, a.shift_type, from, to]);
+            nowCovered = Number(c.cnt) || 0;
+        }
+
+        await audit(connection, assignmentId, 'ASSIGNMENT_START_CHANGED', userId,
+            { assigned_date: oldStart, site_id: a.site_id, shift_type: a.shift_type },
+            { assigned_date: newStart, reason, changed_days: { from, to, kind: earlier ? 'added' : 'removed' } });
+        await connection.commit();
+
+        const toRegenerate = batches.map((b) => ({
+            payroll_batch_id: b.payroll_batch_id, start_date: b.start_date, end_date: b.end_date, batch_type: b.batch_type,
+        }));
+        res.status(200).json({
+            status: 'success',
+            message: `${worker.full_name}: assignment at "${a.site_name}" (${a.shift_type}) now starts on ${newStart} (was ${oldStart}).` +
+                (earlier && nowCovered ? ` ${nowCovered} attendance record(s) before the old start are now covered.` : '') +
+                (toRegenerate.length ? ` Regenerate payroll batch #${toRegenerate.map((b) => b.payroll_batch_id).join(', #')} to include the change.` : ''),
+            data: {
+                assignment_id: assignmentId, old_start_date: oldStart, new_start_date: newStart,
+                attendance_now_covered: nowCovered, payroll_batches_to_regenerate: toRegenerate,
+            },
+        });
+    } catch (err) {
+        try { await connection.rollback(); } catch (_) {}
+        sendError(res, err, 'An error occurred while changing the start date.');
     } finally {
         connection.release();
     }
