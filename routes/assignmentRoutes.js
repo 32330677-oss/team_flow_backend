@@ -13,7 +13,9 @@
 //   POST   /api/assignments/:id/end             End Assignment: { last_day, reason }
 //   POST   /api/assignments/:id/transfer        Direct Transfer: { transfer_date, target_site_id,
 //                                               target_shift_type, reason } — one transaction
-//   POST   /api/assignments/:id/start-date      Change the FIRST day: { new_start_date, reason }
+//   POST   /api/assignments/:id/start-date      Change the FIRST day: { new_start_date, reason,
+//                                               also_move_hire_date? } (earlier than the hire date:
+//                                               409 BEFORE_HIRE_DATE unless also_move_hire_date)
 //   DELETE /api/assignments/:id                 kept for old clients: same as /end, requires last_day
 const express = require('express');
 const router = express.Router();
@@ -339,7 +341,8 @@ router.post('/:assignment_id/transfer', authMiddleware, restrictTo('Admin'), asy
 //    entered too early. Checks, all inside ONE transaction (worker row locked):
 //      * date valid, not in the future, different from the current start;
 //      * the assignment is not cancelled and the new start <= its last day;
-//      * EARLIER start: not before the hire date, worker Active on every added
+//      * EARLIER start: not before the hire date (unless also_move_hire_date:
+//        the hire date and first compensation period move back too), worker Active on every added
 //        day (status history), no other assignment of the worker on the added
 //        days;
 //      * LATER start: no attendance of the worker at this site/shift on the
@@ -364,6 +367,29 @@ async function payrollBatchesCovering(executor, { siteId, workerId, from, to }) 
     return rows;
 }
 
+// Hire date moved EARLIER (only from the start-date change, after the Admin
+// confirmed it). The first compensation period is extended back to the new
+// hire date, otherwise payroll would find no rate for the added days.
+async function moveHireDateEarlier(executor, { workerId, oldHireDate, newHireDate, userId, reason }) {
+    const [[firstComp]] = await executor.execute(
+        `SELECT compensation_id, DATE_FORMAT(effective_from, '%Y-%m-%d') AS effective_from
+         FROM workercompensationhistory WHERE worker_id = ?
+         ORDER BY effective_from ASC, compensation_id ASC LIMIT 1 FOR UPDATE`, [workerId]);
+    let compensationMoved = null;
+    if (firstComp && firstComp.effective_from > newHireDate) {
+        await executor.execute('UPDATE workercompensationhistory SET effective_from = ? WHERE compensation_id = ?',
+            [newHireDate, firstComp.compensation_id]);
+        compensationMoved = { compensation_id: firstComp.compensation_id, from: firstComp.effective_from, to: newHireDate };
+    }
+    await executor.execute('UPDATE workers SET hire_date = ? WHERE worker_id = ?', [newHireDate, workerId]);
+    await executor.execute(
+        `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+         VALUES ('workers', ?, 'HIRE_DATE_CHANGED', ?, ?, ?)`,
+        [workerId, userId, JSON.stringify({ hire_date: oldHireDate }),
+            JSON.stringify({ hire_date: newHireDate, reason, compensation_moved: compensationMoved, via: 'assignment start-date change' })]);
+    return { old_hire_date: oldHireDate, new_hire_date: newHireDate, compensation_moved: compensationMoved };
+}
+
 router.post('/:assignment_id/start-date', authMiddleware, restrictTo('Admin'), async (req, res) => {
     const connection = await db.getConnection();
     try {
@@ -374,6 +400,8 @@ router.post('/:assignment_id/start-date', authMiddleware, restrictTo('Admin'), a
         if (newStart > businessToday()) throw new OpError('The start date cannot be in the future.');
         const reason = requireText(req.body?.reason, 'reason');
         const userId = req.user.user_id;
+        const alsoMoveHireDate = req.body?.also_move_hire_date === true || req.body?.also_move_hire_date === 'true';
+        let hireDateMoved = null;
 
         await connection.beginTransaction();
         // Lock order: worker first (same as create), then the assignment.
@@ -407,7 +435,16 @@ router.post('/:assignment_id/start-date', authMiddleware, restrictTo('Admin'), a
 
         if (earlier) {
             if (worker.hire_date && newStart < worker.hire_date) {
-                throw new OpError(`The new start (${newStart}) cannot be earlier than the worker's hire date (${worker.hire_date}).`, 409);
+                if (!alsoMoveHireDate) {
+                    throw new OpError(
+                        `The new start (${newStart}) cannot be earlier than the worker's hire date (${worker.hire_date}).`,
+                        409, { code: 'BEFORE_HIRE_DATE', hire_date: worker.hire_date, new_start_date: newStart });
+                }
+                // The Admin confirmed: the worker really started earlier. Move the
+                // hire date (and the first compensation period) to the new start.
+                hireDateMoved = await moveHireDateEarlier(connection, {
+                    workerId: worker.worker_id, oldHireDate: worker.hire_date, newHireDate: newStart, userId, reason,
+                });
             }
             const statusAtStart = await getWorkerStatusOnDate(worker.worker_id, newStart, connection);
             if (statusAtStart.status !== 'Active') {
@@ -483,10 +520,12 @@ router.post('/:assignment_id/start-date', authMiddleware, restrictTo('Admin'), a
             status: 'success',
             message: `${worker.full_name}: assignment at "${a.site_name}" (${a.shift_type}) now starts on ${newStart} (was ${oldStart}).` +
                 (earlier && nowCovered ? ` ${nowCovered} attendance record(s) before the old start are now covered.` : '') +
+                (hireDateMoved ? ` Hire date moved from ${hireDateMoved.old_hire_date} to ${hireDateMoved.new_hire_date}.` : '') +
                 (toRegenerate.length ? ` Regenerate payroll batch #${toRegenerate.map((b) => b.payroll_batch_id).join(', #')} to include the change.` : ''),
             data: {
                 assignment_id: assignmentId, old_start_date: oldStart, new_start_date: newStart,
                 attendance_now_covered: nowCovered, payroll_batches_to_regenerate: toRegenerate,
+                hire_date_moved: hireDateMoved,
             },
         });
     } catch (err) {

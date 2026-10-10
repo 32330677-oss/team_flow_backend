@@ -69,6 +69,21 @@ test.before(async () => {
   // Worker 710: worked from 2026-09-29, assigned from 09-30, assignment already ENDED (last day 10-05).
   await worker(710); await assign('J1', 710, 70, '2026-09-30', '2026-10-05');
   await att(710, 70, '2026-09-29'); await att(710, 70, '2026-10-01');
+  // Site 72 (supervisor 12): worker 711 assigned from 2026-10-02, worked 09-28 without any record.
+  await q("INSERT INTO sites (site_id, site_name, site_status, contract_id, supervisor_id, supports_shifts) VALUES (72, 'Site 72', 'Active', 70, 12, 0)");
+  await worker(711);
+  const r = await q("INSERT INTO workersiteassignments (worker_id, site_id, contract_id, assigned_date, shift_type) VALUES (711, 72, 70, '2026-10-02', 'Day')");
+  ids.K1 = r.insertId;
+  // Worker 712: hired 09-29 (first rate from 09-29), assigned 09-30, worked 09-28.
+  await worker(712, '2026-09-29');
+  await q(`INSERT INTO workercompensationhistory (worker_id, payment_type, daily_rate, regular_hourly_rate, overtime_hourly_rate, effective_from, reason)
+           VALUES (712, 'Hourly', NULL, 100, 150, '2026-09-29', 'Initial')`);
+  await assign('L1', 712, 70, '2026-09-30'); await att(712, 70, '2026-09-28');
+  // Worker 713: same, but another assignment overlaps -> the whole change must roll back.
+  await worker(713, '2026-09-29');
+  await q(`INSERT INTO workercompensationhistory (worker_id, payment_type, daily_rate, regular_hourly_rate, overtime_hourly_rate, effective_from, reason)
+           VALUES (713, 'Hourly', NULL, 100, 150, '2026-09-29', 'Initial')`);
+  await assign('M0', 713, 71, '2026-09-20', '2026-09-27'); await assign('M1', 713, 70, '2026-09-30');
 });
 test.after(async () => { await stopServer(); });
 
@@ -169,4 +184,61 @@ test('SD9 an ENDED assignment can get an earlier start (worked the day before th
   const h = await admin().get('/api/assignments/worker/710');
   assert.equal(h.status, 200);
   assert.equal(h.body.data[0].assigned_date, '2026-09-29');
+});
+
+test('SD10 after an earlier start the Supervisor sees the worker on that day and can record + submit him', async () => {
+  const sup = client(12, 'Supervisor');
+  const D = '2026-09-28';
+  let view = await sup.get(`/api/attendance/sites/72/workers?record_date=${D}`);
+  assert.equal(view.status, 200, JSON.stringify(view.body));
+  assert.ok(!view.body.data.some((w) => w.worker_id === 711), 'not listed before the change');
+
+  const r = await change('K1', D);
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+
+  view = await sup.get(`/api/attendance/sites/72/workers?record_date=${D}`);
+  const w = view.body.data.find((x) => x.worker_id === 711);
+  assert.ok(w, 'listed for the Supervisor on the added day');
+  assert.equal(w.attendance_id, null, 'shown as not recorded');
+
+  let res = await sup.post('/api/attendance/checkin', { worker_id: 711, site_id: 72, check_in_time: `${D} 07:00:00` });
+  assert.equal(res.status, 201, JSON.stringify(res.body));
+  res = await sup.post('/api/attendance/checkout', { worker_id: 711, site_id: 72, record_date: D, check_out_time: `${D} 15:00:00` });
+  assert.ok([200, 201].includes(res.status), JSON.stringify(res.body));
+  let sub = await sup.post('/api/attendance/submit', { siteId: 72, shift_type: 'Day', record_date: D });
+  if (sub.body.requires_confirmation) {
+    sub = await sup.post('/api/attendance/submit', { siteId: 72, shift_type: 'Day', record_date: D,
+      confirmed_lunch_skips: sub.body.missing_workers.map((m) => ({ attendance_id: m.attendance_id, reason: 'test' })) });
+  }
+  assert.equal(sub.status, 200, JSON.stringify(sub.body));
+  const [rec] = await q('SELECT status FROM attendance WHERE worker_id = 711 AND record_date = ?', [D]);
+  assert.equal(rec.status, 'Submitted');
+});
+
+test('SD11 before the hire date: refused with BEFORE_HIRE_DATE, accepted with also_move_hire_date (rate moves too)', async () => {
+  let r = await change('L1', '2026-09-28');
+  assert.equal(r.status, 409);
+  assert.equal(r.body.code, 'BEFORE_HIRE_DATE');
+  assert.equal(r.body.hire_date, '2026-09-29');
+  r = await admin().post(`/api/assignments/${ids.L1}/start-date`, { new_start_date: '2026-09-28', reason: REASON, also_move_hire_date: true });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(r.body.data.hire_date_moved.new_hire_date, '2026-09-28');
+  assert.equal(r.body.data.attendance_now_covered, 1);
+  const [w] = await q("SELECT DATE_FORMAT(hire_date, '%Y-%m-%d') AS h FROM workers WHERE worker_id = 712");
+  assert.equal(w.h, '2026-09-28');
+  const [c] = await q("SELECT DATE_FORMAT(MIN(effective_from), '%Y-%m-%d') AS f FROM workercompensationhistory WHERE worker_id = 712");
+  assert.equal(c.f, '2026-09-28', 'payroll has a rate for the new first day');
+  const [log] = await q("SELECT COUNT(*) AS n FROM auditlogs WHERE table_name = 'workers' AND record_id = 712 AND action_type = 'HIRE_DATE_CHANGED'");
+  assert.equal(Number(log.n), 1);
+});
+
+test('SD12 hire date is NOT moved when another check fails (one transaction)', async () => {
+  const r = await admin().post(`/api/assignments/${ids.M1}/start-date`, { new_start_date: '2026-09-26', reason: REASON, also_move_hire_date: true });
+  assert.equal(r.status, 409);
+  assert.match(r.body.message, /Site 71/);
+  const [w] = await q("SELECT DATE_FORMAT(hire_date, '%Y-%m-%d') AS h FROM workers WHERE worker_id = 713");
+  assert.equal(w.h, '2026-09-29');
+  const [c] = await q("SELECT DATE_FORMAT(MIN(effective_from), '%Y-%m-%d') AS f FROM workercompensationhistory WHERE worker_id = 713");
+  assert.equal(c.f, '2026-09-29');
+  assert.equal(await startOf('M1'), '2026-09-30');
 });
