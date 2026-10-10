@@ -66,6 +66,9 @@ test.before(async () => {
   await q(`INSERT INTO worker_status_history (worker_id, old_status, new_status, effective_date) VALUES
            (709, 'Active', 'Inactive', '2026-05-03'), (709, 'Inactive', 'Active', '2026-05-06')`);
   await assign('I1', 709, 70, '2026-05-10');
+  // Worker 710: worked from 2026-09-29, assigned from 09-30, assignment already ENDED (last day 10-05).
+  await worker(710); await assign('J1', 710, 70, '2026-09-30', '2026-10-05');
+  await att(710, 70, '2026-09-29'); await att(710, 70, '2026-10-01');
 });
 test.after(async () => { await stopServer(); });
 
@@ -154,4 +157,16 @@ test('SD8 validation and access', async () => {
   assert.equal(r.status, 404);
   r = await client(11, 'Supervisor').post(`/api/assignments/${ids.A1}/start-date`, { new_start_date: '2026-05-04', reason: REASON });
   assert.equal(r.status, 403);
+});
+
+test('SD9 an ENDED assignment can get an earlier start (worked the day before the recorded start)', async () => {
+  const r = await change('J1', '2026-09-29');
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(r.body.data.attendance_now_covered, 1);
+  const [row] = await q("SELECT DATE_FORMAT(assigned_date, '%Y-%m-%d') AS s, DATE_FORMAT(unassigned_date, '%Y-%m-%d') AS e FROM workersiteassignments WHERE assignment_id = ?", [ids.J1]);
+  assert.deepEqual(row, { s: '2026-09-29', e: '2026-10-05' }, 'the last day is kept');
+  // Shown in the worker history (the app opens it from there for ended assignments).
+  const h = await admin().get('/api/assignments/worker/710');
+  assert.equal(h.status, 200);
+  assert.equal(h.body.data[0].assigned_date, '2026-09-29');
 });
