@@ -39,6 +39,7 @@ function resetDatabase({ migrate = true } = {}) {
     }
     sh(`${MYSQL} ${DB_NAME} < migrations/2026_10_recycle_bin/01_ddl.sql`);
     sh(`${MYSQL} ${DB_NAME} < migrations/2026_10_payroll_adjustments/01_ddl.sql`);
+    sh(`${MYSQL} ${DB_NAME} < migrations/2026_10_daily_site_report/01_ddl.sql`);
   }
 }
 

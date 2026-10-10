@@ -61,6 +61,7 @@ app.use('/api/staff-overtime', staffOvertimeRoutes);
 app.use('/api/main-dashboard', mainDashboardRoutes);
 app.use('/api/recycle-bin', require('./routes/recycleBinRoutes'));
 app.use('/api/payroll-adjustments', require('./routes/payrollAdjustmentRoutes'));
+app.use('/api/reports/daily-site', require('./routes/dailySiteReportRoutes'));
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });
 });
