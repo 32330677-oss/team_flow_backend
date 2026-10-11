@@ -26,4 +26,16 @@ const loginLimiter = rateLimit({
     },
 });
 
-module.exports = { forgotPasswordLimiter, loginLimiter };
+// QR document downloads (no login): per IP.
+const publicDocumentLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: Number(process.env.PUBLIC_DOC_RATE_LIMIT_MAX) || 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: {
+        status: 'error',
+        message: 'Too many downloads. Please try again later.',
+    },
+});
+
+module.exports = { forgotPasswordLimiter, loginLimiter, publicDocumentLimiter };

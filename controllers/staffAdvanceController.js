@@ -5,6 +5,7 @@ const multer = require('multer');
 const db = require('../config/db');
 const svc = require('../services/staffAdvanceService');
 const pdf = require('../services/staffAdvancePdf');
+const documents = require('../services/staffAdvanceDocuments');
 const fileStorage = require('../services/fileStorage');
 
 const RECEIPT_TYPES = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.pdf': 'application/pdf' };
@@ -155,39 +156,82 @@ async function loadStaff(staffId) {
   return staff;
 }
 
-// GET /api/staff-advances/:id/voucher.pdf   (every print is counted; reprints say COPY)
+async function qrFor(req, token) {
+  if (!token) return null;
+  const url = documents.publicDocumentUrl(req, token);
+  return { url, png: await documents.qrPng(url) };
+}
+
+// GET /api/staff-advances/:id/voucher.pdf
+// The voucher as issued (frozen). Every print is counted; reprints say COPY,
+// a cancelled voucher is stamped CANCELLED. Carries the QR download code.
 exports.voucherPdf = async (req, res) => {
   try {
-    const advance = await svc.getAdvance(req.params.id);
-    const staff = await loadStaff(advance.staff_id);
-    const printNumber = await svc.recordVoucherPrint(advance.advance_id, req.user.user_id);
+    const v = await documents.loadVoucher(req.params.id);
+    const qr = await qrFor(req, v.token);
+    const printNumber = await svc.recordVoucherPrint(v.advance_id, req.user.user_id);
     const [[u]] = await db.execute('SELECT full_name FROM users WHERE user_id = ?', [req.user.user_id]);
-    return pdf.renderVoucherPdf(res, { advance, staff, printNumber, printedBy: u ? u.full_name : null });
+    return pdf.renderVoucherPdf(res, {
+      voucher: v.doc, meta: v, printNumber, printedBy: u ? u.full_name : null, source: 'print', qr,
+    });
   } catch (error) {
     if (res.headersSent) return undefined;
     return svc.sendError(res, error, 'Failed to export the voucher.');
   }
 };
 
-// GET /api/staff-advances/:id/repayments/:entryId/receipt.pdf
+// GET /api/staff-advances/:id/repayments/:entryId/receipt.pdf   (frozen, with QR)
 exports.repaymentReceiptPdf = async (req, res) => {
   try {
-    const advance = await svc.getAdvance(req.params.id);
-    const entryId = Number(req.params.entryId);
-    let running = 0;
-    let entry = null;
-    for (const l of advance.ledger) {
-      running = svc.money(running + l.amount);
-      if (l.entry_id === entryId) { entry = { ...l, balance_after: running }; break; }
-    }
-    if (!entry || entry.entry_type !== 'CashRepayment') {
-      return res.status(404).json({ status: 'error', message: 'Repayment not found.' });
-    }
-    const staff = await loadStaff(advance.staff_id);
-    return pdf.renderRepaymentReceiptPdf(res, { advance, staff, entry });
+    const r = await documents.loadReceipt(req.params.id, req.params.entryId);
+    const qr = await qrFor(req, r.token);
+    return pdf.renderRepaymentReceiptPdf(res, { receipt: r.doc, meta: r, source: 'print', qr });
   } catch (error) {
     if (res.headersSent) return undefined;
     return svc.sendError(res, error, 'Failed to export the receipt.');
+  }
+};
+
+// GET /api/staff-advances/:id/statement.pdf   current state (live data)
+exports.statementPdf = async (req, res) => {
+  try {
+    const advance = await svc.getAdvance(req.params.id);
+    const staff = await loadStaff(advance.staff_id);
+    return pdf.renderStatementPdf(res, { advance, staff });
+  } catch (error) {
+    if (res.headersSent) return undefined;
+    return svc.sendError(res, error, 'Failed to export the statement.');
+  }
+};
+
+// GET /api/public/documents/:token.pdf   (NO login: the QR code on the paper)
+// Downloads the frozen document. Unknown tokens get a plain 404.
+exports.publicDocumentPdf = async (req, res) => {
+  try {
+    const found = await documents.findByPublicToken(req.params.token);
+    if (!found) return res.status(404).json({ status: 'error', message: 'Document not found.' });
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+    try {
+      await db.execute(
+        `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+         VALUES (?, ?, 'PUBLIC_DOCUMENT_DOWNLOADED', NULL, NULL, ?)`,
+        [found.kind === 'voucher' ? 'staff_advances' : 'staff_advance_ledger',
+          found.kind === 'voucher' ? found.advance_id : found.entry_id,
+          JSON.stringify({ number: found.number, ip: req.ip })]);
+    } catch (e) { /* the download never fails because of the audit row */ }
+    const qr = await qrFor(req, found.token);
+    if (found.kind === 'voucher') {
+      return pdf.renderVoucherPdf(res, { voucher: found.doc, meta: found, source: 'qr', qr });
+    }
+    return pdf.renderRepaymentReceiptPdf(res, { receipt: found.doc, meta: found, source: 'qr', qr });
+  } catch (error) {
+    if (res.headersSent) return undefined;
+    if (error && error.isOperational && error.statusCode === 409) {
+      return res.status(409).json({ status: 'error', code: error.code, message: 'This document failed its integrity check and cannot be downloaded.' });
+    }
+    console.error('publicDocumentPdf:', error);
+    return res.status(500).json({ status: 'error', message: 'Failed to load the document.' });
   }
 };
 

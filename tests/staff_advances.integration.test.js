@@ -59,6 +59,7 @@ async function createAdvance(staffId, amount, schedule, extra = {}) {
     staff_id: staffId, amount, schedule, reason: 'Family emergency', financial_report_id: reportId, ...extra,
   });
 }
+const money2 = (v) => Math.round(Number(v) * 100) / 100;
 const line = async (batchId, staffId) => (await q(
   'SELECT * FROM staff_payroll WHERE staff_payroll_batch_id = ? AND staff_id = ?', [batchId, staffId]))[0];
 const batch = async (batchId) => (await q('SELECT * FROM staff_payroll_batches WHERE staff_payroll_batch_id = ?', [batchId]))[0];
@@ -427,4 +428,144 @@ test('SA13 voucher prints: original then COPY, counted; list filters', async () 
   assert.ok(list.body.open_balance_by_currency.USD > 0);
   const byStaff = await admin().get('/api/staff-advances?staff_id=3');
   assert.deepEqual(byStaff.body.data.map((a) => a.advance_id), [S.a3]);
+});
+
+// ======================= Frozen documents + QR =======================
+const publicGet = async (path) => {
+  const res = await fetch(base + path);
+  return { status: res.status, bytes: Buffer.from(await res.arrayBuffer()), headers: res.headers };
+};
+
+test('SA14 the voucher is frozen as issued: reschedules do not change it; the statement shows the current state', async () => {
+  // S.a1 was created for M+1 (1500), then rescheduled to M+1 1000 + M+2 500, then written off.
+  const row = (await q('SELECT voucher_snapshot, voucher_hash, public_token FROM staff_advances WHERE advance_id = ?', [S.a1]))[0];
+  const snap = typeof row.voucher_snapshot === 'string' ? JSON.parse(row.voucher_snapshot) : row.voucher_snapshot;
+  assert.deepEqual(snap.schedule.map((r) => [r.month, r.amount]), [[M1, '1500.00']], 'schedule as signed');
+  assert.equal(snap.frozen_late, false);
+  assert.match(row.voucher_hash, /^[0-9a-f]{64}$/);
+  assert.match(row.public_token, /^[A-Za-z0-9_-]{32}$/);
+  const { fingerprint } = require('../services/staffAdvanceDocuments');
+  assert.equal(fingerprint(snap), row.voucher_hash, 'fingerprint is stable across the JSON column round trip');
+
+  const v = await getBytes(`/api/staff-advances/${S.a1}/voucher.pdf`);
+  assert.equal(v.status, 200);
+  const text = pdfText(v.bytes);
+  assert.ok(text.includes('1,500.00'));
+  assert.ok(!text.includes(addMonths(M, 2) === M1 ? '__never__' : new Date(`${addMonths(M, 2)}-01T00:00:00Z`).toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' })),
+    'the later reschedule is not on the voucher');
+  assert.match(text, /Document fingerprint/);
+
+  const st = await getBytes(`/api/staff-advances/${S.a1}/statement.pdf`);
+  assert.equal(st.status, 200);
+  const sText = pdfText(st.bytes);
+  assert.match(sText, /ADVANCE STATEMENT/);
+  assert.match(sText, /Written off/);
+});
+
+test('SA15 QR: anyone with the code downloads the same document (no login); bad tokens get 404; prints are not counted', async () => {
+  const [a7] = await q('SELECT voucher_no, public_token, voucher_print_count FROM staff_advances WHERE advance_id = ?', [S.a7]);
+  const r = await publicGet(`/api/public/documents/${a7.public_token}.pdf`);
+  assert.equal(r.status, 200);
+  assert.equal(r.bytes.slice(0, 4).toString(), '%PDF');
+  assert.equal(r.headers.get('cache-control'), 'no-store');
+  const text = pdfText(r.bytes);
+  assert.ok(text.includes(a7.voucher_no));
+  assert.match(text, /COPY \(QR download\)/);
+  assert.equal((await advance(S.a7)).voucher_print_count, a7.voucher_print_count, 'a QR download is not a print');
+  const logs = await q(`SELECT COUNT(*) c FROM auditlogs WHERE action_type = 'PUBLIC_DOCUMENT_DOWNLOADED' AND record_id = ?`, [S.a7]);
+  assert.equal(Number(logs[0].c), 1);
+
+  assert.equal((await publicGet('/api/public/documents/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.pdf')).status, 404);
+  assert.equal((await publicGet('/api/public/documents/short.pdf')).status, 404);
+  assert.equal((await publicGet(`/api/public/documents/${a7.public_token}x.pdf`)).status, 404);
+  // A cancelled voucher downloads stamped CANCELLED.
+  const [a2] = await q('SELECT public_token FROM staff_advances WHERE advance_id = ?', [S.a2]);
+  assert.match(pdfText((await publicGet(`/api/public/documents/${a2.public_token}.pdf`)).bytes), /CANCELLED/);
+  // Receipts too.
+  const [rcp] = await q(`SELECT receipt_no, public_token FROM staff_advance_ledger WHERE entry_type = 'CashRepayment' ORDER BY entry_id LIMIT 1`);
+  assert.match(rcp.public_token, /^[A-Za-z0-9_-]{32}$/);
+  const rr = await publicGet(`/api/public/documents/${rcp.public_token}.pdf`);
+  assert.equal(rr.status, 200);
+  assert.ok(pdfText(rr.bytes).includes(rcp.receipt_no));
+  // Every token is different.
+  const tokens = (await q('SELECT public_token t FROM staff_advances UNION ALL SELECT public_token FROM staff_advance_ledger WHERE public_token IS NOT NULL')).map((x) => x.t);
+  assert.equal(new Set(tokens).size, tokens.length);
+});
+
+test('SA16 a document changed after issue is refused (fingerprint check), on print and on QR', async () => {
+  const [before] = await q('SELECT voucher_snapshot, public_token FROM staff_advances WHERE advance_id = ?', [S.a6]);
+  await q(`UPDATE staff_advances SET voucher_snapshot = JSON_SET(voucher_snapshot, '$.amount', '99999.00') WHERE advance_id = ?`, [S.a6]);
+  const p = await admin().get(`/api/staff-advances/${S.a6}/voucher.pdf`);
+  assert.equal(p.status, 409);
+  assert.equal(p.body.code, 'DOCUMENT_INTEGRITY');
+  assert.equal((await publicGet(`/api/public/documents/${before.public_token}.pdf`)).status, 409);
+  await q('UPDATE staff_advances SET voucher_snapshot = ? WHERE advance_id = ?',
+    [typeof before.voucher_snapshot === 'string' ? before.voucher_snapshot : JSON.stringify(before.voucher_snapshot), S.a6]);
+  assert.equal((await getBytes(`/api/staff-advances/${S.a6}/voucher.pdf`)).status, 200, 'restored -> prints again');
+});
+
+test('SA17 an advance issued before freezing is frozen on first print, with the schedule from its creation record', async () => {
+  // Simulate an advance created by the previous version (no snapshot, no token) and rescheduled since.
+  await q('UPDATE staff_advances SET voucher_snapshot = NULL, voucher_hash = NULL, public_token = NULL WHERE advance_id = ?', [S.a1]);
+  const v = await getBytes(`/api/staff-advances/${S.a1}/voucher.pdf`);
+  assert.equal(v.status, 200);
+  const [row] = await q('SELECT voucher_snapshot, voucher_hash, public_token FROM staff_advances WHERE advance_id = ?', [S.a1]);
+  const snap = typeof row.voucher_snapshot === 'string' ? JSON.parse(row.voucher_snapshot) : row.voucher_snapshot;
+  assert.equal(snap.frozen_late, true);
+  assert.deepEqual(snap.schedule.map((r) => [r.month, r.amount]), [[M1, '1500.00']], 'from the ADVANCE_CREATED audit entry');
+  assert.match(row.public_token, /^[A-Za-z0-9_-]{32}$/);
+  // Frozen once: a second print does not change it.
+  await getBytes(`/api/staff-advances/${S.a1}/voucher.pdf`);
+  const [again] = await q('SELECT voucher_hash, public_token FROM staff_advances WHERE advance_id = ?', [S.a1]);
+  assert.deepEqual([again.voucher_hash, again.public_token], [row.voucher_hash, row.public_token]);
+});
+
+test('SA18 signed voucher upload: images / PDF only, stored and downloadable', async () => {
+  const png = Buffer.from('89504e470d0a1a0a0000000d4948445200000001000000010806000000' +
+    '1f15c4890000000d49444154789c6300010000050001' + '0d0a2db40000000049454e44ae426082', 'hex');
+  const up = async (name, type, bytes) => {
+    const form = new FormData();
+    form.append('file', new Blob([bytes], { type }), name);
+    const res = await fetch(`${base}/api/staff-advances/${S.a7}/signed-receipt`, {
+      method: 'POST', headers: { Authorization: `Bearer ${token(1, 'Admin')}` }, body: form,
+    });
+    return { status: res.status, body: await res.json() };
+  };
+  assert.equal((await up('voucher.exe', 'application/octet-stream', Buffer.from('MZ'))).status, 400);
+  const ok = await up('signed.png', 'image/png', png);
+  assert.equal(ok.status, 200, JSON.stringify(ok.body));
+  assert.equal(ok.body.data.has_signed_receipt, true);
+  const dl = await getBytes(`/api/staff-advances/${S.a7}/signed-receipt`);
+  assert.equal(dl.status, 200);
+  assert.deepEqual(dl.bytes, png);
+  assert.equal((await fetch(`${base}/api/staff-advances/${S.a7}/signed-receipt`)).status, 401, 'login required');
+});
+
+test('SA19 leftover amount rescheduled, then its batch voided: the balance and the schedule stay consistent', async () => {
+  // Staff 5: salary 1000, attendance in the current month. Advance of 5000 for this month.
+  const r = await createAdvance(5, 5000, [{ month: M1, amount: 5000 }]);
+  assert.equal(r.status, 201, JSON.stringify(r.body));
+  const id = r.body.data.advance_id;
+  // Test hook: point it to the previous month (its batch can be generated); staff 5 has no attendance there -> attach some.
+  await q('UPDATE staff_advance_installments SET deduction_month = ? WHERE advance_id = ?', [PREV, id]);
+  await addAttendance(5, `${PREV}-01`, lastDay(PREV));
+  const g = await admin().post('/api/staff-payroll/generate', PREV_PERIOD);
+  assert.equal(g.status, 201, JSON.stringify(g.body));
+  const deducted = Number((await line(g.body.batch_id, 5)).advance_deduction_amount);
+  assert.ok(deducted > 0 && deducted < 5000);
+  // The leftover (Unscheduled) is rescheduled to next month.
+  const rest = money2(5000 - deducted);
+  const rs = await admin().put(`/api/staff-advances/${id}/schedule`, { schedule: [{ month: M1, amount: rest }], reason: 'Leftover to next month' });
+  assert.equal(rs.status, 200, JSON.stringify(rs.body));
+  // Now the batch is voided: the deducted part goes back to Scheduled (previous month); the leftover stays in M+1.
+  assert.equal((await admin().patch(`/api/staff-payroll/batch/${g.body.batch_id}/void`, { reason: 'void after reschedule' })).status, 200);
+  const live = (await installments(id)).filter((i) => !['Replaced'].includes(i.status));
+  const sum = live.reduce((s, i) => s + Number(i.amount), 0);
+  assert.equal(Math.round(sum * 100), 500000, 'the schedule still adds up to the advance');
+  assert.deepEqual(live.map((i) => [i.deduction_month, i.status]).sort(), [[M1, 'Scheduled'], [PREV, 'Scheduled']].sort());
+  assert.equal(Number((await advance(id)).outstanding_balance), 5000);
+  // The voucher still shows the schedule as signed.
+  const [row] = await q('SELECT voucher_snapshot FROM staff_advances WHERE advance_id = ?', [id]);
+  const snap = typeof row.voucher_snapshot === 'string' ? JSON.parse(row.voucher_snapshot) : row.voucher_snapshot;
+  assert.deepEqual(snap.schedule.map((x) => [x.month, x.amount]), [[M1, '5000.00']]);
 });

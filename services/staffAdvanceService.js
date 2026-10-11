@@ -29,6 +29,7 @@
 const db = require('../config/db');
 const settingsCache = require('./settingsCache');
 const { businessToday } = require('./businessDate');
+const documents = require('./staffAdvanceDocuments');
 
 const PAYMENT_METHODS = ['Cash', 'BankTransfer', 'Cheque'];
 const MAX_SCHEDULE_ROWS = 24;
@@ -549,6 +550,8 @@ async function createAdvance({ staffId: rawStaffId, amount: rawAmount, schedule,
         [advanceId, amount.toFixed(2), method, `Advance paid out: ${voucherNo}`, userId]);
       await audit(connection, 'staff_advances', advanceId, 'ADVANCE_CREATED', userId, null,
         { voucher_no: voucherNo, staff_id: staffId, amount, currency, schedule: rows, reason, payment_method: method, financial_report_id: reportId });
+      // The voucher is frozen as issued (same transaction): prints and QR downloads show this content.
+      await documents.freezeVoucher(connection, advanceId);
       return { advanceId, warnings };
     });
   } catch (error) {
@@ -723,6 +726,8 @@ async function repayAdvance(rawId, { amount: rawAmount, reason: rawReason, payme
     if (balance <= 0) {
       await connection.execute(`UPDATE staff_advances SET status = 'Settled', settled_at = NOW() WHERE advance_id = ?`, [a.advance_id]);
     }
+    // The receipt is frozen as issued (same transaction).
+    await documents.freezeReceipt(connection, led.insertId);
     await audit(connection, 'staff_advances', a.advance_id, 'ADVANCE_REPAID', userId,
       { outstanding_balance: Number(a.outstanding_balance) }, { amount, receipt_no: receiptNo, outstanding_balance: balance, reason });
     return { receipt_no: receiptNo, entry_id: led.insertId, balance };
@@ -997,6 +1002,13 @@ async function assertStaffAdvanceSchema(executor = db) {
      AND TABLE_NAME = 'staff_payroll' AND COLUMN_NAME = 'advance_deduction_amount'`);
   if (Number(t.n) !== 5 || Number(c.n) !== 1) {
     throw new Error('Staff advance tables are missing. Run migrations/2026_10_staff_advances/01_ddl.sql before starting this version.');
+  }
+  const [[d]] = await executor.query(
+    `SELECT COUNT(*) AS n FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+     AND ((TABLE_NAME = 'staff_advances' AND COLUMN_NAME IN ('voucher_snapshot','voucher_hash','public_token'))
+       OR (TABLE_NAME = 'staff_advance_ledger' AND COLUMN_NAME IN ('document_snapshot','document_hash','public_token')))`);
+  if (Number(d.n) !== 6) {
+    throw new Error('Frozen document columns are missing. Run migrations/2026_10_staff_advances/02_frozen_documents.sql before starting this version.');
   }
 }
 

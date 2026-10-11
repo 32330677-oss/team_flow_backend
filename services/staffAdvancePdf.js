@@ -75,11 +75,12 @@ function drawHeader(doc, title, rightLines) {
   const top = doc.page.margins.top;
   const logo = fs.existsSync(LOGO_PATH) ? LOGO_PATH : (fs.existsSync(FALLBACK_LOGO) ? FALLBACK_LOGO : null);
   if (logo) doc.image(logo, L, top, { fit: [90, 52] });
-  doc.font('Helvetica-Bold').fontSize(9).fillColor(BRAND.muted).text(COMPANY_NAME, L + 100, top + 4, { width: 220 });
-  doc.font('Helvetica-Bold').fontSize(15).fillColor(BRAND.charcoalDark).text(title, L + 100, top + 18, { width: 240 });
-  // Right box: document number + dates
+  // Right box: document number + dates. The title never runs under it.
   const bw = 190;
   const bx = L + W - bw;
+  const titleW = bx - (L + 100) - 12;
+  doc.font('Helvetica-Bold').fontSize(9).fillColor(BRAND.muted).text(COMPANY_NAME, L + 100, top + 4, { width: titleW });
+  doc.font('Helvetica-Bold').fontSize(15).fillColor(BRAND.charcoalDark).text(title, L + 100, top + 18, { width: titleW });
   const bh = 14 + rightLines.length * 14;
   doc.rect(bx, top, bw, bh).fill(BRAND.goldLight);
   doc.rect(bx, top, 3, bh).fill(BRAND.gold);
@@ -103,19 +104,18 @@ function sectionTitle(doc, y, text) {
 }
 
 // Two-column key/value grid.
-function kvGrid(doc, y, pairs, cols = 2) {
+function kvGrid(doc, y, pairs, cols = 2, rowH = 30) {
   const L = doc.page.margins.left;
   const W = doc.page.width - L - doc.page.margins.right;
   const colW = W / cols;
-  const rowH = 30;
   pairs.forEach(([k, v], i) => {
     const c = i % cols;
     const r = Math.floor(i / cols);
     const x = L + c * colW;
     const yy = y + r * rowH;
     doc.rect(x, yy, colW, rowH).strokeColor(BRAND.grid).stroke();
-    doc.font('Helvetica').fontSize(7.5).fillColor(BRAND.muted).text(k, x + 8, yy + 5, { width: colW - 16 });
-    doc.font('Helvetica-Bold').fontSize(9.5).fillColor(BRAND.ink).text(String(v ?? '-'), x + 8, yy + 15, { width: colW - 16, lineBreak: false, ellipsis: true });
+    doc.font('Helvetica').fontSize(7.5).fillColor(BRAND.muted).text(k, x + 8, yy + (rowH < 30 ? 3 : 5), { width: colW - 16 });
+    doc.font('Helvetica-Bold').fontSize(9.5).fillColor(BRAND.ink).text(String(v ?? '-'), x + 8, yy + (rowH < 30 ? 13 : 15), { width: colW - 16, lineBreak: false, ellipsis: true });
   });
   return y + Math.ceil(pairs.length / cols) * rowH + 12;
 }
@@ -183,117 +183,214 @@ function footer(doc, text) {
 }
 
 const STATUS_LABEL = { Active: 'ACTIVE', Settled: 'SETTLED', Cancelled: 'CANCELLED', WrittenOff: 'WRITTEN OFF' };
+const methodLabel = (m) => (m === 'BankTransfer' ? 'Bank transfer' : (m || 'Cash'));
+const shortHash = (h) => String(h || '').slice(0, 16).toUpperCase().replace(/(.{4})(?=.)/g, '$1 ');
+
+// QR code + fingerprint block. Anyone who scans it downloads this same document.
+function qrBlock(doc, y, { png, caption, hash, url }) {
+  const L = doc.page.margins.left;
+  const W = doc.page.width - L - doc.page.margins.right;
+  const size = 74;
+  if (y + size + 8 > doc.page.height - doc.page.margins.bottom - 20) { doc.addPage(); y = doc.page.margins.top; }
+  doc.rect(L, y, W, size + 8).fill(BRAND.grey);
+  if (png) doc.image(png, L + 4, y + 4, { width: size, height: size });
+  const tx = L + size + 16;
+  doc.font('Helvetica-Bold').fontSize(9).fillColor(BRAND.charcoalDark).text(caption, tx, y + 10, { width: W - size - 24 });
+  doc.font('Helvetica').fontSize(7.5).fillColor(BRAND.muted)
+    .text('Scan with a phone camera to download this document as issued. Compare it with the paper copy.', tx, y + 24, { width: W - size - 24 });
+  doc.font('Helvetica-Bold').fontSize(8).fillColor(BRAND.ink).text(`Document fingerprint: ${shortHash(hash)}`, tx, y + 46, { width: W - size - 24 });
+  if (url) doc.font('Helvetica').fontSize(6).fillColor(BRAND.muted).text(url, tx, y + 60, { width: W - size - 24, lineBreak: false, ellipsis: true });
+  return y + size + 18;
+}
+
+function printLabel(source, printNumber) {
+  if (source === 'qr') return 'COPY (QR download)';
+  return printNumber > 1 ? `COPY ${printNumber - 1}` : 'ORIGINAL';
+}
 
 // ---------------------------------------------------------------------------
-// Payment voucher
+// Payment voucher: drawn ONLY from the frozen document (as issued).
+//   meta: { status, cancelled_at, cancel_reason, hash }
 // ---------------------------------------------------------------------------
-function renderVoucherPdf(res, { advance, staff, report, printNumber, printedBy }) {
-  const doc = newDoc(res, `${advance.voucher_no}.pdf`);
-  const cur = advance.currency;
+function renderVoucherPdf(res, { voucher, meta, printNumber = 1, printedBy = null, source = 'print', qr = null }) {
+  const doc = newDoc(res, `${voucher.voucher_no}.pdf`);
+  const cur = voucher.currency;
+  const s = voucher.staff;
+  const cancelled = meta.status === 'Cancelled';
   let y = drawHeader(doc, 'SALARY ADVANCE PAYMENT VOUCHER', [
-    ['Voucher No.', advance.voucher_no, true],
-    ['Date', String(advance.created_at).slice(0, 16)],
-    ['Status', STATUS_LABEL[advance.status] || advance.status],
-    ['Print', printNumber > 1 ? `COPY ${printNumber - 1}` : 'ORIGINAL'],
+    ['Voucher No.', voucher.voucher_no, true],
+    ['Issued', voucher.issued_at],
+    ['Copy', printLabel(source, printNumber)],
+    ...(cancelled ? [['Status', 'CANCELLED']] : []),
   ]);
-  if (advance.status === 'Cancelled') watermark(doc, 'CANCELLED');
-  else if (printNumber > 1) watermark(doc, 'COPY');
+  if (cancelled) watermark(doc, 'CANCELLED');
+  else if (source === 'qr' || printNumber > 1) watermark(doc, 'COPY');
+  const L = doc.page.margins.left;
+  const W = doc.page.width - L - doc.page.margins.right;
+
+  if (cancelled) {
+    doc.rect(L, y - 4, W, 18).fill(BRAND.charcoal);
+    doc.font('Helvetica-Bold').fontSize(8.5).fillColor(BRAND.white)
+      .text(`CANCELLED on ${meta.cancelled_at || '-'}${meta.cancel_reason ? `: ${meta.cancel_reason}` : ''}. This voucher is void.`,
+        L + 8, y + 1, { width: W - 16, lineBreak: false, ellipsis: true });
+    y += 22;
+  }
 
   y = sectionTitle(doc, y, 'Paid to');
   y = kvGrid(doc, y, [
-    ['Staff name', staff.full_name],
-    ['Staff ID', staff.staff_unique_id],
-    ['Position', staff.position || '-'],
-    ['Site', staff.site_name || '-'],
-    ['Hire date', staff.hire_date || '-'],
-    [`Monthly salary (${cur})`, amount(staff.monthly_salary)],
-  ]);
+    ['Staff name', s.full_name], ['Staff ID', s.staff_unique_id],
+    ['Position', s.position || '-'], ['Site', s.site_name || '-'],
+    ['Hire date', s.hire_date || '-'], [`Monthly salary (${cur})`, amount(s.monthly_salary)],
+  ], 2, 26);
 
   y = sectionTitle(doc, y, 'Amount');
-  const L = doc.page.margins.left;
-  const W = doc.page.width - L - doc.page.margins.right;
-  doc.rect(L, y, W, 46).fill(BRAND.goldPale);
-  doc.rect(L, y, 3, 46).fill(BRAND.gold);
-  doc.font('Helvetica-Bold').fontSize(18).fillColor(BRAND.charcoalDark).text(`${amount(advance.amount)} ${cur}`, L + 12, y + 7, { width: 220 });
-  doc.font('Helvetica-Oblique').fontSize(9).fillColor(BRAND.ink).text(amountInWords(advance.amount, cur), L + 12, y + 29, { width: W - 24 });
-  y += 58;
+  doc.rect(L, y, W, 40).fill(BRAND.goldPale);
+  doc.rect(L, y, 3, 40).fill(BRAND.gold);
+  doc.font('Helvetica-Bold').fontSize(17).fillColor(BRAND.charcoalDark).text(`${amount(voucher.amount)} ${cur}`, L + 12, y + 5, { width: 260 });
+  doc.font('Helvetica-Oblique').fontSize(9).fillColor(BRAND.ink).text(amountInWords(voucher.amount, cur), L + 12, y + 25, { width: W - 24 });
+  y += 50;
   y = kvGrid(doc, y, [
-    ['Payment method', advance.payment_method === 'BankTransfer' ? 'Bank transfer' : advance.payment_method],
-    ['Payment reference', advance.payment_reference || '-'],
-    ['Deduction', advance.deduction_mode === 'Full' ? 'Full (one month)' : `Partial (${advance.installments.filter((i) => i.status !== 'Replaced').length} months)`],
-    ['Cancel window ends', advance.cancel_deadline],
-  ]);
+    ['Payment method', methodLabel(voucher.payment_method)],
+    ['Payment reference', voucher.payment_reference || '-'],
+    ['Deduction', voucher.deduction_mode === 'Full' ? 'Full (one month)' : `Partial (${voucher.schedule.length} months)`],
+    ['Can be cancelled until', voucher.cancel_deadline],
+  ], 2, 26);
   doc.font('Helvetica').fontSize(7.5).fillColor(BRAND.muted).text('Reason', L, y);
-  doc.font('Helvetica').fontSize(9).fillColor(BRAND.ink).text(advance.reason, L, doc.y + 2, { width: W });
-  y = doc.y + 12;
+  doc.font('Helvetica').fontSize(9).fillColor(BRAND.ink).text(voucher.reason, L, doc.y + 2, { width: W });
+  y = doc.y + 10;
 
-  y = sectionTitle(doc, y, 'Salary deduction schedule');
-  const shown = advance.installments.filter((i) => !['Replaced'].includes(i.status));
+  y = sectionTitle(doc, y, 'Salary deduction schedule (as agreed)');
   y = table(doc, y, [
-    { h: '#', w: 0.07, align: 'center' }, { h: 'Payroll month', w: 0.33 }, { h: `Amount (${cur})`, w: 0.25, align: 'right' },
-    { h: 'Status', w: 0.35 },
-  ], shown.map((i, idx) => [idx + 1, i.month_label || 'To be scheduled', amount(i.amount),
-    i.status === 'Included' ? `In staff batch #${i.included_batch_id}` : i.status === 'Deducted' ? `Deducted (batch #${i.included_batch_id})` : i.status]),
-  { totalRow: ['', 'TOTAL', amount(shown.reduce((s, i) => s + num(i.amount), 0)), `Balance: ${amount(advance.outstanding_balance)}`] });
+    { h: '#', w: 0.08, align: 'center' }, { h: 'Payroll month', w: 0.52 }, { h: `Amount (${cur})`, w: 0.4, align: 'right' },
+  ], voucher.schedule.map((r) => [r.seq, r.month_label || r.month, amount(r.amount)]),
+  { totalRow: ['', 'TOTAL', amount(voucher.schedule.reduce((sum, r) => sum + num(r.amount), 0))] });
+  if (voucher.frozen_late) {
+    doc.font('Helvetica-Oblique').fontSize(7).fillColor(BRAND.muted)
+      .text('Frozen after issue: schedule taken from the creation record.', L, y - 8, { width: W });
+  }
 
-  if (y > doc.page.height - 260) { doc.addPage(); y = doc.page.margins.top; }
+  const restHeight = 52 + 88 + (qr ? 92 : 0) + 24;
+  if (y + restHeight > doc.page.height - doc.page.margins.bottom - 14) { doc.addPage(); y = doc.page.margins.top; }
   y = sectionTitle(doc, y, 'Employee acknowledgement');
   doc.font('Helvetica').fontSize(8.5).fillColor(BRAND.ink).text(
-    `I, ${staff.full_name} (${staff.staff_unique_id}), acknowledge that I received ${amount(advance.amount)} ${cur} ` +
-    `(${amountInWords(advance.amount, cur)}) from ${COMPANY_NAME} as an advance on my salary. I authorize the company to deduct ` +
+    `I, ${s.full_name} (${s.staff_unique_id}), acknowledge that I received ${amount(voucher.amount)} ${cur} ` +
+    `(${amountInWords(voucher.amount, cur)}) from ${voucher.company} as an advance on my salary. I authorize the company to deduct ` +
     'this amount from my salary according to the schedule above. If my employment ends before the advance is fully recovered, ' +
     'I authorize the company to deduct the outstanding balance from my final dues.',
     L, y, { width: W, align: 'justify', lineGap: 1.5 });
   y = doc.y + 14;
 
-  signatureBlock(doc, y, [
-    { title: 'Prepared by', name: advance.created_by },
+  y = signatureBlock(doc, y, [
+    { title: 'Prepared by', name: voucher.created_by },
     { title: 'Approved by', name: '' },
     { title: 'Cashier', name: '' },
-    { title: 'Received by (employee)', name: staff.full_name },
+    { title: 'Received by (employee)', name: s.full_name },
   ]);
-  footer(doc, `${advance.voucher_no}  |  Financial report #${report ? report.report_id : advance.financial_report_id}  |  ` +
-    `Printed ${new Date().toISOString().slice(0, 16).replace('T', ' ')} UTC by ${printedBy || '-'}  |  Print #${printNumber}`);
+  if (qr) qrBlock(doc, y, { png: qr.png, url: qr.url, hash: meta.hash, caption: `Scan to download voucher ${voucher.voucher_no}` });
+  footer(doc, `${voucher.voucher_no}  |  Financial report #${voucher.financial_report_id}  |  ` +
+    `${source === 'qr' ? 'Downloaded by QR' : `Printed by ${printedBy || '-'} (print #${printNumber})`} ` +
+    `${new Date().toISOString().slice(0, 16).replace('T', ' ')} UTC`);
   doc.end();
 }
 
 // ---------------------------------------------------------------------------
-// Cash repayment receipt
+// Cash repayment receipt: drawn ONLY from the frozen document.
 // ---------------------------------------------------------------------------
-function renderRepaymentReceiptPdf(res, { advance, staff, entry }) {
-  const doc = newDoc(res, `${entry.receipt_no}.pdf`);
-  const cur = advance.currency;
+function renderRepaymentReceiptPdf(res, { receipt, meta, source = 'print', qr = null }) {
+  const doc = newDoc(res, `${receipt.receipt_no}.pdf`);
+  const cur = receipt.currency;
+  const s = receipt.staff;
   let y = drawHeader(doc, 'ADVANCE REPAYMENT RECEIPT', [
-    ['Receipt No.', entry.receipt_no, true],
-    ['Date', entry.created_at],
-    ['Advance', advance.voucher_no],
+    ['Receipt No.', receipt.receipt_no, true],
+    ['Issued', receipt.issued_at],
+    ['Advance', receipt.voucher_no],
+    ['Copy', source === 'qr' ? 'COPY (QR download)' : 'PRINT'],
   ]);
-  if (advance.status === 'Cancelled') watermark(doc, 'CANCELLED');
-  y = sectionTitle(doc, y, 'Received from');
-  y = kvGrid(doc, y, [
-    ['Staff name', staff.full_name], ['Staff ID', staff.staff_unique_id],
-    ['Advance voucher', advance.voucher_no], [`Advance amount (${cur})`, amount(advance.amount)],
-  ]);
+  if (source === 'qr') watermark(doc, 'COPY');
   const L = doc.page.margins.left;
   const W = doc.page.width - L - doc.page.margins.right;
+  y = sectionTitle(doc, y, 'Received from');
+  y = kvGrid(doc, y, [
+    ['Staff name', s.full_name], ['Staff ID', s.staff_unique_id],
+    ['Advance voucher', receipt.voucher_no], [`Advance amount (${cur})`, amount(receipt.advance_amount)],
+  ]);
   y = sectionTitle(doc, y, 'Amount received');
   doc.rect(L, y, W, 46).fill(BRAND.goldPale);
   doc.rect(L, y, 3, 46).fill(BRAND.gold);
-  doc.font('Helvetica-Bold').fontSize(18).fillColor(BRAND.charcoalDark).text(`${amount(-entry.amount)} ${cur}`, L + 12, y + 7);
-  doc.font('Helvetica-Oblique').fontSize(9).fillColor(BRAND.ink).text(amountInWords(-entry.amount, cur), L + 12, y + 29, { width: W - 24 });
+  doc.font('Helvetica-Bold').fontSize(18).fillColor(BRAND.charcoalDark).text(`${amount(receipt.amount)} ${cur}`, L + 12, y + 7);
+  doc.font('Helvetica-Oblique').fontSize(9).fillColor(BRAND.ink).text(amountInWords(receipt.amount, cur), L + 12, y + 29, { width: W - 24 });
   y += 58;
   y = kvGrid(doc, y, [
-    ['Payment method', entry.payment_method === 'BankTransfer' ? 'Bank transfer' : (entry.payment_method || 'Cash')],
-    [`Balance after this receipt (${cur})`, amount(entry.balance_after)],
+    ['Payment method', methodLabel(receipt.payment_method)],
+    [`Advance balance after this receipt (${cur})`, amount(receipt.balance_after)],
   ]);
   doc.font('Helvetica').fontSize(7.5).fillColor(BRAND.muted).text('Note', L, y);
-  doc.font('Helvetica').fontSize(9).fillColor(BRAND.ink).text(entry.note || '-', L, doc.y + 2, { width: W });
+  doc.font('Helvetica').fontSize(9).fillColor(BRAND.ink).text(receipt.note || '-', L, doc.y + 2, { width: W });
   y = doc.y + 18;
-  signatureBlock(doc, y, [
-    { title: 'Received by (cashier)', name: entry.created_by },
-    { title: 'Paid by (employee)', name: staff.full_name },
+  y = signatureBlock(doc, y, [
+    { title: 'Received by (cashier)', name: receipt.received_by },
+    { title: 'Paid by (employee)', name: s.full_name },
   ]);
-  footer(doc, `${entry.receipt_no}  |  ${advance.voucher_no}`);
+  if (qr) qrBlock(doc, y, { png: qr.png, url: qr.url, hash: meta.hash, caption: `Scan to download receipt ${receipt.receipt_no}` });
+  footer(doc, `${receipt.receipt_no}  |  ${receipt.voucher_no}  |  ${source === 'qr' ? 'Downloaded by QR' : 'Printed'} ` +
+    `${new Date().toISOString().slice(0, 16).replace('T', ' ')} UTC`);
+  doc.end();
+}
+
+// ---------------------------------------------------------------------------
+// Advance statement: the CURRENT state (live data, not a frozen document).
+// ---------------------------------------------------------------------------
+const INSTALLMENT_LABEL = {
+  Scheduled: 'Scheduled', Included: 'In a payroll batch (not paid yet)', Deducted: 'Deducted from salary',
+  Unscheduled: 'Needs a new month', Repaid: 'Repaid in cash', WrittenOff: 'Written off', Cancelled: 'Cancelled',
+};
+const ENTRY_LABEL = {
+  Disbursement: 'Advance paid out', PayrollDeduction: 'Salary deduction', CashRepayment: 'Cash repayment',
+  WriteOff: 'Written off', Cancellation: 'Cancelled',
+};
+
+function renderStatementPdf(res, { advance, staff }) {
+  const doc = newDoc(res, `${advance.voucher_no}_statement.pdf`);
+  const cur = advance.currency;
+  let y = drawHeader(doc, 'ADVANCE STATEMENT', [
+    ['Voucher No.', advance.voucher_no, true],
+    ['As of', new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC'],
+    ['Status', STATUS_LABEL[advance.status] || advance.status],
+  ]);
+  const L = doc.page.margins.left;
+  const W = doc.page.width - L - doc.page.margins.right;
+  y = kvGrid(doc, y, [
+    ['Staff name', staff.full_name], ['Staff ID', staff.staff_unique_id],
+    [`Advance amount (${cur})`, amount(advance.amount)], [`Outstanding balance (${cur})`, amount(advance.outstanding_balance)],
+    ['Issued', advance.created_at], ['Issued by', advance.created_by],
+  ]);
+  doc.font('Helvetica-Oblique').fontSize(8).fillColor(BRAND.muted).text(
+    'This statement shows the current state of the advance. The voucher shows it as issued and signed.', L, y - 4, { width: W });
+  y = doc.y + 10;
+
+  y = sectionTitle(doc, y, 'Deduction schedule (current)');
+  const inst = advance.installments.filter((i) => i.status !== 'Replaced');
+  y = table(doc, y, [
+    { h: 'Payroll month', w: 0.3 }, { h: `Amount (${cur})`, w: 0.2, align: 'right' }, { h: 'Status', w: 0.32 }, { h: 'Staff batch', w: 0.18 },
+  ], inst.map((i) => [i.month_label || 'No month yet', amount(i.amount), INSTALLMENT_LABEL[i.status] || i.status,
+    i.included_batch_id ? `#${i.included_batch_id}` : '-']));
+
+  y = sectionTitle(doc, y, 'Movements');
+  let running = 0;
+  y = table(doc, y, [
+    { h: 'Date', w: 0.18 }, { h: 'Movement', w: 0.26 }, { h: 'Reference', w: 0.2 }, { h: `Amount (${cur})`, w: 0.18, align: 'right' },
+    { h: `Balance (${cur})`, w: 0.18, align: 'right' },
+  ], advance.ledger.map((l) => {
+    running += num(l.amount);
+    return [l.created_at, ENTRY_LABEL[l.entry_type] || l.entry_type,
+      l.receipt_no || (l.staff_payroll_batch_id ? `Batch #${l.staff_payroll_batch_id}` : '-'),
+      `${num(l.amount) > 0 ? '+' : ''}${amount(l.amount)}`, amount(running)];
+  }), { totalRow: ['', 'BALANCE', '', '', amount(advance.outstanding_balance)] });
+  if (advance.status === 'Cancelled') {
+    doc.font('Helvetica').fontSize(8.5).fillColor(BRAND.ink)
+      .text(`Cancelled ${advance.cancelled_at || ''} by ${advance.cancelled_by || '-'}: ${advance.cancel_reason || ''}`, L, y, { width: W });
+  }
+  footer(doc, `${advance.voucher_no}  |  Advance statement  |  ${new Date().toISOString().slice(0, 16).replace('T', ' ')} UTC`);
   doc.end();
 }
 
@@ -363,4 +460,4 @@ function renderFinancialReportPdf(res, report) {
   doc.end();
 }
 
-module.exports = { renderVoucherPdf, renderRepaymentReceiptPdf, renderFinancialReportPdf, amountInWords };
+module.exports = { renderVoucherPdf, renderRepaymentReceiptPdf, renderStatementPdf, renderFinancialReportPdf, amountInWords };

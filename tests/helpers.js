@@ -41,6 +41,7 @@ function resetDatabase({ migrate = true } = {}) {
     sh(`${MYSQL} ${DB_NAME} < migrations/2026_10_payroll_adjustments/01_ddl.sql`);
     sh(`${MYSQL} ${DB_NAME} < migrations/2026_10_daily_site_report/01_ddl.sql`);
     sh(`${MYSQL} ${DB_NAME} < migrations/2026_10_staff_advances/01_ddl.sql`);
+    sh(`${MYSQL} ${DB_NAME} < migrations/2026_10_staff_advances/02_frozen_documents.sql`);
   }
 }
 

@@ -16,6 +16,7 @@ router.get('/', controller.list);
 router.post('/', controller.create);
 router.get('/:id/voucher.pdf', controller.voucherPdf);
 router.get('/:id/repayments/:entryId/receipt.pdf', controller.repaymentReceiptPdf);
+router.get('/:id/statement.pdf', controller.statementPdf);
 router.post('/:id/signed-receipt', controller.uploadMiddleware, controller.uploadSignedReceipt);
 router.get('/:id/signed-receipt', controller.downloadSignedReceipt);
 router.get('/:id', controller.get);

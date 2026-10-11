@@ -62,6 +62,8 @@ app.use('/api/main-dashboard', mainDashboardRoutes);
 app.use('/api/recycle-bin', require('./routes/recycleBinRoutes'));
 app.use('/api/payroll-adjustments', require('./routes/payrollAdjustmentRoutes'));
 app.use('/api/staff-advances', require('./routes/staffAdvanceRoutes'));
+// Public (no login): QR download of frozen advance vouchers / receipts.
+app.use('/api/public/documents', require('./routes/publicDocumentRoutes'));
 app.use('/api/reports/daily-site', require('./routes/dailySiteReportRoutes'));
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });

@@ -6,8 +6,11 @@ Staff only. Worker payroll is not touched.
 1. Take a database backup.
 2. Run `migrations/2026_10_payroll_adjustments/01_ddl.sql` if it has not been run yet.
 3. Run `migrations/2026_10_staff_advances/01_ddl.sql`. Its last SELECT must show 6 rows with `present = 1`. Running it twice is safe.
-4. Deploy the backend. It refuses to start if step 3 is missing.
-5. Deploy the app.
+4. Run `migrations/2026_10_staff_advances/02_frozen_documents.sql`. Its last SELECT must show 8 rows with `present = 1`. Running it twice is safe. It only adds nullable columns, so it is safe on a database where advances already exist.
+5. Deploy the backend. It refuses to start if step 3 or 4 is missing.
+   - Optional env `PUBLIC_BASE_URL` (e.g. `https://team-flow-backend-f15z.onrender.com`): the address printed in the QR codes. Without it, the address the request came in on is used.
+   - Optional env `PUBLIC_DOC_RATE_LIMIT_MAX` (default 60 per 15 minutes per IP) for QR downloads.
+6. Deploy the app.
 
 Rollback: see `99_rollback.sql`. Run its SELECTs first; the DROP statements are commented out.
 
@@ -42,6 +45,20 @@ Rollback: see `99_rollback.sql`. Run its SELECTs first; the DROP statements are 
 | GET | `/api/staff-advances/:id/repayments/:entryId/receipt.pdf` | | Repayment receipt |
 | POST | `/api/staff-advances/:id/write-off` | `{reason}` | Write off the balance |
 | POST / GET | `/api/staff-advances/:id/signed-receipt` | multipart `file` | Upload / download the signed voucher (JPG, PNG, WEBP or PDF, max 8 MB) |
+| GET | `/api/staff-advances/:id/statement.pdf` | | Advance Statement: the CURRENT state (schedule, deductions, repayments, balance) |
+| GET | `/api/public/documents/:token.pdf` | | **No login.** The QR code on a voucher / receipt. Downloads that document as issued |
+
+## Frozen documents and QR codes
+- **When a voucher or receipt is frozen:** at the moment it is issued, in the same transaction. Its content is stored as JSON (`voucher_snapshot` / `document_snapshot`) with a SHA-256 fingerprint.
+- **What a print shows:** every print and every QR download is drawn from that frozen content, so a copy always matches the signed paper.
+  - Reprints say "COPY n"; QR downloads say "COPY (QR download)".
+  - A cancelled voucher is stamped CANCELLED.
+- **Where the current state is:** the **Advance Statement** shows it. The voucher never changes after it is issued.
+- **The fingerprint:** if the stored content no longer matches it, the document is refused (`409 DOCUMENT_INTEGRITY`) instead of being printed.
+- **The QR code:**
+  - It holds a random, unguessable 32-character token. Unknown tokens get 404; downloads are rate limited and recorded in `auditlogs` (`PUBLIC_DOCUMENT_DOWNLOADED`).
+  - Anyone holding the paper can download the document, so treat the QR like the paper itself.
+- **Advances created before step 4:** they are frozen on their first print. Their schedule is taken from the creation audit entry, i.e. the schedule that was signed.
 
 ## Rules
 - **Deduction month:**
@@ -72,4 +89,4 @@ Rollback: see `99_rollback.sql`. Run its SELECTs first; the DROP statements are 
   - **Staff batch PDF:** an "Advance Deduction" column plus an "ADVANCES DEDUCTED IN THIS BATCH" table, with voucher numbers.
   - **Monthly staff report:** DEDUCTION includes the advance, so TOTAL still equals net.
 
-Tests: `tests/staff_advances.integration.test.js` (13 scenarios). Full suite: 104 / 104.
+Tests: `tests/staff_advances.integration.test.js` (19 scenarios). Full suite: 111 / 111.
