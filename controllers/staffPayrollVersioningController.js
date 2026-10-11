@@ -12,6 +12,7 @@
 
 const pool = require('../config/db');
 const payrollAdjustments = require('../services/payrollAdjustmentService');
+const staffAdvances = require('../services/staffAdvanceService');
 const { generateStaffPayrollBatch } = require('./StaffPayrollController');
 
 // PATCH /api/staff-payroll/batch/:batchId/finalize
@@ -127,9 +128,11 @@ async function voidBatch(req, res) {
       [batchId, userId, JSON.stringify({ status: batch.status }), JSON.stringify({ status: 'Voided', reason })]
     );
     const released = await payrollAdjustments.releaseBatches(connection, 'Staff', [batchId]);
+    const advancesReleased = await staffAdvances.releaseBatches(connection, [batchId]);
     await connection.commit();
     return res.json({ status: 'success', message: `Batch #${batchId} voided. It stays in the history; its period can be generated again.` +
-      (released ? ` ${released} payroll adjustment(s) it carried are Pending again.` : '') });
+      (released ? ` ${released} payroll adjustment(s) it carried are Pending again.` : '') +
+      (advancesReleased ? ` ${advancesReleased} advance deduction(s) it carried are scheduled again.` : '') });
   } catch (error) {
     await connection.rollback();
     console.error('voidBatch:', error);

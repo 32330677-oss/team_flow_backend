@@ -1,5 +1,6 @@
 const pool = require('../config/db');
 const payrollAdjustments = require('../services/payrollAdjustmentService');
+const staffAdvances = require('../services/staffAdvanceService');
 const { BRAND } = require('../services/pdfBrand');
 const { countNonFridayDays, listNonFridayDates, isFriday, round2 } = require('../services/staffAttendanceService');
 const { getActiveSpansOverlapping } = require('../services/staffEmploymentService');
@@ -137,6 +138,12 @@ const [batchResult] = await connection.execute(
             connection, 'Staff', staffList.map((st) => st.staff_id), staffCurrency);
         const includedAdjustmentIds = [];
         const adjustmentWarnings = [];
+        // Staff advances: installments whose month is this batch's end month are
+        // deducted here. What the superseded batch carried goes back first.
+        if (supersede) await staffAdvances.releaseBatches(connection, [supersede.batchId]);
+        const advancesDue = await staffAdvances.loadDueForBatch(connection, end_date, staffCurrency);
+        const advanceWarnings = [];
+        let advancesDeducted = 0;
         const pendingAttendance = [];
         // D3: dates whose historical salary / hours / paid leave types cannot be
         // reconstructed reliably (never silently replaced by today's profile).
@@ -429,7 +436,17 @@ if (pendingAdj) {
             message: 'Pending deductions exceed this pay: they stay Pending for a later batch.' });
     }
 }
-const netSalary        = money(calculatedNet + adjustmentsAmount);
+// Staff advances: deducted after adjustments, never below 0 (the rest is Unscheduled).
+let advanceDeduction = 0;
+const dueAdvances = advancesDue.get(Number(staff.staff_id));
+if (dueAdvances) {
+    advancesDue.delete(Number(staff.staff_id));
+    const adv = await staffAdvances.deductForLine(connection, dueAdvances, money(calculatedNet + adjustmentsAmount), batchId, staff);
+    advanceDeduction = adv.amount;
+    advanceWarnings.push(...adv.warnings);
+    if (adv.amount > 0) advancesDeducted += adv.vouchers.length;
+}
+const netSalary        = money(calculatedNet + adjustmentsAmount - advanceDeduction);
 
             const [payrollResult] = await connection.execute(
                 `INSERT INTO staff_payroll
@@ -438,8 +455,9 @@ const netSalary        = money(calculatedNet + adjustmentsAmount);
                      overtime_hours, daily_rate, net_salary,
                      required_hours, ot_earned_hours, ot_used_hours, ot_remaining_hours,
                      shortage_hours, salary_deduction_amount,
-                     employed_from, employed_to, prorated_base_salary, period_required_hours, adjustments_amount)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                     employed_from, employed_to, prorated_base_salary, period_required_hours, adjustments_amount,
+                     advance_deduction_amount)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                              [
                     batchId, staff.staff_id, staff.monthly_salary, requiredDays,
                     presentDaysCount, paidLeaveDays, managementPaidDays, unpaidAbsenceDays,
@@ -447,6 +465,7 @@ const netSalary        = money(calculatedNet + adjustmentsAmount);
                     requiredHours, otEarnedHours, otUsedHours, otRemainingHours,
                     shortageHours, salaryDeduction,
                     effectiveStart, effectiveEnd, proratedBaseSalary, periodRequiredHours, adjustmentsAmount.toFixed(2),
+                    advanceDeduction.toFixed(2),
                 ]
             );
             if (!payrollResult.insertId) continue;
@@ -529,6 +548,8 @@ const netSalary        = money(calculatedNet + adjustmentsAmount);
             [totalStaff, totalAmount, batchId]
         );
         await payrollAdjustments.markIncluded(connection, includedAdjustmentIds, batchId);
+        // Advance installments of this month for staff who are not in this batch.
+        advanceWarnings.push(...await staffAdvances.displaceRemaining(connection, advancesDue, batchId));
 
         if (supersede) {
             // Verified replacement exists -> supersede the old batch (same transaction).
@@ -555,7 +576,9 @@ const netSalary        = money(calculatedNet + adjustmentsAmount);
             batch_id: batchId,
             currency: staffCurrency,
             adjustments_included: includedAdjustmentIds.length,
+            advances_deducted: advancesDeducted,
             ...(adjustmentWarnings.length ? { adjustment_warnings: adjustmentWarnings } : {}),
+            ...(advanceWarnings.length ? { advance_warnings: advanceWarnings } : {}),
             ...(segmentAudits.length ? { compensation_segments: segmentAudits } : {}),
         });
     } catch (error) {
@@ -609,8 +632,13 @@ async function getStaffPayrollBatchDetails(req, res) {
         // Retro pay: adjustments carried by this batch (already inside net_salary).
         const adjustments = await payrollAdjustments.listForBatch(pool, 'Staff', batchId);
         for (const it of items) it.adjustments = adjustments.filter((a) => Number(a.person_id) === Number(it.staff_id));
+        // Staff advances deducted in this batch (already subtracted from net_salary).
+        const advances = await staffAdvances.listForBatch(pool, batchId);
+        for (const it of items) it.advances = advances.filter((a) => Number(a.staff_id) === Number(it.staff_id));
         return res.json({ status: 'success', batch: batches[0], staff: items, adjustments,
-            adjustments_total: money(adjustments.reduce((sum, a) => sum + Number(a.amount || 0), 0)) });
+            adjustments_total: money(adjustments.reduce((sum, a) => sum + Number(a.amount || 0), 0)),
+            advances,
+            advances_total: money(advances.reduce((sum, a) => sum + Number(a.amount || 0), 0)) });
     } catch (error) {
         console.error('getStaffPayrollBatchDetails:', error);
         return res.status(500).json({ status: 'error', message: 'Failed to load batch details' });
@@ -655,15 +683,18 @@ await connection.execute(
         // this batch was only finalized become adjustments for the next batch.
         const applied = await payrollAdjustments.applyBatch(connection, 'Staff', batchId);
         const converted = await payrollAdjustments.convertOpenCorrectionsForPaidBatch(connection, 'Staff', batchId, req.user?.user_id);
+        const advancesApplied = await staffAdvances.applyPaidBatch(connection, batchId, req.user?.user_id);
         await connection.commit();
         const created = converted.filter((c) => c.adjustment_id);
         return res.json({
             status: 'success',
             message: 'Payroll batch marked as paid successfully' +
                 (applied ? `. ${applied} payroll adjustment(s) paid with it` : '') +
+                (advancesApplied ? `. ${advancesApplied} advance deduction(s) recorded` : '') +
                 (created.length ? `. ${created.length} correction(s) made after finalizing became payroll adjustment(s) for the next batch` : ''),
             adjustments_applied: applied,
             adjustments_created: created,
+            advance_deductions_applied: advancesApplied,
         });
     } catch (error) {
         await connection.rollback();
@@ -769,6 +800,8 @@ async function exportStaffPayrollExcel(req, res) {
             { header: 'OT Remaining', key: 'ot_remaining_hours', width: 10 },
             { header: 'Shortage Hrs', key: 'shortage_hours', width: 10 },
             { header: `Deduction (${currency})`, key: 'salary_deduction_amount', width: 12, money: true },
+            { header: `Advance Deduction (${currency})`, key: 'advance_deduction_amount', width: 13, money: true },
+            { header: 'Advance Voucher(s)', key: 'advance_vouchers', width: 18 },
             { header: `Net Salary (${currency})`, key: 'net_salary', width: 14, money: true },
             { header: 'Signature', key: 'signature', width: 16 },
         ];
@@ -814,7 +847,10 @@ async function exportStaffPayrollExcel(req, res) {
         headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
         headerRow.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
 
-        const totals = { prorated_base: 0, salary_deduction_amount: 0, net_salary: 0 };
+        const totals = { prorated_base: 0, salary_deduction_amount: 0, advance_deduction_amount: 0, net_salary: 0 };
+        const batchAdvances = await staffAdvances.listForBatch(pool, batchId);
+        const vouchersOf = (staffId) => [...new Set(batchAdvances
+            .filter((a) => Number(a.staff_id) === Number(staffId)).map((a) => a.voucher_no))].join(', ');
         const partialFill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF4CC' } };
 
         rows.forEach((r, index) => {
@@ -839,6 +875,8 @@ async function exportStaffPayrollExcel(req, res) {
                 ot_remaining_hours: Number(r.ot_remaining_hours || 0),
                 shortage_hours: Number(r.shortage_hours || 0),
                 salary_deduction_amount: Number(r.salary_deduction_amount || 0),
+                advance_deduction_amount: Number(r.advance_deduction_amount || 0),
+                advance_vouchers: vouchersOf(r.staff_id),
                 net_salary: Number(r.net_salary || 0),
                 signature: '',
             });
@@ -849,6 +887,7 @@ async function exportStaffPayrollExcel(req, res) {
             }
             totals.prorated_base += prorated;
             totals.salary_deduction_amount += Number(r.salary_deduction_amount || 0);
+            totals.advance_deduction_amount += Number(r.advance_deduction_amount || 0);
             totals.net_salary += Number(r.net_salary || 0);
         });
 
@@ -856,6 +895,7 @@ async function exportStaffPayrollExcel(req, res) {
             full_name: 'GRAND TOTAL',
             prorated_base: money(totals.prorated_base),
             salary_deduction_amount: money(totals.salary_deduction_amount),
+            advance_deduction_amount: money(totals.advance_deduction_amount),
             net_salary: money(totals.net_salary),
         });
         totalRow.font = { bold: true };
@@ -870,6 +910,8 @@ async function exportStaffPayrollExcel(req, res) {
 
         // Retro pay: adjustments carried by this batch (already inside Net Salary).
         payrollAdjustments.addAdjustmentsSheet(workbook, await payrollAdjustments.listForBatch(pool, 'Staff', batchId), '#,##0.00');
+        // Staff advances: voucher numbers of the deductions inside Net Salary.
+        staffAdvances.addAdvancesSheet(workbook, batchAdvances, '#,##0.00');
 
         const fileName = `staff_payroll_batch_${batchId}.xlsx`;
         res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -921,8 +963,10 @@ async function exportStaffPayrollPdf(req, res) {
         let totalOtEarned = 0;
         let totalNet = 0;
         let totalProrated = 0;
+        let totalAdvance = 0;
         rows.forEach((r) => {
             totalOtEarned += num(r.ot_earned_hours);
+            totalAdvance += num(r.advance_deduction_amount);
             totalNet += num(r.net_salary);
             totalProrated += num(r.prorated_base_salary ?? r.monthly_salary_snapshot);
         });
@@ -943,19 +987,20 @@ async function exportStaffPayrollPdf(req, res) {
         const columns = [
             { key: 'no', label: 'No.', width: 22 },
             { key: 'staff_id', label: 'Staff ID', width: 44 },
-            { key: 'full_name', label: 'Full Name', width: 92, align: 'left' },
-            { key: 'position', label: 'Position', width: 56, align: 'left' },
+            { key: 'full_name', label: 'Full Name', width: 80, align: 'left' },
+            { key: 'position', label: 'Position', width: 46, align: 'left' },
             { key: 'monthly_salary', label: `Monthly Salary (${currency})`, width: 56 },
-            { key: 'employed', label: 'Employed', width: 62, wrap: true },
+            { key: 'employed', label: 'Employed', width: 58, wrap: true },
             { key: 'prorated_base', label: `Prorated Base (${currency})`, width: 56 },
-            { key: 'present_days', label: 'Present Days', width: 38 },
-            { key: 'paid_leave_days', label: 'Paid Leave', width: 38 },
-            { key: 'mgmt_paid_days', label: 'Mgmt-Paid Absence', width: 42 },
+            { key: 'present_days', label: 'Present Days', width: 34 },
+            { key: 'paid_leave_days', label: 'Paid Leave', width: 34 },
+            { key: 'mgmt_paid_days', label: 'Mgmt-Paid Absence', width: 40 },
             { key: 'unpaid_absence_days', label: 'Unpaid Absence', width: 40 },
-            { key: 'required_hours', label: 'Required Hrs', width: 44 },
+            { key: 'required_hours', label: 'Required Hrs', width: 40 },
             { key: 'ot_earned_hours', label: 'OT Earned', width: 40 },
-            { key: 'ot_used_hours', label: 'OT Used', width: 38 },
-            { key: 'shortage_hours', label: 'Shortage Hrs', width: 42 },
+            { key: 'ot_used_hours', label: 'OT Used', width: 34 },
+            { key: 'shortage_hours', label: 'Shortage Hrs', width: 38 },
+            { key: 'advance', label: `Advance Deduction (${currency})`, width: 48 },
             { key: 'net_salary', label: `Net Salary (${currency})`, width: 56 },
         ];
         const tableWidth = columns.reduce((s, c) => s + c.width, 0);
@@ -1115,6 +1160,7 @@ async function exportStaffPayrollPdf(req, res) {
                 ot_earned_hours: fmt(r.ot_earned_hours),
                 ot_used_hours: fmt(r.ot_used_hours),
                 shortage_hours: fmt(r.shortage_hours),
+                advance: num(r.advance_deduction_amount) ? amount(r.advance_deduction_amount) : '-',
                 net_salary: amount(r.net_salary),
             }, { fill: partial ? BRAND.goldLight : (index % 2 === 1 ? BRAND.goldPale : null) });
         });
@@ -1124,6 +1170,7 @@ async function exportStaffPayrollPdf(req, res) {
             full_name: 'GRAND TOTAL',
             prorated_base: amount(totalProrated),
             ot_earned_hours: fmt(totalOtEarned),
+            advance: totalAdvance ? amount(totalAdvance) : '-',
             net_salary: amount(totalNet),
         }, { bold: true, fill: BRAND.goldMid });
 
@@ -1152,6 +1199,45 @@ async function exportStaffPayrollPdf(req, res) {
                 .text(`TOTAL ADJUSTMENTS: ${adjTotal > 0 ? '+' : ''}${amount(adjTotal)} ${currency}`, left, y, { width });
             doc.fillColor(BRAND.ink);
             y = doc.y;
+        }
+
+        // Staff advances: voucher numbers of the deductions inside Net Salary.
+        const pdfAdvances = await staffAdvances.listForBatch(pool, batchId);
+        if (pdfAdvances.length) {
+            y += 12;
+            const left = doc.page.margins.left;
+            const width = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+            if (y > bottomLimit - 30) { doc.addPage(); y = doc.page.margins.top; }
+            doc.font('Helvetica-Bold').fontSize(8.5).fillColor(BRAND.charcoal)
+                .text('ADVANCES DEDUCTED IN THIS BATCH (already subtracted from Net Salary above)', left, y, { width });
+            y = doc.y + 3;
+            const aCols = [
+                { h: 'No.', w: 28 }, { h: 'Voucher No.', w: 100 }, { h: 'Staff ID', w: 70 }, { h: 'Name', w: 170, left: true },
+                { h: 'Advance date', w: 75 }, { h: `Advance (${currency})`, w: 85 }, { h: `Deducted (${currency})`, w: 85 },
+                { h: `Balance after (${currency})`, w: 95 },
+            ];
+            const drawARow = (yy, cells, bold, fill) => {
+                let x = left;
+                if (fill) { doc.rect(left, yy, aCols.reduce((s, c) => s + c.w, 0), 16).fill(fill); doc.fillColor(BRAND.ink); }
+                doc.font(bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(7.5);
+                aCols.forEach((c, i) => {
+                    doc.rect(x, yy, c.w, 16).stroke(BRAND.grid);
+                    doc.fillColor(BRAND.ink).text(String(cells[i] ?? ''), x + 3, yy + 4,
+                        { width: c.w - 6, align: c.left ? 'left' : 'center', lineBreak: false });
+                    x += c.w;
+                });
+                return yy + 16;
+            };
+            y = drawARow(y, aCols.map((c) => c.h), true, BRAND.goldLight);
+            let advTotal = 0;
+            pdfAdvances.forEach((a, i) => {
+                if (y > bottomLimit) { doc.addPage(); y = doc.page.margins.top; }
+                y = drawARow(y, [i + 1, a.voucher_no, a.staff_unique_id, a.full_name, a.advance_date,
+                    amount(a.advance_amount), amount(a.amount), amount(a.remaining_after)], false, null);
+                advTotal += num(a.amount);
+            });
+            y = drawARow(y, ['', '', '', 'TOTAL ADVANCE DEDUCTIONS', '', '', amount(advTotal), ''], true, BRAND.goldMid);
+            doc.fillColor(BRAND.ink);
         }
 
         drawSignaturesFooter(y + 25);

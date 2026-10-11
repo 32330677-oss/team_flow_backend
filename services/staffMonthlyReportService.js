@@ -33,7 +33,7 @@ async function loadData(monthStart, monthEnd) {
   if (batches.length) {
     const r = await pool.query(
       `SELECT staff_payroll_batch_id, staff_id, prorated_base_salary, monthly_salary_snapshot,
-              salary_deduction_amount, net_salary, ot_earned_hours, adjustments_amount
+              salary_deduction_amount, net_salary, ot_earned_hours, adjustments_amount, advance_deduction_amount
        FROM staff_payroll WHERE staff_payroll_batch_id IN (?)`,
       [batches.map((b) => b.staff_payroll_batch_id)]
     );
@@ -115,7 +115,8 @@ function aggregate({ attendance, batches, payrolls, staff }, monthStart, monthEn
     r.hasPay = true;
     r.payrolls.push({ p, b });
     r.basic += Number(p.prorated_base_salary ?? p.monthly_salary_snapshot ?? 0);
-    r.deduction += Number(p.salary_deduction_amount || 0);
+    // Staff advances are part of DEDUCTION, so TOTAL = BASIC - DEDUCTION (+ adjustments) = net.
+    r.deduction += Number(p.salary_deduction_amount || 0) + Number(p.advance_deduction_amount || 0);
     r.total += Number(p.net_salary || 0);
     if (b.start_date < monthStart || b.end_date > monthEnd) {
       r.flags.push(`Batch #${b.staff_payroll_batch_id} (${b.start_date} → ${b.end_date}) extends outside the selected period; pay covers the whole batch`);
@@ -125,6 +126,10 @@ function aggregate({ attendance, batches, payrolls, staff }, monthStart, monthEn
     const adj = Number(p.adjustments_amount || 0);
     if (Math.abs(adj) > 0.005) {
       r.flags.push(`Batch #${b.staff_payroll_batch_id}: total includes payroll adjustment(s) for earlier paid months (${adj > 0 ? '+' : ''}${adj})`);
+    }
+    const advance = Number(p.advance_deduction_amount || 0);
+    if (advance > 0.005) {
+      r.flags.push(`Batch #${b.staff_payroll_batch_id}: DEDUCTION includes a salary advance deduction of ${advance}`);
     }
   }
 
@@ -183,7 +188,7 @@ function buildSpec(rows, batches, period) {
 
   const notes = [
     'Hours: approved staff attendance only. Confirmed-Friday hours count as OT. Pay: stored staff payroll batch values — not recalculated. Currency: US Dollar ($).',
-    'OT PAY is 0 by design: existing Staff payroll does not pay overtime in cash; earned OT only offsets shortage hours (reflected in DEDUCTION). TOTAL = BASIC PAY − DEDUCTION.',
+    'OT PAY is 0 by design: existing Staff payroll does not pay overtime in cash; earned OT only offsets shortage hours (reflected in DEDUCTION). TOTAL = BASIC PAY − DEDUCTION. DEDUCTION includes salary advance deductions (see Flags).',
     batches.length
       ? 'Payroll batches: ' + batches.map((b) =>
           `#${b.staff_payroll_batch_id} (${b.start_date} → ${b.end_date}, ${b.status}${b.is_finalized ? ', finalized' : ', not finalized'})`).join(' • ')

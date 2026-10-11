@@ -12,6 +12,7 @@
 //   router.get('/:id/lifecycle-history', restrictTo('Admin'), staffLifecycleController.getStatusHistory);
 
 const db = require('../config/db');
+const staffAdvances = require('../services/staffAdvanceService');
 const { businessToday, addDays } = require('../services/businessDate');
 const { getActiveSpans } = require('../services/staffEmploymentService'); // ← جديد
 const VALID_STATUSES = ['Active', 'Inactive', 'Terminated'];
@@ -63,6 +64,23 @@ exports.changeStatus = async (req, res) => {
     if (current.status === new_status) {
       await connection.rollback();
       return res.status(400).json({ status: 'error', message: `Staff member is already ${new_status}.` });
+    }
+    // Staff advances: nobody with an open advance balance can be set Inactive
+    // or Terminated (no override). Close it first: payroll deduction, cash
+    // repayment or write-off.
+    if (new_status === 'Inactive' || new_status === 'Terminated') {
+      const open = await staffAdvances.openAdvancesFor(connection, staffId);
+      if (open.length) {
+        await connection.rollback();
+        const total = open.reduce((s, a) => s + a.outstanding_balance, 0);
+        return res.status(409).json({
+          status: 'error',
+          code: 'ADVANCE_OUTSTANDING',
+          message: `This staff member cannot be set ${new_status}: open advance balance ${total.toFixed(2)} ${open[0].currency} ` +
+            `(${open.map((a) => a.voucher_no).join(', ')}). Close it first by payroll deduction, cash repayment or write-off.`,
+          advances: open,
+        });
+      }
     }
 const [[lastHistory]] = await connection.execute(
   `SELECT effective_date

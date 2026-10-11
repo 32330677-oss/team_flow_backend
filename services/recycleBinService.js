@@ -63,6 +63,9 @@ const ENTITIES = {
     tables: [
       // Cancelled payroll adjustments only (open ones block the delete, see deletionCheck).
       { table: 'payroll_adjustments', pk: 'adjustment_id', where: "person_type = 'Staff' AND person_id = ?" },
+      // Financial reports opened before an advance that was never created
+      // (staff with an advance cannot be deleted, see deletionCheck).
+      { table: 'staff_financial_reports', pk: 'report_id', where: 'staff_id = ?' },
       { table: 'attendance_corrections_log', pk: 'correction_id', where: "record_table = 'staff_attendance' AND person_id = ?" },
       { table: 'staff_overtime_compensations', pk: 'compensation_id', where: 'staff_id = ?' },
       { table: 'staff_monthly_overtime_ledger', pk: 'ledger_id', where: 'staff_id = ?' },
@@ -194,6 +197,21 @@ async function deletionCheck(executor, type, rawId, { lock = false } = {}) {
     }
   }
 
+  // 1c. Staff advances are financial records with unique voucher numbers.
+  if (type === 'Staff') {
+    const advTables = await existingTables(executor, ['staff_advances']);
+    if (advTables.has('staff_advances')) {
+      const [[sa]] = await executor.execute(
+        `SELECT COUNT(*) AS c, SUM(status = 'Active') AS open_count FROM staff_advances WHERE staff_id = ?`, [id]);
+      if (Number(sa.c) > 0) {
+        blockers.push({ code: 'STAFF_ADVANCES', action: null,
+          message: Number(sa.open_count) > 0
+            ? `This person has ${sa.open_count} open salary advance(s). Advances are financial records: close them first; the person cannot be deleted.`
+            : `This person has ${sa.c} salary advance record(s) with voucher numbers. Advances are financial records: this person cannot be deleted. Deactivate / terminate instead.` });
+      }
+    }
+  }
+
   // 2. Biometric data (not in use yet; handled when biometric goes live).
   const tables = await existingTables(executor, [...def.tables.map((t) => t.table), 'attendance_device_users', 'attendance_punch_processing']);
   if (type === 'Staff') {
@@ -226,6 +244,7 @@ async function deletionCheck(executor, type, rawId, { lock = false } = {}) {
   for (const fk of fks) {
     if (owned.has(fk.child)) continue;
     if (fk.child === 'attendance_device_users') continue; // reported above as BIOMETRIC_DATA
+    if (fk.child === 'staff_advances') continue; // reported above as STAFF_ADVANCES
     const parentDef = def.tables.find((t) => t.table === fk.parent);
     const [[c]] = await executor.query(
       `SELECT COUNT(*) AS c FROM \`${fk.child}\`
