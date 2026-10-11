@@ -8,3 +8,7 @@ certs/
 
 # C-18: uploaded files (worker photos, transfer documents) never go to git
 uploads/
+
+# Biometric Connector (runs inside the backend): temporary files and logs never go to git
+connector/data/
+connector/logs/

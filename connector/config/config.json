@@ -1,0 +1,16 @@
+{
+  "folders": {
+    "incoming": "./data/incoming",
+    "processed": "./data/processed",
+    "failed": "./data/failed"
+  },
+  "logFile": "./logs/connector.log",
+  "chunkSize": 200,
+  "requestTimeoutSeconds": 60,
+  "filePattern": "\\.(txt|csv|dat)$",
+  "punchCodeMap": {
+    "1": "IN",
+    "0": "OUT"
+  },
+  "punchCodeMapConfirmed": true
+}

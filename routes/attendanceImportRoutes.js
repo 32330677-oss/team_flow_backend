@@ -19,5 +19,6 @@ router.get('/import-batches', authMiddleware, restrictTo('Admin'), adminImport.l
 router.get('/import-batches/:batchId', authMiddleware, restrictTo('Admin'), adminImport.getBatchDetail);
 router.post('/import-file', authMiddleware, restrictTo('Admin'), adminImport.uploadMiddleware, adminImport.uploadAndRun);
 router.post('/import-run', authMiddleware, restrictTo('Admin'), adminImport.runOnly);
+router.get('/import-files/:fileId/download', authMiddleware, restrictTo('Admin'), adminImport.downloadFile);
 
 module.exports = router;
