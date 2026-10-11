@@ -25,7 +25,9 @@ async function loadData(monthStart, monthEnd) {
             DATE_FORMAT(end_date, '%Y-%m-%d') AS end_date,
             status, is_finalized, version_number
      FROM staff_payroll_batches
-     WHERE status <> 'Superseded' AND start_date <= ? AND end_date >= ?`,
+     -- Only the active batch of a period. Voided and Superseded batches are
+     -- history: counting them added the same salary once per batch version.
+     WHERE status IN ('Generated', 'Paid') AND start_date <= ? AND end_date >= ?`,
     [monthEnd, monthStart]
   );
 
@@ -277,4 +279,4 @@ async function generateStaffMonthlyReportPdf(month, year, from, to) {
   return { buffer, fileName: `staff_hours_payroll_${spec.period.fileSuffix}.pdf` };
 }
 
-module.exports = { generateStaffMonthlyReport, generateStaffMonthlyReportPdf };
+module.exports = { generateStaffMonthlyReport, generateStaffMonthlyReportPdf, loadSpec };
