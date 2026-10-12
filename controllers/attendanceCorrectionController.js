@@ -179,12 +179,19 @@ exports.correctWorkerAttendance = async (req, res) => {
       if (checkIn.slice(0, 10) !== recordDate) throw new OpError(`Check-in must be on the record date (${recordDate}).`);
       if (checkOut <= checkIn) throw new OpError('Check-out must be after check-in.');
       if (checkOut > nowWall()) throw new OpError('Check-out cannot be in the future.');
+      // The existing Lunch is replaced (new lunch times) or removed (worked
+      // through lunch) below, so it is not checked against the new shift.
+      const lunchReplaced = req.body.worked_through_lunch === true
+        || Boolean(req.body.lunch_start_time || req.body.lunch_end_time);
       const [leaves] = await connection.execute(
-        'SELECT leave_start_time, leave_end_time FROM attendanceleaveperiods WHERE attendance_id = ?', [attendanceId]);
+        'SELECT leave_start_time, leave_end_time, leave_type FROM attendanceleaveperiods WHERE attendance_id = ?', [attendanceId]);
       for (const l of leaves) {
+        if (l.leave_type === 'Lunch' && lunchReplaced) continue;
         if (!l.leave_end_time) throw new OpError('The record has an open break. End or correct it first.');
         if (wall(l.leave_start_time) < checkIn || wall(l.leave_end_time) > checkOut) {
-          throw new OpError('An existing break would fall outside the corrected shift. Correct the break first.');
+          throw new OpError(l.leave_type === 'Lunch'
+            ? 'The recorded lunch falls outside the corrected shift. Enter the new lunch time, or tick "Worked through lunch" to remove it.'
+            : 'An existing break would fall outside the corrected shift. Correct the break first.');
         }
       }
     } else {
