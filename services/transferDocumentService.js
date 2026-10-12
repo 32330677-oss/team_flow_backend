@@ -30,6 +30,9 @@ const LOGO_PATH = path.join(__dirname, '../assets/logo_report.png');
 const LOGO_FALLBACK = path.join(__dirname, '../assets/logo.png');
 const ARABIC_FONT_PATH = path.join(__dirname, '../assets/fonts/NotoNaskhArabic-Regular.ttf');
 
+// Seal radius (points).
+const SEAL_R = 60;
+
 // Decision colours (the stamp keeps its meaning: green / red / amber).
 const STAMP_STYLE = {
   Approved: { color: '#1B7F3B', tint: '#EAF5EE', title: 'APPROVED', caption: 'TRANSFER APPROVED' },
@@ -170,6 +173,21 @@ function createWriter(doc) {
 // ---------------------------------------------------------------------------
 // Seal: round rubber-stamp look, text on the ring, decision in the centre band.
 // ---------------------------------------------------------------------------
+// Font size (and letter spacing) so `str` covers at most `maxDeg` of the ring.
+function fitArc(doc, str, r, maxDeg, { size, spacing, minSize = 5 }) {
+  const maxLen = (r * maxDeg * Math.PI) / 180;
+  let s = size;
+  let sp = spacing;
+  const len = () => {
+    doc.font('Helvetica-Bold').fontSize(s);
+    return [...str].reduce((a, c) => a + doc.widthOfString(c) + sp, 0) - sp;
+  };
+  while (len() > maxLen && (s > minSize || sp > 0.2)) {
+    if (sp > 0.4) sp -= 0.2; else s -= 0.2;
+  }
+  return { size: s, spacing: sp };
+}
+
 function textOnArc(doc, str, cx, cy, r, { size, top, color, spacing = 1.2 }) {
   doc.font('Helvetica-Bold').fontSize(size);
   const chars = [...str];
@@ -192,9 +210,11 @@ function textOnArc(doc, str, cx, cy, r, { size, top, color, spacing = 1.2 }) {
 
 function drawSeal(doc, cx, cy, { status, companyName, dateText }) {
   const s = STAMP_STYLE[status];
-  const R = 58;
+  const R = SEAL_R;
+  const ringR = R - 11;        // radius of the ring text
+  const innerR = R - 20;       // inner circle
   doc.save();
-  doc.rotate(-9, { origin: [cx, cy] });
+  doc.rotate(-8, { origin: [cx, cy] });
   doc.opacity(0.93);
   if (status === 'Pending') {
     doc.circle(cx, cy, R).dash(4, { space: 3 }).lineWidth(1.8).strokeColor(s.color).stroke();
@@ -203,26 +223,33 @@ function drawSeal(doc, cx, cy, { status, companyName, dateText }) {
     doc.circle(cx, cy, R).lineWidth(2.6).strokeColor(s.color).stroke();
   }
   doc.circle(cx, cy, R - 4).lineWidth(0.7).strokeColor(s.color).stroke();
-  doc.circle(cx, cy, R - 19).lineWidth(0.9).strokeColor(s.color).stroke();
+  doc.circle(cx, cy, innerR).lineWidth(0.9).strokeColor(s.color).stroke();
 
-  const ring = companyName.toUpperCase().length > 30 ? companyName.toUpperCase().slice(0, 30) : companyName.toUpperCase();
-  textOnArc(doc, ring, cx, cy, R - 11.5, { size: 7.2, top: true, color: s.color, spacing: 0.9 });
-  textOnArc(doc, 'ELECTRONIC STAMP', cx, cy, R - 11.5, { size: 7, top: false, color: s.color, spacing: 1.4 });
-  // small dots between the two ring texts
+  // Ring texts: company name on the top arc (max 150 deg), stamp label on the
+  // bottom arc (max 110 deg), so they never meet on the sides.
+  const ring = companyName.toUpperCase().slice(0, 34);
+  const topFit = fitArc(doc, ring, ringR, 150, { size: 7.2, spacing: 0.9 });
+  textOnArc(doc, ring, cx, cy, ringR, { ...topFit, top: true, color: s.color });
+  const botFit = fitArc(doc, 'ELECTRONIC STAMP', ringR, 110, { size: 7, spacing: 1.4 });
+  textOnArc(doc, 'ELECTRONIC STAMP', cx, cy, ringR, { ...botFit, top: false, color: s.color });
+  // small dots on the sides, between the two ring texts
   [-1, 1].forEach((side) => {
-    doc.circle(cx + side * (R - 11.5), cy, 1.6).fill(s.color);
+    doc.circle(cx + side * ringR, cy + 1, 1.6).fill(s.color);
   });
 
-  // Centre band with the decision word.
-  const bandW = (R - 19) * 2 + 18;
-  const bandH = 19;
+  // Centre band with the decision word: its ends sit on the inner circle.
+  const bandH = 18;
+  const bandW = 2 * Math.sqrt(innerR * innerR - (bandH / 2) * (bandH / 2)) - 1;
   doc.rect(cx - bandW / 2, cy - bandH / 2, bandW, bandH).fill(s.color);
-  doc.font('Helvetica-Bold').fontSize(status === 'Pending' ? 11 : 12.5).fillColor('#FFFFFF')
-    .text(s.title, cx - bandW / 2, cy - (status === 'Pending' ? 5.5 : 6.5), { width: bandW, align: 'center', characterSpacing: 1.5, lineBreak: false });
+  let titleSize = 11.5;
+  doc.font('Helvetica-Bold');
+  while (titleSize > 8 && doc.fontSize(titleSize).widthOfString(s.title, { characterSpacing: 1.2 }) > bandW - 8) titleSize -= 0.5;
+  doc.fontSize(titleSize).fillColor('#FFFFFF')
+    .text(s.title, cx - bandW / 2, cy - titleSize * 0.5 + 0.5, { width: bandW, align: 'center', characterSpacing: 1.2, lineBreak: false });
   doc.font('Helvetica-Bold').fontSize(6.3).fillColor(s.color)
-    .text('TRANSFER', cx - 30, cy - 25, { width: 60, align: 'center', characterSpacing: 1.6, lineBreak: false });
+    .text('TRANSFER', cx - 30, cy - bandH / 2 - 12, { width: 60, align: 'center', characterSpacing: 1.6, lineBreak: false });
   doc.font('Helvetica').fontSize(7).fillColor(s.color)
-    .text(dateText || '', cx - 32, cy + 15, { width: 64, align: 'center', lineBreak: false });
+    .text(dateText || '', cx - 32, cy + bandH / 2 + 5, { width: 64, align: 'center', lineBreak: false });
   doc.opacity(1);
   doc.restore();
 }
@@ -308,8 +335,8 @@ function renderTransferRequestPdf(data) {
   const midX = L + 130;
   const midW = boxX - midX - 12;
   doc.font('Helvetica-Bold').fontSize(8).fillColor(BRAND.goldDark)
-    .text('HUMAN RESOURCES  •  SITE OPERATIONS', midX, y + 14, { width: midW, characterSpacing: 0.6, lineBreak: false });
-  w.text(companyInfo, midX, y + 27, midW, { size: 8.5, color: BRAND.muted, maxLines: 2, align: 'left' });
+    .text('PROJECT', midX, y + 16, { characterSpacing: 1.2, lineBreak: false });
+  w.text(companyInfo, midX, y + 29, midW, { size: 9.5, bold: true, color: BRAND.charcoalDark, maxLines: 2, align: 'left' });
 
   y = Math.max(y + 70, y + boxH) + 8;
   doc.moveTo(L, y).lineTo(R, y).lineWidth(1.4).strokeColor(BRAND.gold).stroke();
@@ -411,7 +438,7 @@ function renderTransferRequestPdf(data) {
 
   // ---- Signatures + stamp -----------------------------------------------------
   // Keep the decision block at the bottom of the page.
-  const blockH = 176;
+  const blockH = 214;
   y = Math.max(y, pageBottom - 40 - blockH);
   section('Approval');
   const sigTop = y;
@@ -442,10 +469,10 @@ function renderTransferRequestPdf(data) {
   decided ? 'Electronically stamped - no handwritten signature required.' : null);
 
   // Decision panel (left) + seal (right).
-  const py = sigTop + 84;
-  const sealR = 58;
+  const py = sigTop + 94;
+  const sealR = SEAL_R;
   const panelW = W - (sealR * 2 + 34);
-  const panelH = 86;
+  const panelH = 96;
   doc.rect(L, py, panelW, panelH).fill(st.tint);
   doc.rect(L, py, 4, panelH).fill(st.color);
   doc.font('Helvetica-Bold').fontSize(8).fillColor(st.color)
@@ -472,7 +499,7 @@ function renderTransferRequestPdf(data) {
     doc.font('Courier-Bold').fontSize(9).fillColor(BRAND.charcoalDark).text(code, L + 92, py + panelH - 18.5, { lineBreak: false });
   }
 
-  drawSeal(doc, R - sealR - 6, py + panelH / 2 - 2, {
+  drawSeal(doc, R - sealR - 4, py + panelH / 2, {
     status, companyName, dateText: decided ? String(review.reviewedAt || '').slice(0, 10) : requestDate,
   });
 
