@@ -181,6 +181,48 @@ function draw(doc, r) {
     for (const ch of s) { if (isAr(ch)) ar += 1; else if (LATIN_LETTER.test(ch)) la += 1; }
     return ar > 0 && ar >= la;
   }
+  // Right-to-left line, simplified Unicode bidi:
+  //  - a stand-alone punctuation token ("|", "-", "/") stays inside a Latin
+  //    run only when Latin text is on both sides; otherwise it follows the
+  //    Arabic direction (it used to be glued to the next Latin run, which
+  //    put the "|" of "مشروع | T2 Bridges" on the wrong side);
+  //  - a Latin run of several words keeps its inner punctuation where it is
+  //    ("T2+ Bridges" stays "T2+ Bridges"); only the punctuation at the very
+  //    start / end of the run moves to the other end, as in real bidi.
+  const neutral = (t) => !t.ar && t.segs.every((sg) => PUNCT_ONLY.test(sg.text));
+  function rtlVisualOrder(tokens) {
+    const strong = tokens.map((t) => (neutral(t) ? null : (t.ar ? 'R' : 'L')));
+    const dir = strong.map((d, i) => {
+      if (d) return d;
+      let a = null; let b = null;
+      for (let j = i - 1; j >= 0 && !a; j -= 1) a = strong[j];
+      for (let j = i + 1; j < tokens.length && !b; j += 1) b = strong[j];
+      return a === 'L' && b === 'L' ? 'L' : 'R';
+    });
+    const groups = [];
+    tokens.forEach((t, i) => {
+      const last = groups[groups.length - 1];
+      if (dir[i] === 'L' && last && last.ltr) last.items.push(t);
+      else groups.push({ ltr: dir[i] === 'L', items: [t] });
+    });
+    return groups.reverse().flatMap((g) => {
+      if (!g.ltr) return g.items.map(rtlToken);
+      if (g.items.length === 1) return [rtlToken(g.items[0])];
+      // Several Latin words: move only the outer punctuation of the run.
+      const items = g.items.map((t) => ({ ...t, segs: t.segs.map((sg) => ({ ...sg })) }));
+      // The run starts and ends with a real word (never a lone punctuation
+      // token), and a Latin token is a single segment.
+      const first = items[0].segs[0];
+      const last = items[items.length - 1].segs[0];
+      const lead = first.text.match(/^[^\p{L}\p{N}]*/u)[0];
+      const trail = last.text.match(/[^\p{L}\p{N}]*$/u)[0];
+      first.text = first.text.slice(lead.length);
+      if (trail) last.text = last.text.slice(0, -trail.length);
+      first.text = mirrorRun(trail) + first.text;
+      last.text += mirrorRun(lead);
+      return items;
+    });
+  }
   const lineWidth = (tokens, sp) => tokens.reduce((a, t) => a + t.w, 0) + sp * Math.max(0, tokens.length - 1);
 
   // Draws one line of tokens. Right-to-left lines: Arabic words in reverse
@@ -189,15 +231,7 @@ function draw(doc, r) {
     const sp = spaceW(size, o.bold, o.spacing || 0);
     const lw = lineWidth(tokens, sp);
     let visual = tokens;
-    if (o.rtl) {
-      const groups = [];
-      for (const t of tokens) {
-        const last = groups[groups.length - 1];
-        if (!t.ar && last && !last.ar) last.items.push(t);
-        else groups.push({ ar: t.ar, items: [t] });
-      }
-      visual = groups.reverse().flatMap((g) => g.items).map(rtlToken);
-    }
+    if (o.rtl) visual = rtlVisualOrder(tokens);
     const align = o.align || (o.rtl ? 'right' : 'left');
     let cx = x;
     if (align === 'right') cx = x + w - lw;
@@ -243,6 +277,37 @@ function draw(doc, r) {
     // A cell keeps its column alignment even for Arabic (only the word order
     // changes); paragraphs are the ones that align right when Arabic.
     drawTokens(tokens, x + pad, ty, avail, size, { bold, color: o.color, align: o.align || 'left', rtl, spacing: spc });
+  }
+  // Several fields on one line, left to right, joined by "|". Each field is
+  // laid out on its own, so an Arabic project name next to a Latin contract
+  // name keeps its words in order and the separators stay between fields.
+  // Empty fields are skipped (no dangling "|").
+  function fieldLine(parts, x, y, w, h, o = {}) {
+    const items = parts.map((v) => clean(v).replace(/\s+/g, ' ').trim()).filter(Boolean);
+    if (!items.length) return;
+    let size = o.size || 8;
+    const sep = '|';
+    const gap = 9;
+    const natural = (sz) => {
+      const ws = items.map((t) => lineWidth(tokenize(t, sz, o.bold), spaceW(sz, o.bold)));
+      doc.font('Helvetica').fontSize(sz);
+      const sepW = doc.widthOfString(sep) + gap * 2;
+      return { ws, sepW, total: ws.reduce((a, b) => a + b, 0) + sepW * (items.length - 1) };
+    };
+    let m = natural(size);
+    if (m.total > w) { size = Math.max(size * 0.75, size * (w / m.total)); m = natural(size); }
+    let cx = x;
+    items.forEach((t, i) => {
+      if (i > 0) {
+        if (cx + m.sepW > x + w) return;
+        cell(sep, cx + gap, y, m.sepW - gap * 2 + 1, h, { size, color: o.sepColor || o.color, pad: 0 });
+        cx += m.sepW;
+      }
+      const room = x + w - cx;
+      if (room <= 8) return;
+      cell(t, cx, y, Math.min(m.ws[i] + 1, room), h, { size, bold: o.bold, color: o.color, pad: 0 });
+      cx += m.ws[i];
+    });
   }
   const label = (str, x, y, w, o = {}) => cell(str, x, y, w, 10, { size: 6.8, bold: true, color: P.muted, spacing: 0.8, pad: 0, ...o });
 
@@ -686,8 +751,7 @@ function draw(doc, r) {
     rect(L, y, W, bandH, P.charcoal);
     rect(L, y + bandH - 3, W, 3, P.gold);
     cell(s.site_name, L + 14, y + 6, W * 0.64, 20, { size: 14, bold: true, color: P.white, pad: 0 });
-    const sub = [s.project_name, s.contract_name, s.location].filter(Boolean).join('   |   ');
-    cell(sub || ' ', L + 14, y + 26, W * 0.64, 12, { size: 7.8, color: P.goldMid, pad: 0 });
+    fieldLine([s.project_name, s.contract_name, s.location], L + 14, y + 26, W * 0.64, 12, { size: 7.8, color: P.goldMid });
     label('ON SITE', L + W - 130, y + 9, 116, { color: P.goldMid, align: 'right' });
     cell(`${c.on_site || 0} / ${c.assigned || 0}`, L + W - 160, y + 19, 146, 20, { size: 15, bold: true, color: P.white, align: 'right', pad: 0 });
     y += bandH;
