@@ -1,7 +1,7 @@
 const db = require('../config/db');
 const path = require('path');
 const fs = require('fs');
-const { generateTransferRequestDocx, isDocumentCurrent } = require('../services/transferDocumentService');
+const { generateTransferRequestPdf, isDocumentCurrent } = require('../services/transferDocumentService');
 const { businessToday, isValidDateOnly, addDays } = require('../services/businessDate');
 const { overlaps } = require('../services/assignmentDates');
 
@@ -57,11 +57,11 @@ async function loadTransferDocumentRow(requestId) {
     return row || null;
 }
 
-// (Re)generates the Word document for the request in its CURRENT status
+// (Re)generates the PDF document for the request in its CURRENT status
 // (Pending copy, or the electronically stamped Approved/Rejected copy) and
 // stores the path. Returns the relative path.
 async function buildTransferDocument(row) {
-    const documentPath = await generateTransferRequestDocx({
+    const documentPath = await generateTransferRequestPdf({
         requestId: row.request_id,
         companyName: process.env.COMPANY_NAME || null,
         companyInfo: process.env.COMPANY_INFO || null,
@@ -180,7 +180,7 @@ exports.createTransferRequest = async (req, res) => {
         try {
             documentPath = await regenerateTransferDocument(requestId);
         } catch (docError) {
-            console.error('TRANSFER DOCX GENERATION ERROR:', docError);
+            console.error('TRANSFER PDF GENERATION ERROR:', docError);
         }
 
         res.status(201).json({
@@ -416,7 +416,7 @@ exports.reviewTransferRequest = async (req, res) => {
         try {
             documentAvailable = Boolean(await regenerateTransferDocument(id));
         } catch (docError) {
-            console.error('TRANSFER STAMPED DOCX ERROR:', docError);
+            console.error('TRANSFER STAMPED PDF ERROR:', docError);
         }
 
         res.status(200).json({
@@ -461,7 +461,7 @@ exports.downloadTransferDocument = async (req, res) => {
                 const generatedPath = await buildTransferDocument(row);
                 absolutePath = path.join(__dirname, '..', generatedPath);
             } catch (genError) {
-                console.error('ON-THE-FLY DOCX GENERATION ERROR:', genError);
+                console.error('ON-THE-FLY PDF GENERATION ERROR:', genError);
                 return res.status(500).json({ status: 'error', message: 'Failed to generate document on the fly.' });
             }
         }
@@ -474,7 +474,7 @@ exports.downloadTransferDocument = async (req, res) => {
 };
 
 // 5. The supervisor's own transfer requests (all statuses) — the requests and
-// their Word documents stay available to the supervisor after submitting,
+// their PDF documents stay available to the supervisor after submitting,
 // and show the Admin decision once reviewed.
 // GET /api/transfers/mine?status=
 exports.getMyTransfers = async (req, res) => {
