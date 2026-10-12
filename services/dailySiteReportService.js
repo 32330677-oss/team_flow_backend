@@ -16,6 +16,8 @@
 //   * Absent / Sick / Leave (Vacation) / Holiday = that attendance_status.
 //   * No record = assigned but nothing recorded for D yet.
 //   * Staff: staff_site_assignments covering D + staff_attendance dated D.
+//   * Output: counts and trade breakdowns only. No names, IDs, check-in
+//     times, hours or money (layout v2, 2026-10-12).
 //     Staff have no shift; they are reported once per site, whatever shift
 //     filter is chosen (optional: includeStaff).
 
@@ -27,13 +29,6 @@ const SHIFTS = ['Day', 'Night'];
 function n(v) {
   const x = Number(v);
   return Number.isFinite(x) ? x : 0;
-}
-
-function hhmm(dt) {
-  if (!dt) return null;
-  const s = String(dt);
-  const m = s.match(/(\d{2}):(\d{2})/);
-  return m ? `${m[1]}:${m[2]}` : null;
 }
 
 function stateOf(row) {
@@ -92,9 +87,8 @@ async function listReportableSites() {
  * @param {number[]} p.siteIds    Active site ids (already validated)
  * @param {'All'|'Day'|'Night'} p.shift
  * @param {boolean} p.includeStaff
- * @param {boolean} p.showAbsentNames
  */
-async function buildReportData({ date, siteIds, shift, includeStaff, showAbsentNames }) {
+async function buildReportData({ date, siteIds, shift, includeStaff }) {
   if (!siteIds.length) return { sites: [], totals: totalsOf([]) };
   const shiftList = shift === 'All' ? SHIFTS : [shift];
   const sitePh = siteIds.map(() => '?').join(',');
@@ -119,10 +113,8 @@ async function buildReportData({ date, siteIds, shift, includeStaff, showAbsentN
 
   // One row per worker assigned on D (+ his record dated D, if any).
   const workersSql = `
-    SELECT wsa.site_id, wsa.shift_type, w.worker_id, w.worker_unique_id, w.full_name, w.job_position,
-           DATE_FORMAT(wsa.assigned_date, '%Y-%m-%d') AS assigned_date,
-           DATE_FORMAT(wsa.unassigned_date, '%Y-%m-%d') AS last_day,
-           a.attendance_id, a.attendance_status, a.check_in_time, a.source
+    SELECT wsa.site_id, wsa.shift_type, w.worker_id, w.job_position AS trade,
+           a.attendance_id, a.attendance_status, a.check_in_time
     FROM workersiteassignments wsa
     JOIN workers w ON w.worker_id = wsa.worker_id AND w.status = 'Active'
     LEFT JOIN attendance a
@@ -131,20 +123,18 @@ async function buildReportData({ date, siteIds, shift, includeStaff, showAbsentN
     WHERE ${activeOn('wsa')}
       AND wsa.site_id IN (${sitePh})
       AND wsa.shift_type IN (${shiftPh})
-    ORDER BY w.full_name, w.worker_id`;
+    ORDER BY w.worker_id`;
 
   const staffSql = `
-    SELECT ssa.site_id, sm.staff_id, sm.staff_unique_id, sm.full_name, sm.position,
-           DATE_FORMAT(ssa.assigned_date, '%Y-%m-%d') AS assigned_date,
-           DATE_FORMAT(ssa.unassigned_date, '%Y-%m-%d') AS last_day,
-           sa.staff_attendance_id AS attendance_id, sa.attendance_status, sa.check_in_time, sa.source
+    SELECT ssa.site_id, sm.staff_id, sm.position AS trade,
+           sa.staff_attendance_id AS attendance_id, sa.attendance_status, sa.check_in_time
     FROM staff_site_assignments ssa
     JOIN staff_members sm ON sm.staff_id = ssa.staff_id
      AND (sm.status = 'Active' OR (sm.termination_date IS NOT NULL AND sm.termination_date >= ?))
     LEFT JOIN staff_attendance sa ON sa.staff_id = ssa.staff_id AND sa.record_date = ?
     WHERE ${activeOn('ssa')}
       AND ssa.site_id IN (${sitePh})
-    ORDER BY sm.full_name, sm.staff_id`;
+    ORDER BY sm.staff_id`;
 
   const [[sites], [shiftSups], [workers], [staff]] = await Promise.all([
     pool.query(sitesSql, siteIds),
@@ -170,7 +160,7 @@ async function buildReportData({ date, siteIds, shift, includeStaff, showAbsentN
       return {
         shift_type: sh,
         supervisor: supportsShifts ? (supMap.get(`${siteId}|${sh}`) || null) : (sh === 'Day' ? s.site_supervisor || null : null),
-        ...summarisePeople(rows, date, showAbsentNames, (r) => r.worker_unique_id, (r) => r.job_position),
+        ...summarisePeople(rows),
       };
     });
     // Hide an empty shift (no one assigned) unless it is the only one shown.
@@ -179,7 +169,7 @@ async function buildReportData({ date, siteIds, shift, includeStaff, showAbsentN
 
     const staffRows = staff.filter((r) => n(r.site_id) === siteId);
     const staffBlock = includeStaff
-      ? summarisePeople(staffRows, date, showAbsentNames, (r) => r.staff_unique_id, (r) => r.position)
+      ? summarisePeople(staffRows)
       : null;
 
     const counts = emptyCounts();
@@ -204,45 +194,26 @@ async function buildReportData({ date, siteIds, shift, includeStaff, showAbsentN
   return { sites: result, totals: totalsOf(result) };
 }
 
-function summarisePeople(rows, date, showAbsentNames, codeOf, tradeOf) {
+// Counts and trade breakdown only. Since layout v2 the report carries no
+// names, IDs or check-in times: the client only needs head counts.
+function summarisePeople(rows) {
   const counts = emptyCounts();
-  const present = [];
-  const away = [];
   const trades = new Map();
-  const joined = [];
-  const leaving = [];
 
   for (const r of rows) {
     const st = stateOf(r);
     counts.assigned += 1;
     counts[st] += 1;
-    const trade = tradeLabel(tradeOf(r));
+    const trade = tradeLabel(r.trade);
     const t = trades.get(trade) || { trade, assigned: 0, on_site: 0 };
     t.assigned += 1;
     if (st === 'on_site') t.on_site += 1;
     trades.set(trade, t);
-
-    const person = { code: codeOf(r) || '', name: r.full_name, trade };
-    if (st === 'on_site') {
-      present.push({ ...person, check_in: hhmm(r.check_in_time), source: r.source === 'Biometric' ? 'Biometric' : 'Manual' });
-    } else if (showAbsentNames) {
-      away.push({ ...person, status: st });
-    }
-    if (r.assigned_date === date) joined.push(person);
-    if (r.last_day === date) leaving.push(person);
   }
-
-  present.sort((a, b) => String(a.check_in || '99').localeCompare(String(b.check_in || '99')) || a.name.localeCompare(b.name));
-  const awayOrder = { absent: 0, sick: 1, leave: 2, holiday: 3, no_record: 4 };
-  away.sort((a, b) => awayOrder[a.status] - awayOrder[b.status] || a.name.localeCompare(b.name));
 
   return {
     counts,
     trades: [...trades.values()].sort((a, b) => b.assigned - a.assigned || a.trade.localeCompare(b.trade)),
-    present,
-    away,
-    joined,
-    leaving,
   };
 }
 
@@ -262,4 +233,4 @@ function totalsOf(sites) {
   };
 }
 
-module.exports = { listReportableSites, buildReportData, _internal: { stateOf, summarisePeople, hhmm } };
+module.exports = { listReportableSites, buildReportData, LAYOUT_VERSION: 2, _internal: { stateOf, summarisePeople } };

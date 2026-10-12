@@ -159,7 +159,7 @@ test('R4 signatory + generate PDF + history + reprint', async () => {
   assert.equal(g2.status, 400);
 });
 
-test('R5 typed issuer, all sites, show_absent_names=false', async () => {
+test('R5 typed issuer, all sites, legacy show_absent_names ignored', async () => {
   const g = await pdf('/api/reports/daily-site/generate', {
     site_ids: 'all', issued_by_name: 'Site Office', issued_by_title: 'Admin', recipient_name: 'Typed Recipient', show_absent_names: false,
   });
@@ -167,5 +167,78 @@ test('R5 typed issuer, all sites, show_absent_names=false', async () => {
   const [row] = await q('SELECT recipient_name, options FROM daily_site_reports WHERE report_no = ?', [g.reportNo]);
   assert.equal(row.recipient_name, 'Typed Recipient');
   const opts = typeof row.options === 'string' ? JSON.parse(row.options) : row.options;
-  assert.equal(opts.show_absent_names, false);
+  assert.deepEqual(opts, { include_staff: true });
+});
+
+test('R6 v2 payload: counts and trades only, no names / IDs / check-in times', async () => {
+  const g = await pdf('/api/reports/daily-site/generate', { site_ids: [SITE], issued_by_name: 'Site Office' });
+  assert.equal(g.status, 200);
+  const [row] = await q('SELECT payload FROM daily_site_reports WHERE report_no = ?', [g.reportNo]);
+  const raw = typeof row.payload === 'string' ? row.payload : JSON.stringify(row.payload);
+  const p = JSON.parse(raw);
+  assert.equal(p.layout, 2);
+  for (const bad of ['Worker Present', 'W-501', 'عامل جديد', 'S-51', 'check_in', '07:00', 'present', 'away']) {
+    assert.ok(!raw.includes(bad), `payload must not contain ${bad}`);
+  }
+  const day = p.sites[0].shifts.find((x) => x.shift_type === 'Day');
+  // 501 (Steel Fixer) was turned Absent in R4.
+  const steel = day.trades.find((t) => t.trade === 'Steel Fixer');
+  assert.deepEqual({ ...steel }, { trade: 'Steel Fixer', assigned: 1, on_site: 0 });
+  const lab = day.trades.find((t) => t.trade === 'Labourer');
+  assert.deepEqual({ a: lab.assigned, on: lab.on_site }, { a: 3, on: 1 });
+  assert.deepEqual(p.sites[0].staff.trades, [{ trade: 'Site Engineer', assigned: 1, on_site: 1 }]);
+});
+
+test('R7 site notes: validated, stored in the snapshot, offered as last notes', async () => {
+  const notes = {
+    [SITE]: {
+      weather: 'hot', weather_impact: 'slowed', hse_status: 'near_miss',
+      work_done: '  Slab rebar zone A done.\r\n\r\n\r\n\r\nColumns 12/20  ',
+      work_planned: 'صب أعمدة الطابق الأرضي (المحور A)',
+      toolbox_talk: 'Working at height', issues: 'x'.repeat(5000), hse_details: 'Plank fell, no injury.',
+    },
+    [SITE_B]: { weather: 'tornado', hse_status: 'bad', work_done: '   ' }, // nothing valid: dropped
+    999: { work_done: 'not in the report' },
+  };
+  const g = await pdf('/api/reports/daily-site/generate', { site_ids: [SITE, SITE_B], issued_by_name: 'Site Office', site_notes: notes });
+  assert.equal(g.status, 200, g.buf.toString().slice(0, 300));
+  const [row] = await q('SELECT payload FROM daily_site_reports WHERE report_no = ?', [g.reportNo]);
+  const p = typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload;
+  const a = p.sites.find((s) => s.site_id === SITE).notes;
+  const b = p.sites.find((s) => s.site_id === SITE_B).notes;
+  assert.equal(a.weather, 'hot');
+  assert.equal(a.weather_impact, 'slowed');
+  assert.equal(a.hse_status, 'near_miss');
+  assert.equal(a.work_done, 'Slab rebar zone A done.\n\nColumns 12/20');
+  assert.equal(a.work_planned, 'صب أعمدة الطابق الأرضي (المحور A)');
+  assert.equal(a.issues.length, 1200);
+  assert.deepEqual(b, {});
+  assert.ok(!JSON.stringify(p).includes('not in the report'));
+
+  const opt = await admin().get('/api/reports/daily-site/options');
+  assert.equal(opt.status, 200);
+  const last = opt.body.data.last_notes[String(SITE)];
+  assert.equal(last.report_no, g.reportNo);
+  assert.equal(last.notes.toolbox_talk, 'Working at height');
+  assert.equal(last.notes.weather, undefined, 'weather is day-specific, not offered');
+  assert.equal(opt.body.data.last_notes[String(SITE_B)], undefined);
+});
+
+test('R8 a report saved before v2 re-prints with the new layout', async () => {
+  const legacy = {
+    sites: [{
+      site_id: SITE, site_name: 'Report Site', shifts: [{ shift_type: 'Day', supervisor: 'X', counts: { assigned: 1, on_site: 1, absent: 0, sick: 0, leave: 0, holiday: 0, no_record: 0 },
+        trades: [{ trade: 'Mason', assigned: 1, on_site: 1 }], present: [{ code: 'W-1', name: 'Old Name', trade: 'Mason', check_in: '07:00' }], away: [], joined: [], leaving: [] }],
+      staff: null, workers_counts: { assigned: 1, on_site: 1, absent: 0, sick: 0, leave: 0, holiday: 0, no_record: 0 },
+      staff_counts: { assigned: 0, on_site: 0, absent: 0, sick: 0, leave: 0, holiday: 0, no_record: 0 },
+    }],
+    totals: { sites: 1, workers: { assigned: 1, on_site: 1, absent: 0, sick: 0, leave: 0, holiday: 0, no_record: 0 },
+      staff: { assigned: 0, on_site: 0, absent: 0, sick: 0, leave: 0, holiday: 0, no_record: 0 }, on_site_total: 1, assigned_total: 1 },
+  };
+  const ins = await q(`INSERT INTO daily_site_reports (report_no, report_date, shift_filter, site_ids, issued_by_name, options, totals, payload, generated_by_user_id, generated_at)
+    VALUES ('DSR-LEGACY-0001', ?, 'All', '[50]', 'Old', '{"include_staff":true,"show_absent_names":true}', ?, ?, 1, NOW())`,
+  [D, JSON.stringify(legacy.totals), JSON.stringify(legacy)]);
+  const re = await pdf(`/api/reports/daily-site/${ins.insertId}/pdf`);
+  assert.equal(re.status, 200);
+  assert.equal(re.buf.subarray(0, 4).toString(), '%PDF');
 });

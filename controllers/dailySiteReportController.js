@@ -16,13 +16,22 @@
 //   { date: 'YYYY-MM-DD' (default today), site_ids: [1,2] | 'all',
 //     shift: 'All'|'Day'|'Night', recipient_name,
 //     signatory_id | issued_by_name (+ issued_by_title),
-//     include_staff: true, show_absent_names: true }
+//     include_staff: true,
+//     site_notes: { "<site_id>": { weather, weather_impact, work_done,
+//       work_planned, hse_status, hse_details, toolbox_talk, issues } } }
+//
+// Layout v2 (2026-10-12): head counts by site and trade + the site notes.
+// No names, IDs, check-in times, hours or money. `show_absent_names` is
+// accepted and ignored (older app builds still send it).
 
 const pool = require('../config/db');
 const { businessToday, isValidDateOnly } = require('../services/businessDate');
 const { businessNow } = require('../services/biometricPunchProcessor');
 const { listReportableSites, buildReportData } = require('../services/dailySiteReportService');
-const { renderDailySiteReportPdf } = require('../services/dailySiteReportPdfLayout');
+const {
+  renderDailySiteReportPdf, WEATHER_KEYS, IMPACT_KEYS, HSE_KEYS,
+} = require('../services/dailySiteReportPdfLayout');
+const { LAYOUT_VERSION } = require('../services/dailySiteReportService');
 
 class ReportError extends Error {
   constructor(message, statusCode = 400) {
@@ -57,6 +66,40 @@ function fail(res, error, where) {
 function text(v, max) {
   const s = String(v ?? '').replace(/\s+/g, ' ').trim();
   return s ? s.slice(0, max) : '';
+}
+
+// Multi-line note: keeps line breaks, drops control characters.
+function noteText(v, max) {
+  const s = String(v ?? '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, '')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/ *\n */g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return s.slice(0, max).trim();
+}
+
+const NOTE_LIMITS = { work_done: 1500, work_planned: 1000, hse_details: 800, toolbox_talk: 160, issues: 1200 };
+
+/** Site notes typed at issue time. Unknown sites / values are dropped. */
+function parseSiteNotes(raw, siteIds) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  const allowed = new Set(siteIds);
+  for (const [key, v] of Object.entries(raw)) {
+    const id = Number(key);
+    if (!allowed.has(id) || !v || typeof v !== 'object') continue;
+    const n = {
+      weather: WEATHER_KEYS.includes(v.weather) ? v.weather : '',
+      weather_impact: IMPACT_KEYS.includes(v.weather_impact) ? v.weather_impact : '',
+      hse_status: HSE_KEYS.includes(v.hse_status) ? v.hse_status : '',
+    };
+    for (const [k, max] of Object.entries(NOTE_LIMITS)) n[k] = noteText(v[k], max);
+    const kept = Object.fromEntries(Object.entries(n).filter(([, x]) => x));
+    if (Object.keys(kept).length) out[id] = kept;
+  }
+  return out;
 }
 
 function bool(v, fallback) {
@@ -127,8 +170,36 @@ async function resolveRequest(body) {
     issuedByName,
     issuedByTitle,
     includeStaff: bool(b.include_staff, true),
-    showAbsentNames: bool(b.show_absent_names, true),
+    siteNotes: parseSiteNotes(b.site_notes, siteIds),
   };
+}
+
+/**
+ * The most recent notes typed for each site (from the last 30 reports), so
+ * the app can offer "copy from the last report". Weather and HSE status are
+ * day-specific and are not offered.
+ */
+async function lastNotesBySite() {
+  const [rows] = await pool.query(
+    `SELECT report_no, DATE_FORMAT(report_date, '%Y-%m-%d') AS report_date, payload
+     FROM daily_site_reports ORDER BY report_id DESC LIMIT 30`);
+  const out = {};
+  for (const r of rows) {
+    const p = json(r.payload);
+    if (!p || Number(p.layout) !== LAYOUT_VERSION) continue;
+    for (const s of p.sites || []) {
+      if (out[s.site_id] || !s.notes) continue;
+      const { work_done, work_planned, toolbox_talk, issues } = s.notes;
+      if (work_done || work_planned || toolbox_talk || issues) {
+        out[s.site_id] = {
+          report_no: r.report_no,
+          report_date: r.report_date,
+          notes: Object.fromEntries(Object.entries({ work_done, work_planned, toolbox_talk, issues }).filter(([, v]) => v)),
+        };
+      }
+    }
+  }
+  return out;
 }
 
 exports.getOptions = async (req, res) => {
@@ -141,7 +212,7 @@ exports.getOptions = async (req, res) => {
     ]);
     return res.json({
       status: 'success',
-      data: { business_today: businessToday(), sites, signatories },
+      data: { business_today: businessToday(), sites, signatories, last_notes: await lastNotesBySite() },
     });
   } catch (error) {
     return fail(res, error, 'dailySiteReport.getOptions');
@@ -185,9 +256,14 @@ exports.generate = async (req, res) => {
   try {
     const q = await resolveRequest(req.body);
     if (!q.issuedByName) throw new ReportError('Choose who the report is issued by.');
-    const data = await buildReportData(q);
+    const built = await buildReportData(q);
+    const data = {
+      layout: LAYOUT_VERSION,
+      sites: built.sites.map((s) => ({ ...s, notes: q.siteNotes[s.site_id] || {} })),
+      totals: built.totals,
+    };
     const generatedAt = businessNow();
-    const options = { include_staff: q.includeStaff, show_absent_names: q.showAbsentNames };
+    const options = { include_staff: q.includeStaff };
 
     const [ins] = await pool.query(
       `INSERT INTO daily_site_reports
