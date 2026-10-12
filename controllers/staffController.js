@@ -179,7 +179,7 @@ exports.updateStaff = async (req, res) => {
                  FROM staff_payroll sp
                  JOIN staff_payroll_batches spb
                    ON spb.staff_payroll_batch_id = sp.staff_payroll_batch_id
-                 WHERE sp.staff_id = ? AND spb.status <> 'Superseded'
+                 WHERE sp.staff_id = ? AND spb.status IN ('Generated', 'Paid')
                  LIMIT 1`,
                 [id]
             );

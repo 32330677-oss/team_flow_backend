@@ -32,6 +32,8 @@ router.patch('/:attendance_id/edit-times', attendanceController.editAttendanceTi
 
 // D-02 / §12: explicit Admin correction workflow (reason + audit, original kept).
 router.post('/:attendance_id/admin-correction', restrictTo('Admin'), correctionController.correctWorkerAttendance);
+// Delete a record entered on the wrong site/shift (reason + audit; refused inside payroll).
+router.post('/:attendance_id/admin-delete', restrictTo('Admin'), correctionController.deleteWorkerAttendance);
 router.get('/corrections', restrictTo('Admin'), correctionController.listCorrections);
 router.patch('/corrections/:correction_id/resolve', restrictTo('Admin'), correctionController.resolveAdjustment);
 

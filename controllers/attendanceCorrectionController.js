@@ -433,6 +433,126 @@ exports.correctStaffAttendance = async (req, res) => {
   }
 };
 
+// ---------------------------------------------------------------------------
+// Worker attendance: Admin DELETE (wrong site/shift entry)
+// POST /api/attendance/:attendance_id/admin-delete   { reason }
+//
+// For a record entered on the wrong shift/site: delete it, then fix the
+// assignment and enter the day again on the right shift. Refused when:
+//   * the date is inside a Finalized / Paid payroll period (money is fixed:
+//     use an Admin correction + payroll adjustment instead);
+//   * a Generated (not finalized) payroll batch covers the date (void it
+//     first, then generate the period again);
+//   * the record came from the biometric device (its punches would recreate it);
+//   * the record has correction history (Admin correction / old corrections).
+// Lunch/break rows go with the record. Snapshot lines of Voided / Superseded
+// batches (history only, never paid) are removed too, and kept in the audit row.
+// The full row is stored in auditlogs (action ADMIN_DELETE) with the reason.
+// ---------------------------------------------------------------------------
+async function tableExists(executor, name) {
+  const [rows] = await executor.query(
+    'SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? LIMIT 1', [name]);
+  return rows.length > 0;
+}
+
+exports.deleteWorkerAttendance = async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const reason = String(req.body?.reason || '').trim();
+    if (reason.length < 5) throw new OpError('A reason (at least 5 characters) is required to delete an attendance record.');
+    const attendanceId = Number(req.params.attendance_id);
+    if (!Number.isInteger(attendanceId) || attendanceId <= 0) throw new OpError('Invalid attendance id.');
+    const userId = req.user.user_id;
+
+    await connection.beginTransaction();
+    const [[original]] = await connection.execute('SELECT * FROM attendance WHERE attendance_id = ? FOR UPDATE', [attendanceId]);
+    if (!original) throw new OpError('Attendance record not found.', 404);
+    const recordDate = String(original.record_date).slice(0, 10);
+
+    if (original.source === 'Biometric') {
+      throw new OpError('This record came from the biometric device. Delete is not allowed: its punches would create it again. Use an Admin correction.', 409);
+    }
+    if (await tableExists(connection, 'attendance_punch_processing')) {
+      const [[p]] = await connection.execute(
+        "SELECT COUNT(*) AS c FROM attendance_punch_processing WHERE target_table = 'attendance' AND target_record_id = ?", [attendanceId]);
+      if (Number(p.c) > 0) {
+        throw new OpError('Biometric punches are linked to this record. Delete is not allowed; use an Admin correction.', 409);
+      }
+    }
+
+    const locked = await findLockedWorkerBatch(connection, { siteId: original.site_id, date: recordDate, workerId: original.worker_id });
+    if (locked) {
+      const err = new OpError(
+        `Payroll batch #${locked.payroll_batch_id} is ${locked.status === 'Paid' ? 'Paid' : 'Finalized'} and covers ${recordDate}. ` +
+        'A record inside a locked payroll period cannot be deleted. Use an Admin correction (the pay difference becomes a payroll adjustment).', 409);
+      err.code = 'PAYROLL_PERIOD_FINALIZED';
+      throw err;
+    }
+    const open = await payrollAdjustments.openBatchHint(connection, 'Worker',
+      { date: recordDate, siteId: original.site_id, personId: original.worker_id });
+    if (open) {
+      const err = new OpError(
+        `Payroll batch #${open.batch_id} (not finalized) covers ${recordDate}. Void it first, delete the record, then generate the period again.`, 409);
+      err.code = 'OPEN_PAYROLL_BATCH';
+      throw err;
+    }
+
+    const [[oldCorr]] = await connection.execute('SELECT COUNT(*) AS c FROM attendancecorrections WHERE attendance_id = ?', [attendanceId]);
+    let corrCount = Number(oldCorr.c);
+    if (await tableExists(connection, 'attendance_corrections_log')) {
+      const [[c]] = await connection.execute(
+        "SELECT COUNT(*) AS c FROM attendance_corrections_log WHERE record_table = 'attendance' AND record_id = ?", [attendanceId]);
+      corrCount += Number(c.c);
+    }
+    if (corrCount > 0) {
+      throw new OpError('This record has Admin correction history. Delete is not allowed; correct it instead.', 409);
+    }
+
+    // Snapshot lines: only Voided / Superseded batches may still reference it here
+    // (an active batch on this date was refused above). They are history only.
+    let removedSnapshots = [];
+    if (await tableExists(connection, 'payroll_attendance_snapshot')) {
+      const [snaps] = await connection.execute(
+        `SELECT pas.*, pb.status AS batch_status
+         FROM payroll_attendance_snapshot pas
+         JOIN payrollbatches pb ON pb.payroll_batch_id = pas.payroll_batch_id
+         WHERE pas.attendance_id = ?`, [attendanceId]);
+      const active = snaps.find((s) => s.batch_status !== 'Voided' && s.batch_status !== 'Superseded');
+      if (active) {
+        throw new OpError(`This record is part of payroll batch #${active.payroll_batch_id} (${active.batch_status}). It cannot be deleted.`, 409);
+      }
+      removedSnapshots = snaps;
+      if (snaps.length) await connection.execute('DELETE FROM payroll_attendance_snapshot WHERE attendance_id = ?', [attendanceId]);
+    }
+
+    const [breaks] = await connection.execute('SELECT * FROM attendanceleaveperiods WHERE attendance_id = ?', [attendanceId]);
+    await connection.execute('DELETE FROM attendanceleaveperiods WHERE attendance_id = ?', [attendanceId]);
+    await connection.execute('DELETE FROM attendance WHERE attendance_id = ?', [attendanceId]);
+
+    await connection.execute(
+      `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+       VALUES ('attendance', ?, 'ADMIN_DELETE', ?, ?, ?)`,
+      [attendanceId, userId,
+        JSON.stringify({ ...original, breaks, removed_payroll_snapshots: removedSnapshots.length ? removedSnapshots : undefined }),
+        JSON.stringify({ deleted: true, reason })]
+    );
+    await connection.commit();
+
+    return res.status(200).json({
+      status: 'success',
+      message: `Attendance of ${recordDate} (${original.shift_type}) deleted. ` +
+        'To record this day on the right shift, fix the worker assignment first, then enter the attendance again.',
+      data: { attendance_id: attendanceId, worker_id: original.worker_id, site_id: original.site_id,
+        shift_type: original.shift_type, record_date: recordDate },
+    });
+  } catch (error) {
+    try { await connection.rollback(); } catch (_) {}
+    return send(res, error, 'Failed to delete the attendance record.');
+  } finally {
+    connection.release();
+  }
+};
+
 // GET /api/attendance/corrections?adjustment_status=Open&record_table=attendance
 exports.listCorrections = async (req, res) => {
   try {
