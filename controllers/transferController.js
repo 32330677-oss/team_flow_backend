@@ -1,7 +1,7 @@
 const db = require('../config/db');
 const path = require('path');
 const fs = require('fs');
-const { generateTransferRequestDocx } = require('../services/transferDocumentService');
+const { generateTransferRequestDocx, isDocumentCurrent } = require('../services/transferDocumentService');
 const { businessToday, isValidDateOnly, addDays } = require('../services/businessDate');
 const { overlaps } = require('../services/assignmentDates');
 
@@ -26,6 +26,82 @@ async function verifySupervisorShiftScope(userId, siteId, shiftType) {
         [siteId, shiftType, userId, siteId, userId]
     );
     return rows.length > 0;
+}
+
+// Loads everything the transfer document needs (request, worker, sites,
+// requester and — once decided — the reviewer).
+async function loadTransferDocumentRow(requestId) {
+    const [[row]] = await db.query(
+        `SELECT
+            t.request_id, t.status, t.document_path, t.requested_by_user_id, t.admin_notes, t.request_reason,
+            t.current_shift_type, t.target_shift_type, t.reviewed_by_user_id,
+            DATE_FORMAT(t.created_at, '%Y-%m-%d') AS request_date,
+            DATE_FORMAT(t.effective_date, '%Y-%m-%d') AS effective_date,
+            DATE_FORMAT(t.reviewed_at, '%Y-%m-%d %H:%i') AS reviewed_at,
+            w.full_name, w.worker_unique_id, w.job_position, w.nationality, w.phone_number,
+            DATE_FORMAT(w.hire_date, '%Y-%m-%d') AS hire_date,
+            cs.site_name AS current_site_name, c.contract_name,
+            ts.site_name AS target_site_name,
+            u.full_name AS requester_name, u.role AS requester_role,
+            ru.full_name AS reviewer_name
+         FROM worker_transfer_requests t
+         JOIN workers w ON t.worker_id = w.worker_id
+         JOIN sites cs ON t.current_site_id = cs.site_id
+         JOIN sites ts ON t.target_site_id = ts.site_id
+         LEFT JOIN contracts c ON c.contract_id = cs.contract_id
+         JOIN users u ON t.requested_by_user_id = u.user_id
+         LEFT JOIN users ru ON ru.user_id = t.reviewed_by_user_id
+         WHERE t.request_id = ? LIMIT 1`,
+        [requestId]
+    );
+    return row || null;
+}
+
+// (Re)generates the Word document for the request in its CURRENT status
+// (Pending copy, or the electronically stamped Approved/Rejected copy) and
+// stores the path. Returns the relative path.
+async function buildTransferDocument(row) {
+    const documentPath = await generateTransferRequestDocx({
+        requestId: row.request_id,
+        companyName: process.env.COMPANY_NAME || null,
+        companyInfo: process.env.COMPANY_INFO || null,
+        requestDate: row.request_date || businessToday(),
+        effectiveDate: row.effective_date,
+        worker: {
+            full_name: row.full_name,
+            worker_unique_id: row.worker_unique_id,
+            job_position: row.job_position,
+            nationality: row.nationality,
+            phone_number: row.phone_number,
+            hire_date: row.hire_date,
+        },
+        currentSiteName: `${row.current_site_name} (${row.current_shift_type})`,
+        targetSiteName: `${row.target_site_name} (${row.target_shift_type})`,
+        contractName: row.contract_name,
+        requesterName: row.requester_name,
+        requesterPosition: row.requester_role,
+        // C-10: the document prints the requester's reason; the admin note only appears in the stamp.
+        transferReason: row.request_reason || null,
+        review: {
+            status: row.status,
+            reviewerId: row.reviewed_by_user_id,
+            reviewerName: row.reviewer_name,
+            reviewedAt: row.reviewed_at,
+            adminNotes: row.admin_notes,
+            effectiveDate: row.effective_date,
+        },
+    });
+    await db.query(
+        `UPDATE worker_transfer_requests SET document_path = ? WHERE request_id = ?`,
+        [documentPath, row.request_id]
+    );
+    return documentPath;
+}
+
+async function regenerateTransferDocument(requestId) {
+    const row = await loadTransferDocumentRow(requestId);
+    if (!row) return null;
+    return buildTransferDocument(row);
 }
 
 // 1. إنشاء طلب تحويل جديد
@@ -102,44 +178,7 @@ exports.createTransferRequest = async (req, res) => {
 
         let documentPath = null;
         try {
-            const [[workerRow]] = await db.query(
-                `SELECT full_name, worker_unique_id, job_position, nationality, phone_number, hire_date
-                 FROM workers WHERE worker_id = ? LIMIT 1`,
-                [worker_id]
-            );
-            const [[currentSiteRow]] = await db.query(
-                `SELECT s.site_name, c.contract_name
-                 FROM sites s LEFT JOIN contracts c ON c.contract_id = s.contract_id
-                 WHERE s.site_id = ? LIMIT 1`,
-                [current_site_id]
-            );
-            const [[targetSiteRow]] = await db.query(
-                `SELECT site_name FROM sites WHERE site_id = ? LIMIT 1`,
-                [target_site_id]
-            );
-            const [[requesterRow]] = await db.query(
-                `SELECT full_name, role FROM users WHERE user_id = ? LIMIT 1`,
-                [requested_by_user_id]
-            );
-
-            documentPath = await generateTransferRequestDocx({
-                requestId,
-                companyName: process.env.COMPANY_NAME || null,
-                companyInfo: process.env.COMPANY_INFO || null,
-                requestDate: new Date().toISOString().slice(0, 10),
-                worker: workerRow || {},
-                currentSiteName: currentSiteRow?.site_name ? `${currentSiteRow.site_name} (${current_shift_type})` : null,
-                targetSiteName: targetSiteRow?.site_name ? `${targetSiteRow.site_name} (${target_shift_type})` : null,
-                contractName: currentSiteRow?.contract_name,
-                requesterName: requesterRow?.full_name,
-                requesterPosition: requesterRow?.role,
-                transferReason: requestReason,
-            });
-
-            await db.query(
-                `UPDATE worker_transfer_requests SET document_path = ? WHERE request_id = ?`,
-                [documentPath, requestId]
-            );
+            documentPath = await regenerateTransferDocument(requestId);
         } catch (docError) {
             console.error('TRANSFER DOCX GENERATION ERROR:', docError);
         }
@@ -370,9 +409,20 @@ exports.reviewTransferRequest = async (req, res) => {
         );
 
         await connection.commit();
+
+        // Issue the electronically stamped copy (Approved / Rejected). Best effort:
+        // the decision is already committed; the download endpoint re-stamps if this fails.
+        let documentAvailable = false;
+        try {
+            documentAvailable = Boolean(await regenerateTransferDocument(id));
+        } catch (docError) {
+            console.error('TRANSFER STAMPED DOCX ERROR:', docError);
+        }
+
         res.status(200).json({
             status: 'success',
-            message: status === 'Approved' ? 'Request approved and worker transferred successfully.' : 'Transfer request rejected.'
+            message: status === 'Approved' ? 'Request approved and worker transferred successfully.' : 'Transfer request rejected.',
+            document_available: documentAvailable,
         });
     } catch (error) {
         await connection.rollback();
@@ -387,68 +437,28 @@ exports.reviewTransferRequest = async (req, res) => {
     }
 };
 
-// 4. تحميل مستند التحويل — بدون تغيير جوهري (فقط أسماء الحقول بالتوليد أعلاه)
+// 4. تحميل مستند التحويل — always the copy that matches the current status
+// (Pending, or the electronically stamped Approved/Rejected copy). The file is
+// regenerated when missing (e.g. uploads wiped on redeploy) or stale.
 exports.downloadTransferDocument = async (req, res) => {
     const { id } = req.params;
     try {
-        const [[row]] = await db.query(
-            `SELECT 
-                t.document_path, t.requested_by_user_id, t.created_at, t.admin_notes, t.request_reason,
-                t.current_shift_type, t.target_shift_type,
-                w.full_name, w.worker_unique_id, w.job_position, w.nationality, w.phone_number, w.hire_date,
-                cs.site_name AS current_site_name, c.contract_name,
-                ts.site_name AS target_site_name,
-                u.full_name AS requester_name, u.role AS requester_role
-             FROM worker_transfer_requests t
-             JOIN workers w ON t.worker_id = w.worker_id
-             JOIN sites cs ON t.current_site_id = cs.site_id
-             JOIN sites ts ON t.target_site_id = ts.site_id
-             LEFT JOIN contracts c ON c.contract_id = cs.contract_id
-             JOIN users u ON t.requested_by_user_id = u.user_id
-             WHERE t.request_id = ? LIMIT 1`,
-            [id]
-        );
-
+        const row = await loadTransferDocumentRow(id);
         if (!row) {
             return res.status(404).json({ status: 'error', message: 'Transfer request not found.' });
         }
 
-        const isOwner = req.user.role === 'Supervisor' && req.user.user_id === row.requested_by_user_id;
+        const isOwner = req.user.role === 'Supervisor' && Number(req.user.user_id) === Number(row.requested_by_user_id);
         if (req.user.role !== 'Admin' && !isOwner) {
             return res.status(403).json({ status: 'error', message: 'You are not authorized to download this document.' });
         }
 
         let absolutePath = row.document_path ? path.join(__dirname, '..', row.document_path) : null;
+        const stale = !isDocumentCurrent(row.document_path, row.status);
 
-        if (!absolutePath || !fs.existsSync(absolutePath)) {
+        if (!absolutePath || stale || !fs.existsSync(absolutePath)) {
             try {
-                const generatedPath = await generateTransferRequestDocx({
-                    requestId: id,
-                    companyName: process.env.COMPANY_NAME || null,
-                    companyInfo: process.env.COMPANY_INFO || null,
-                    requestDate: row.created_at ? String(row.created_at).slice(0, 10) : new Date().toISOString().slice(0, 10),
-                    worker: {
-                        full_name: row.full_name,
-                        worker_unique_id: row.worker_unique_id,
-                        job_position: row.job_position,
-                        nationality: row.nationality,
-                        phone_number: row.phone_number,
-                        hire_date: row.hire_date,
-                    },
-                    currentSiteName: `${row.current_site_name} (${row.current_shift_type})`,
-                    targetSiteName: `${row.target_site_name} (${row.target_shift_type})`,
-                    contractName: row.contract_name,
-                    requesterName: row.requester_name,
-                    requesterPosition: row.requester_role,
-                    // C-10: the document prints the requester's reason, never the admin note.
-                    transferReason: row.request_reason || null,
-                });
-
-                await db.query(
-                    `UPDATE worker_transfer_requests SET document_path = ? WHERE request_id = ?`,
-                    [generatedPath, id]
-                );
-
+                const generatedPath = await buildTransferDocument(row);
                 absolutePath = path.join(__dirname, '..', generatedPath);
             } catch (genError) {
                 console.error('ON-THE-FLY DOCX GENERATION ERROR:', genError);
@@ -456,9 +466,43 @@ exports.downloadTransferDocument = async (req, res) => {
             }
         }
 
-        return res.download(absolutePath);
+        return res.download(absolutePath, path.basename(absolutePath));
     } catch (error) {
         console.error('DOWNLOAD TRANSFER DOCUMENT ERROR:', error);
         res.status(500).json({ status: 'error', message: 'An error occurred while downloading the document.' });
+    }
+};
+
+// 5. The supervisor's own transfer requests (all statuses) — the requests and
+// their Word documents stay available to the supervisor after submitting,
+// and show the Admin decision once reviewed.
+// GET /api/transfers/mine?status=
+exports.getMyTransfers = async (req, res) => {
+    try {
+        const where = ['t.requested_by_user_id = ?'];
+        const params = [req.user.user_id];
+        if (['Pending', 'Approved', 'Rejected'].includes(req.query.status)) { where.push('t.status = ?'); params.push(req.query.status); }
+        const [rows] = await db.query(
+            `SELECT t.request_id, t.transfer_type, t.status, t.request_reason, t.admin_notes,
+                    t.created_at, t.reviewed_at,
+                    DATE_FORMAT(t.effective_date, '%Y-%m-%d') AS effective_date,
+                    t.current_shift_type, t.target_shift_type,
+                    w.worker_id, w.full_name AS worker_name, w.worker_unique_id,
+                    cs.site_name AS current_site_name, ts.site_name AS target_site_name,
+                    ru.full_name AS reviewed_by_name
+             FROM worker_transfer_requests t
+             JOIN workers w ON t.worker_id = w.worker_id
+             JOIN sites cs ON t.current_site_id = cs.site_id
+             JOIN sites ts ON t.target_site_id = ts.site_id
+             LEFT JOIN users ru ON ru.user_id = t.reviewed_by_user_id
+             WHERE ${where.join(' AND ')}
+             ORDER BY (t.status = 'Pending') DESC, t.created_at DESC
+             LIMIT 300`,
+            params
+        );
+        res.status(200).json({ status: 'success', data: rows });
+    } catch (error) {
+        console.error('MY TRANSFERS ERROR:', error);
+        res.status(500).json({ status: 'error', message: 'An error occurred while fetching your transfer requests.' });
     }
 };

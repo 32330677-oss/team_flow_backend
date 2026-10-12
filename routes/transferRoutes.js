@@ -7,6 +7,7 @@ const restrictTo = require('../middleware/roleMiddleware');
 router.use(authMiddleware);
 
 router.post('/', restrictTo('Supervisor'), transferController.createTransferRequest);
+router.get('/mine', restrictTo('Supervisor'), transferController.getMyTransfers);
 router.get('/pending', restrictTo('Admin'), transferController.getPendingTransfers);
 router.get('/', restrictTo('Admin'), transferController.listTransfers);
 router.put('/:id/review', restrictTo('Admin'), transferController.reviewTransferRequest);
