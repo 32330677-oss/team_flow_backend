@@ -209,6 +209,9 @@ exports.getSiteWorkers = async (req, res) => {
                    a.anomaly_detail,
                    a.admin_rejection_notes,
                    a.remarks AS attendance_remarks,
+                   -- Corrected by the Admin (flag only; the reason is not shown to the Supervisor).
+                   EXISTS (SELECT 1 FROM attendance_corrections_log c
+                           WHERE c.record_table = 'attendance' AND c.record_id = a.attendance_id) AS admin_corrected,
                    (SELECT leave_id
                     FROM attendanceleaveperiods alp
                     WHERE alp.attendance_id = a.attendance_id

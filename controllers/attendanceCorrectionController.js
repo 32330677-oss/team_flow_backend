@@ -14,8 +14,10 @@
 //     payroll_effect = 'AdjustmentRequired', adjustment_status = 'Open'.
 //     No adjustment amount is calculated (no business rule exists for it);
 //     the open item is listed for the payroll team, who resolve it with a note.
-//   * The workflow status is not changed (an Approved record stays Approved:
-//     the Admin is the approver).
+//   * An Approved / Submitted record keeps its workflow status (the Admin is
+//     the approver). A Draft / Rejected worker record becomes Submitted, so the
+//     Supervisor cannot overwrite the correction; the Supervisor list shows it
+//     with an admin_corrected flag (no reason).
 
 const db = require('../config/db');
 const attendanceService = require('../services/attendanceService');
@@ -232,6 +234,17 @@ exports.correctWorkerAttendance = async (req, res) => {
       await connection.execute('DELETE FROM attendanceleaveperiods WHERE attendance_id = ?', [attendanceId]);
     }
 
+    // A Draft / Rejected record corrected by the Admin becomes Submitted: it is
+    // read-only for the Supervisor from now on (every Supervisor edit needs
+    // Draft, resubmit needs Rejected), and it waits in the Admin review list.
+    // Approved / Submitted records keep their workflow status.
+    let workflowMoved = null;
+    if (original.status === 'Draft' || original.status === 'Rejected') {
+      await connection.execute(
+        "UPDATE attendance SET status = 'Submitted', admin_rejection_notes = NULL WHERE attendance_id = ?", [attendanceId]);
+      workflowMoved = { from: original.status, to: 'Submitted' };
+    }
+
     if (status === 'Present') {
       await attendanceService.calculateWorkingHours(attendanceId, connection);
     } else {
@@ -269,6 +282,7 @@ exports.correctWorkerAttendance = async (req, res) => {
         JSON.stringify({ correction_id: log.insertId, reason, attendance_status: status, check_in_time: checkIn,
           check_out_time: checkOut, management_leave_hours: mgmt, locked_batch_id: locked ? locked.payroll_batch_id : null,
           removed_breaks: removedBreaks.length ? removedBreaks : undefined,
+          workflow_moved: workflowMoved || undefined,
           lunch: lunch ? { action: lunch.action, start: lunch.start || null, end: lunch.end || null, from_site: Boolean(lunch.fromSite) } : null })]
     );
     // Payroll follow-up (retro pay): Paid -> adjustment for the next batch;
@@ -287,9 +301,10 @@ exports.correctWorkerAttendance = async (req, res) => {
 
     return res.status(200).json({
       status: 'success',
-      message: correctionMessage(effect, locked ? locked.payroll_batch_id : null, locked ? locked.status : null, log.insertId, payrollAdjustment),
+      message: correctionMessage(effect, locked ? locked.payroll_batch_id : null, locked ? locked.status : null, log.insertId, payrollAdjustment) +
+        (workflowMoved ? ` The record was ${workflowMoved.from} and is now Submitted (read-only for the supervisor): approve it from the review list.` : ''),
       data: { correction_id: log.insertId, payroll_effect: effect, locked_batch_id: locked ? locked.payroll_batch_id : null, record: corrected,
-        payroll_adjustment: payrollAdjustment, payroll_hint: payrollHint },
+        payroll_adjustment: payrollAdjustment, payroll_hint: payrollHint, workflow_moved: workflowMoved },
     });
   } catch (error) {
     try { await connection.rollback(); } catch (_) {}
