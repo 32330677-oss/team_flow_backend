@@ -176,10 +176,17 @@ async function start() {
             process.exit(1);
         }, 10000).unref();
         server.close(async () => {
-            try { await db.end(); } catch (_) { /* pool already closed */ }
+            // Never wait more than 3s for the DB pool to close.
+            await Promise.race([
+                db.end().catch(() => {}),
+                new Promise((resolve) => setTimeout(resolve, 3000)),
+            ]);
             console.log('Server closed.');
             process.exit(0);
         });
+        // Browsers / the app keep idle keep-alive connections open, which would
+        // make server.close() wait. Close the idle ones now; busy ones finish first.
+        if (typeof server.closeIdleConnections === 'function') server.closeIdleConnections();
     };
     process.on('SIGTERM', () => shutdown('SIGTERM'));
     process.on('SIGINT', () => shutdown('SIGINT'));
