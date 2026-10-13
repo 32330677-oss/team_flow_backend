@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 const contractRoutes = require('./routes/contractRoutes');
 const siteRoutes = require('./routes/siteRoutes');
 const workerRoutes = require('./routes/workerRoutes');
@@ -32,7 +33,27 @@ const projectRoutes = require('./routes/projectRoutes');
 const app = express();
 
 // Middlewares
-app.use(cors());
+// Security headers. The API serves JSON, Excel and PDF only, so the defaults
+// are safe. Exception: the public QR documents are opened straight in a phone
+// browser's PDF viewer, so they skip the Content-Security-Policy header.
+const helmetDefault = helmet();
+const helmetPublicDocs = helmet({ contentSecurityPolicy: false });
+app.use((req, res, next) =>
+    (req.path.startsWith('/api/public/documents/') ? helmetPublicDocs : helmetDefault)(req, res, next));
+
+// CORS: CORS_ORIGIN is a comma-separated list of allowed web origins
+// (e.g. https://app.example.com). Mobile/desktop apps send no Origin and are
+// always allowed. When CORS_ORIGIN is empty every origin is allowed (old behaviour).
+const allowedOrigins = (process.env.CORS_ORIGIN || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+app.use(cors({
+    origin: (origin, cb) => {
+        if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) return cb(null, true);
+        return cb(null, false); // no CORS headers -> the browser blocks it
+    },
+}));
 app.use(express.json({ limit: '2mb' }));
 app.set('trust proxy', 1); // أو true
 // ربط المسارات بالسيرفر
@@ -67,8 +88,39 @@ app.use('/api/public/documents', require('./routes/publicDocumentRoutes'));
 app.use('/api/reports/daily-site', require('./routes/dailySiteReportRoutes'));
 // In-app Help Center (always on) and AI assistant (needs ANTHROPIC_API_KEY).
 app.use('/api/assistant', require('./routes/assistantRoutes'));
+// Liveness: is the process up? Kept DB-free on purpose so a slow database
+// never makes the host restart the service.
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });
+});
+
+// Readiness / monitoring: is the database reachable?
+app.get('/health/db', async (req, res) => {
+  try {
+    await require('./config/db').query('SELECT 1');
+    res.status(200).json({ status: 'ok', db: 'up' });
+  } catch (error) {
+    console.error('Health check: database unreachable:', error.message);
+    res.status(503).json({ status: 'error', db: 'down' });
+  }
+});
+
+// Unknown routes.
+app.use((req, res) => {
+  res.status(404).json({ status: 'error', message: 'Route not found.' });
+});
+
+// Last-resort error handler: anything not caught by a route ends here.
+// Details go to the log; the client only gets a generic message for 5xx.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  console.error(`[${req.method} ${req.originalUrl}]`, err);
+  if (res.headersSent) return next(err);
+  const status = Number(err.statusCode || err.status) || 500;
+  res.status(status).json({
+    status: 'error',
+    message: status >= 500 ? 'Internal server error.' : err.message,
+  });
 });
 
 const PORT = process.env.PORT || 5000;
@@ -108,9 +160,30 @@ async function start() {
         .catch((e) => console.error('Recycle bin purge failed:', e.message));
     runPurge();
     setInterval(runPurge, 6 * 60 * 60 * 1000).unref();
-    return app.listen(PORT, '0.0.0.0', () => {
+    const server = app.listen(PORT, '0.0.0.0', () => {
         console.log(`Server is running on port ${PORT}`);
     });
+
+    // Graceful shutdown (Render sends SIGTERM on every redeploy): stop taking
+    // new requests, let running ones finish, then close the DB pool.
+    let shuttingDown = false;
+    const shutdown = (signal) => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        console.log(`${signal} received: shutting down gracefully...`);
+        setTimeout(() => {
+            console.error('Shutdown timed out after 10s, forcing exit.');
+            process.exit(1);
+        }, 10000).unref();
+        server.close(async () => {
+            try { await db.end(); } catch (_) { /* pool already closed */ }
+            console.log('Server closed.');
+            process.exit(0);
+        });
+    };
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    return server;
 }
 
 if (require.main === module) {
