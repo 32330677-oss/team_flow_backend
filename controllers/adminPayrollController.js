@@ -1364,7 +1364,7 @@ async function exportPayrollExcel(req, res) {
     //                H Regular Hrs | I OT Hrs | J Signature
     summarySheet.columns = [
       { header: '', key: 'logo_gap', width: 4 },
-      { header: '', key: 'logo_gap2', width: 10 },
+      { header: '', key: 'logo_gap2', width: 20 },  // A+B wide enough for the 150px logo
       { header: 'No.', key: 'number', width: 6 },
       { header: 'Worker ID', key: 'worker_id', width: 16 },
       { header: 'Worker Name', key: 'worker_name', width: 28 },
@@ -1440,6 +1440,14 @@ async function exportPayrollExcel(req, res) {
       for (let r = 6; r <= summarySheet.rowCount; r += 1) {
       summarySheet.getCell(r, 7).numFmt = moneyFmt;   // Net Salary (G)
       summarySheet.getCell(r, 8).numFmt = '0.00';          // Total Hours (H)
+      // Rows are tall (room to sign): centre every value vertically, otherwise
+      // Excel puts it at the bottom and the row looks empty.
+      for (const col of [3, 4]) {
+        summarySheet.getCell(r, col).alignment = { vertical: 'middle', horizontal: 'center' };
+      }
+      summarySheet.getCell(r, 5).alignment = { vertical: 'middle', horizontal: 'left' };
+      summarySheet.getCell(r, 6).alignment = { vertical: 'middle', horizontal: 'left', wrapText: true };
+      summarySheet.getCell(r, 7).alignment = { vertical: 'middle', horizontal: 'right' };
       for (const col of [8, 9]) {
         summarySheet.getCell(r, col).alignment = { vertical: 'middle', horizontal: 'center' };
       }
@@ -1547,6 +1555,10 @@ async function exportPayrollExcel(req, res) {
       sheet.getRow(2).height = 25;
       sheet.getRow(3).height = 25;
       sheet.getRow(4).height = 22;
+      // The logo sits at the top-left: centre the title lines so it never covers them.
+      for (const ref of ['A1', 'A2', 'A3', 'A4']) {
+        sheet.getCell(ref).alignment = { vertical: 'middle', horizontal: 'center' };
+      }
       sheet.getRow(5).values = sheet.columns.map((c) => c.header);
 
       let siteTotalBase = 0, siteTotalOT = 0, siteTotalAll = 0;
@@ -2510,6 +2522,9 @@ sheet.columns = [
     sheet.getCell('A2').value = 'Attendance and hours only — no salary or rate calculation';
     sheet.getRow(1).height = 48;
     sheet.getRow(2).height = 24;
+    // The logo sits at the top-left: centre the titles so it never covers them.
+    sheet.getCell('A1').alignment = { vertical: 'middle', horizontal: 'center' };
+    sheet.getCell('A2').alignment = { vertical: 'middle', horizontal: 'center' };
     sheet.getRow(4).values = sheet.columns.map((column) => column.header);
 
 rows.forEach((row, index) => {
