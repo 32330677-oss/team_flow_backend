@@ -64,6 +64,22 @@ Integration tests need a local MySQL. They create a throw-away database
 (`TEST_DB_NAME`, default `team_flow_test`) through `TEST_MYSQL_CLI`
 (default `mysql -uroot`) and load `tests/schema/` plus the migrations.
 
+## Database certificate (Aiven)
+
+With `DB_SSL=true` the connection is always encrypted. To also verify that the
+server really is your Aiven database, download `ca.pem` from the Aiven console
+(service → Overview → CA certificate) and either:
+
+- Render: add it as a **Secret File** named `ca.pem` and set `DB_CA_CERT_PATH=/etc/secrets/ca.pem`, or
+- locally: set `DB_CA_CERT_PATH` to where you saved the file.
+
+The startup log says which mode is active (`server certificate verified` or `NOT verified`).
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs `npm test` on every push and pull request
+against a temporary MySQL 8.0 in GitHub Actions. It never touches production.
+
 ## Health checks
 
 | Path | Meaning |

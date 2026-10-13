@@ -1,8 +1,35 @@
+const fs = require('fs');
 const mysql = require('mysql2');
 require('dotenv').config();
 
 const dbPort = Number(process.env.DB_PORT || 3306);
 const useSsl = String(process.env.DB_SSL).toLowerCase() === 'true';
+
+// Aiven CA certificate (ca.pem). When it is set, the server certificate is
+// verified, so the app only ever talks to the real database. Two ways:
+//   DB_CA_CERT_PATH  path to the file (Render "Secret File": /etc/secrets/ca.pem)
+//   DB_CA_CERT       the PEM text itself
+// Neither set: encrypted but not verified (the previous behaviour).
+function loadCaCert() {
+  const caPath = (process.env.DB_CA_CERT_PATH || '').trim();
+  if (caPath) {
+    try {
+      return fs.readFileSync(caPath, 'utf8');
+    } catch (error) {
+      // Fail loudly: a wrong path must not silently turn verification off.
+      throw new Error(`DB_CA_CERT_PATH is set but the file cannot be read (${caPath}): ${error.message}`);
+    }
+  }
+  const inline = (process.env.DB_CA_CERT || '').trim();
+  return inline ? inline.replace(/\\n/g, '\n') : null;
+}
+
+const caCert = useSsl ? loadCaCert() : null;
+if (useSsl) {
+  console.log(caCert
+    ? 'DB SSL: encrypted, server certificate verified (CA).'
+    : 'DB SSL: encrypted, server certificate NOT verified (set DB_CA_CERT_PATH to verify).');
+}
 
 const pool = mysql.createPool({
   host: process.env.DB_HOST,
@@ -16,11 +43,10 @@ const pool = mysql.createPool({
   connectionLimit: 10,
   queueLimit: 0,
   ssl: useSsl
-    ? {
-        // Aiven requires an encrypted SSL connection.
-        // Certificate verification can be hardened later with Aiven's CA file.
-        rejectUnauthorized: false,
-      }
+    ? (caCert
+        ? { ca: caCert, rejectUnauthorized: true }
+        // Aiven requires SSL; without the CA the certificate is not verified.
+        : { rejectUnauthorized: false })
     : undefined,
 });
 
