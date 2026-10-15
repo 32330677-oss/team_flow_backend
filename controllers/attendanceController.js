@@ -1821,7 +1821,15 @@ exports.submitDay = async (req, res) => {
 //
 // Allowed as soon as the worker has CHECKED OUT (Present, Draft, check-in and
 // check-out recorded, no break still open), whether a lunch was recorded for
-// him or not. Everything else follows submitDay exactly:
+// him or not.
+//
+// "Check out & submit": a worker who is still checked in can be checked out
+// and submitted in the SAME transaction by sending check_out_time. Only on this
+// path the check-out may be in the future (e.g. it is 14:00 and he leaves at
+// 18:00): the record is submitted at once, so it never stays an open Draft
+// with a future time. Limits: after check-in, at most 24 h after check-in and
+// at most the day after the record date (night shift). The normal check-out
+// (POST /attendance/checkout) still refuses future times. Everything else follows submitDay exactly:
 //   * the same scope, future-date, payroll-lock, daily and weekly gates;
 //   * no lunch recorded -> the same "did he work through lunch?" question
 //     (reply: requires_confirmation + missing_workers, then call again with
@@ -1839,6 +1847,11 @@ exports.submitWorker = async (req, res) => {
     const raw = req.body?.lunch_decision;
     if (raw && typeof raw === 'object') {
         decision = { worked_through_lunch: raw.worked_through_lunch === true, reason: String(raw.reason || '').trim() };
+    }
+    let newCheckOut = null;
+    if (req.body?.check_out_time !== undefined && req.body?.check_out_time !== null && req.body?.check_out_time !== '') {
+        newCheckOut = formatToMySqlDateTime(req.body.check_out_time);
+        if (!newCheckOut) return res.status(400).json({ status: 'error', message: 'Invalid check-out time format.' });
     }
 
     const connection = await db.getConnection();
@@ -1868,7 +1881,13 @@ exports.submitWorker = async (req, res) => {
         if (row.status !== 'Draft') {
             throw new AppError(`${row.full_name}'s record is already ${row.status}.`, 409);
         }
-        if (row.attendance_status !== 'Present' || !row.check_in_time || !row.check_out_time) {
+        if (row.attendance_status !== 'Present' || !row.check_in_time) {
+            throw new AppError(`${row.full_name} must be checked out before his record can be submitted alone.`, 400);
+        }
+        if (row.check_out_time && newCheckOut) {
+            throw new AppError(`${row.full_name} is already checked out. Edit the times or submit him as he is.`, 409);
+        }
+        if (!row.check_out_time && !newCheckOut) {
             throw new AppError(`${row.full_name} must be checked out before his record can be submitted alone.`, 400);
         }
         assertNotFutureDate(recordDate);
@@ -1885,6 +1904,39 @@ exports.submitWorker = async (req, res) => {
         );
         if (openLeaves.length > 0) {
             throw new AppError(`${row.full_name} still has an active break that has not ended.`, 400);
+        }
+
+        // "Check out & submit" (future check-out allowed only here, see above).
+        if (newCheckOut) {
+            if (!(await verifyWorkerAssignedToSite(row.worker_id, siteId, shiftType, recordDate, connection))) {
+                throw new AppError('Worker is not active or is not assigned to this site/shift.');
+            }
+            const checkInDate = parseAttendanceDate(row.check_in_time);
+            const checkOutDate = parseAttendanceDate(newCheckOut);
+            if (!checkInDate || !checkOutDate || checkOutDate <= checkInDate) {
+                throw new AppError('Check-out time must be after check-in time.');
+            }
+            if (checkOutDate.getTime() - checkInDate.getTime() > 24 * 60 * 60 * 1000) {
+                throw new AppError('Check-out cannot be more than 24 hours after check-in.');
+            }
+            if (newCheckOut.slice(0, 10) > addDays(recordDate, 1)) {
+                throw new AppError('Check-out must be on the record date or the next day (night shift).');
+            }
+            const [out] = await connection.execute(
+                `UPDATE attendance SET check_out_time = ?
+                 WHERE attendance_id = ? AND status = 'Draft' AND check_out_time IS NULL`,
+                [newCheckOut, attendanceId]
+            );
+            if (out.affectedRows !== 1) throw new AppError('Attendance was changed by another request.', 409);
+            row.check_out_time = newCheckOut;
+            await connection.execute(
+                `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+                 VALUES ('attendance', ?, 'CHECK_OUT', ?, ?, ?)`,
+                [attendanceId, req.user.user_id,
+                    JSON.stringify({ check_in_time: row.check_in_time, check_out_time: null }),
+                    JSON.stringify({ check_out_time: newCheckOut, shift_type: shiftType, via: 'submit-worker',
+                        future_check_out: newCheckOut > businessNowWall() })]
+            );
         }
 
         // Missing lunch: same predicate as submitDay step 4, for this record only.
@@ -1955,6 +2007,7 @@ exports.submitWorker = async (req, res) => {
              VALUES ('attendance', ?, 'WORKER_SUBMITTED', ?, NULL, ?)`,
             [attendanceId, req.user.user_id, JSON.stringify({
                 site_id: siteId, shift_type: shiftType, record_date: recordDate, worker_id: row.worker_id,
+                ...(newCheckOut ? { check_out_time: newCheckOut } : {}),
             })]
         );
 
