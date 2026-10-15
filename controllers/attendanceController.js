@@ -561,6 +561,20 @@ async function runBulkAttendance(req, res, mode) {
                     failedWorker = { worker_id: workerId, message: 'Worker is already checked out.' };
                     throw new AppError(`Bulk check-out aborted: worker ${workerId} is already checked out. No changes were saved.`);
                 }
+                                const inDate = parseAttendanceDate(attendance.check_in_time);
+                const outDate = parseAttendanceDate(formattedTime);
+                if (!inDate || !outDate || outDate <= inDate) {
+                    failedWorker = { worker_id: workerId, message: 'Check-out time must be after check-in time.' };
+                    throw new AppError(`Bulk check-out aborted: check-out time must be after worker ${workerId}'s check-in. No changes were saved.`);
+                }
+                const [[lateLeave]] = await connection.execute(
+                    `SELECT leave_id FROM attendanceleaveperiods WHERE attendance_id = ? AND leave_end_time > ? LIMIT 1`,
+                    [attendanceId, formattedTime]
+                );
+                if (lateLeave) {
+                    failedWorker = { worker_id: workerId, message: 'Worker has a break that ends after the chosen check-out time.' };
+                    throw new AppError(`Bulk check-out aborted: worker ${workerId} has a break ending after the chosen check-out time. No changes were saved.`);
+                }
                 const [[openLeave]] = await connection.execute(
                     `SELECT leave_id FROM attendanceleaveperiods WHERE attendance_id = ? AND leave_end_time IS NULL LIMIT 1 FOR UPDATE`,
                     [attendanceId]
