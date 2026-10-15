@@ -15,6 +15,8 @@ router.post('/checkin', attendanceController.checkIn);
 router.post('/status', attendanceController.setAttendanceStatus);
 router.post('/checkout', attendanceController.checkOut);
 router.post('/submit', attendanceController.submitDay);
+// Submit one checked-out worker before the rest of the day (same gates/lunch rules).
+router.post('/submit-worker', attendanceController.submitWorker);
 router.post('/leave/start', attendanceController.startLeave);
 router.post('/leave/end', attendanceController.endLeave);
 router.post('/lunch/bulk', attendanceController.saveLunchBulk);

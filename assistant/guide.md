@@ -248,6 +248,18 @@ Sidebar → "Daily Site Report".
 Screen: daily_site_report
 Keywords: daily report, site report, pdf, client report, print, notes, issued by
 
+## [Admin] Project Daily Report (Word file, manpower + equipment)
+Sidebar → "Project Daily Report". One Word file in the client's form (UCC-IMS-CM-3003A) with the staff and tradesmen from Team Flow and the plant from the equipment system.
+1. "Profile": choose the agreement (for example "Agreement 71"). "Edit profile" sets the header, project info, the Team Flow sites and the equipment sites, the row lists and the BOQ. "New profile" adds one.
+2. "Date": the report date.
+3. "Sections": tick what goes in the file (project info, weather, manpower, plant, BOQ, activities, photos page).
+4. "Weather" and "Activities" are optional: what you leave empty stays empty in Word. "Use suggestions" copies the weather and the work typed in the Daily Site Report and by the equipment supervisors.
+5. "Names not on the form": a job title or machine type that is not a row of the form gets its own row; choose the right row and press "Save mapping" so it is placed correctly from now on.
+6. Press "Generate Word file". Photos and BOQ progress (CURR) are filled in Word.
+"Issued reports" lists earlier files; "Download" gives exactly the file that was issued.
+Screen: project_daily_report
+Keywords: project daily report, word, docx, manpower, equipment, plant, machines, agreement, boq, weather, client form
+
 ## [Admin] Biometric: import files
 Sidebar → "Biometric Import".
 - "Select file & Import": choose the device export file and confirm "Import".

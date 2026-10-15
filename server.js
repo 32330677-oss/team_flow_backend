@@ -86,6 +86,7 @@ app.use('/api/staff-advances', require('./routes/staffAdvanceRoutes'));
 // Public (no login): QR download of frozen advance vouchers / receipts.
 app.use('/api/public/documents', require('./routes/publicDocumentRoutes'));
 app.use('/api/reports/daily-site', require('./routes/dailySiteReportRoutes'));
+app.use('/api/reports/project-daily', require('./routes/projectDailyReportRoutes'));
 // In-app Help Center (always on) and AI assistant (needs ANTHROPIC_API_KEY).
 app.use('/api/assistant', require('./routes/assistantRoutes'));
 // Liveness: is the process up? Kept DB-free on purpose so a slow database

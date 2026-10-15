@@ -1486,6 +1486,75 @@ exports.saveLunchBulk = async (req, res) => {
 };
 
 
+// Applies ONE lunch decision of a Present record that has no recorded lunch
+// (worked through lunch -> remark + audit; did not work -> the site lunch period
+// is inserted + audit). Shared by submitDay (whole day) and submitWorker (one
+// worker); the rules are exactly the ones submitDay always used.
+async function applyLunchDecision(connection, req, row, decision, siteLunchStart, siteLunchEnd) {
+    const attendanceId = Number(row.attendance_id);
+    if (!decision) throw new AppError(`Missing lunch decision for worker ${row.full_name}.`);
+
+    if (decision.worked_through_lunch === true) {
+        const reason = decision.reason;
+        if (!reason) throw new AppError(`A reason is required when ${row.full_name} worked through lunch.`);
+        await connection.execute(
+            `UPDATE attendance SET remarks = CONCAT(COALESCE(remarks, ''), CASE WHEN remarks IS NULL OR remarks = '' THEN '' ELSE ' | ' END, ?) WHERE attendance_id = ?`,
+            [`Worked through lunch: ${reason}`, attendanceId]
+        );
+        await connection.execute(
+            `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+             VALUES ('attendance', ?, 'LUNCH_SKIPPED_CONFIRMED', ?, NULL, ?)`,
+            [attendanceId, req.user.user_id, JSON.stringify({ worked_through_lunch: true, reason })]
+        );
+        return;
+    }
+
+    if (!siteLunchStart || !siteLunchEnd) {
+        throw new AppError(`No site lunch period is configured. Record the site's lunch time before submitting the day for worker ${row.full_name}.`);
+    }
+    const checkInDate = parseAttendanceDate(row.check_in_time);
+    const checkOutDate = parseAttendanceDate(row.check_out_time);
+    if (!checkInDate || !checkOutDate) throw new AppError(`Invalid attendance times for worker ${row.full_name}.`);
+
+    const lunchStart = normalizeTimeForShift(siteLunchStart, checkInDate, checkOutDate);
+    const lunchEnd = normalizeTimeForShift(siteLunchEnd, checkInDate, checkOutDate);
+    const lunchStartDate = parseAttendanceDate(lunchStart);
+    const lunchEndDate = parseAttendanceDate(lunchEnd);
+    if (!lunchStart || !lunchEnd || !lunchStartDate || !lunchEndDate) {
+        throw new AppError(`The site lunch period is not valid for worker ${row.full_name}'s shift.`);
+    }
+    if (lunchEndDate <= lunchStartDate) throw new AppError(`Lunch end must be after lunch start for worker ${row.full_name}.`);
+
+    if (lunchStartDate < checkOutDate && lunchEndDate > checkInDate) {
+        if (lunchStartDate < checkInDate || lunchEndDate > checkOutDate) {
+            throw new AppError(`Lunch period is not completely inside worker ${row.full_name}'s shift.`);
+        }
+        const [existingLunch] = await connection.execute(
+            `SELECT leave_id FROM attendanceleaveperiods WHERE attendance_id = ? AND leave_type = 'Lunch' ORDER BY leave_id DESC LIMIT 1`,
+            [attendanceId]
+        );
+        if (existingLunch.length === 0) {
+            const [insertedLunch] = await connection.execute(
+                `INSERT INTO attendanceleaveperiods (attendance_id, leave_start_time, leave_end_time, leave_type) VALUES (?, ?, ?, 'Lunch')`,
+                [attendanceId, lunchStart, lunchEnd]
+            );
+            await connection.execute(
+                `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+                 VALUES ('attendanceleaveperiods', ?, 'LUNCH_AUTO_CREATE_ON_SUBMIT', ?, NULL, ?)`,
+                [insertedLunch.insertId, req.user.user_id, JSON.stringify({
+                    attendance_id: attendanceId, leave_start_time: lunchStart, leave_end_time: lunchEnd,
+                    leave_type: 'Lunch', reason: 'Worker confirmed they did not work during lunch.'
+                })]
+            );
+        }
+    }
+    await connection.execute(
+        `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+         VALUES ('attendance', ?, 'LUNCH_NOT_WORKED_CONFIRMED', ?, NULL, ?)`,
+        [attendanceId, req.user.user_id, JSON.stringify({ worked_through_lunch: false, lunch_start: lunchStart, lunch_end: lunchEnd })]
+    );
+}
+
 exports.submitDay = async (req, res) => {
     const {
         siteId,
@@ -1689,69 +1758,7 @@ exports.submitDay = async (req, res) => {
 
         // 5) Apply lunch decisions (لا تغيير على المنطق الداخلي، فقط استُخدم shiftType بجلب البيانات أعلاه)
         for (const row of missingLunch) {
-            const attendanceId = Number(row.attendance_id);
-            const decision = decisions.get(attendanceId);
-            if (!decision) throw new AppError(`Missing lunch decision for worker ${row.full_name}.`);
-
-            if (decision.worked_through_lunch === true) {
-                const reason = decision.reason;
-                if (!reason) throw new AppError(`A reason is required when ${row.full_name} worked through lunch.`);
-                await connection.execute(
-                    `UPDATE attendance SET remarks = CONCAT(COALESCE(remarks, ''), CASE WHEN remarks IS NULL OR remarks = '' THEN '' ELSE ' | ' END, ?) WHERE attendance_id = ?`,
-                    [`Worked through lunch: ${reason}`, attendanceId]
-                );
-                await connection.execute(
-                    `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
-                     VALUES ('attendance', ?, 'LUNCH_SKIPPED_CONFIRMED', ?, NULL, ?)`,
-                    [attendanceId, req.user.user_id, JSON.stringify({ worked_through_lunch: true, reason })]
-                );
-                continue;
-            }
-
-            if (!siteLunchStart || !siteLunchEnd) {
-                throw new AppError(`No site lunch period is configured. Record the site's lunch time before submitting the day for worker ${row.full_name}.`);
-            }
-            const checkInDate = parseAttendanceDate(row.check_in_time);
-            const checkOutDate = parseAttendanceDate(row.check_out_time);
-            if (!checkInDate || !checkOutDate) throw new AppError(`Invalid attendance times for worker ${row.full_name}.`);
-
-            const lunchStart = normalizeTimeForShift(siteLunchStart, checkInDate, checkOutDate);
-            const lunchEnd = normalizeTimeForShift(siteLunchEnd, checkInDate, checkOutDate);
-            const lunchStartDate = parseAttendanceDate(lunchStart);
-            const lunchEndDate = parseAttendanceDate(lunchEnd);
-            if (!lunchStart || !lunchEnd || !lunchStartDate || !lunchEndDate) {
-                throw new AppError(`The site lunch period is not valid for worker ${row.full_name}'s shift.`);
-            }
-            if (lunchEndDate <= lunchStartDate) throw new AppError(`Lunch end must be after lunch start for worker ${row.full_name}.`);
-
-            if (lunchStartDate < checkOutDate && lunchEndDate > checkInDate) {
-                if (lunchStartDate < checkInDate || lunchEndDate > checkOutDate) {
-                    throw new AppError(`Lunch period is not completely inside worker ${row.full_name}'s shift.`);
-                }
-                const [existingLunch] = await connection.execute(
-                    `SELECT leave_id FROM attendanceleaveperiods WHERE attendance_id = ? AND leave_type = 'Lunch' ORDER BY leave_id DESC LIMIT 1`,
-                    [attendanceId]
-                );
-                if (existingLunch.length === 0) {
-                    const [insertedLunch] = await connection.execute(
-                        `INSERT INTO attendanceleaveperiods (attendance_id, leave_start_time, leave_end_time, leave_type) VALUES (?, ?, ?, 'Lunch')`,
-                        [attendanceId, lunchStart, lunchEnd]
-                    );
-                    await connection.execute(
-                        `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
-                         VALUES ('attendanceleaveperiods', ?, 'LUNCH_AUTO_CREATE_ON_SUBMIT', ?, NULL, ?)`,
-                        [insertedLunch.insertId, req.user.user_id, JSON.stringify({
-                            attendance_id: attendanceId, leave_start_time: lunchStart, leave_end_time: lunchEnd,
-                            leave_type: 'Lunch', reason: 'Worker confirmed they did not work during lunch.'
-                        })]
-                    );
-                }
-            }
-            await connection.execute(
-                `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
-                 VALUES ('attendance', ?, 'LUNCH_NOT_WORKED_CONFIRMED', ?, NULL, ?)`,
-                [attendanceId, req.user.user_id, JSON.stringify({ worked_through_lunch: false, lunch_start: lunchStart, lunch_end: lunchEnd })]
-            );
+            await applyLunchDecision(connection, req, row, decisions.get(Number(row.attendance_id)), siteLunchStart, siteLunchEnd);
         }
 
         // 6) (Former auto-absent step removed: it was unreachable because step 3
@@ -1802,6 +1809,170 @@ exports.submitDay = async (req, res) => {
         }
         console.error('SUBMIT DAY ERROR:', error);
         return sendOpError(res, error, 'An error occurred while submitting the day, please try again.');
+    } finally {
+        connection.release();
+    }
+};
+
+// ------------------------------------------------------------
+// Submit ONE worker's record before the rest of the day (Supervisor/Admin).
+//
+// POST /attendance/submit-worker { attendance_id, lunch_decision? }
+//
+// Allowed as soon as the worker has CHECKED OUT (Present, Draft, check-in and
+// check-out recorded, no break still open), whether a lunch was recorded for
+// him or not. Everything else follows submitDay exactly:
+//   * the same scope, future-date, payroll-lock, daily and weekly gates;
+//   * no lunch recorded -> the same "did he work through lunch?" question
+//     (reply: requires_confirmation + missing_workers, then call again with
+//     lunch_decision = { worked_through_lunch, reason });
+//   * hours are recalculated, then the record becomes Submitted.
+// The other records of the day are not touched; "Submit day" still submits
+// the rest (and still requires every worker to be finished).
+// ------------------------------------------------------------
+exports.submitWorker = async (req, res) => {
+    const attendanceId = Number(req.body?.attendance_id);
+    if (!Number.isInteger(attendanceId) || attendanceId <= 0) {
+        return res.status(400).json({ status: 'error', message: 'A valid attendance_id is required.' });
+    }
+    let decision = null;
+    const raw = req.body?.lunch_decision;
+    if (raw && typeof raw === 'object') {
+        decision = { worked_through_lunch: raw.worked_through_lunch === true, reason: String(raw.reason || '').trim() };
+    }
+
+    const connection = await db.getConnection();
+    let transactionStarted = false;
+    try {
+        await connection.beginTransaction();
+        transactionStarted = true;
+
+        const [rows] = await connection.execute(
+            `SELECT a.attendance_id, a.worker_id, a.site_id, a.shift_type, a.status, a.attendance_status,
+                    a.check_in_time, a.check_out_time, DATE_FORMAT(a.record_date, '%Y-%m-%d') AS record_date,
+                    w.full_name
+             FROM attendance a JOIN workers w ON w.worker_id = a.worker_id
+             WHERE a.attendance_id = ?
+             FOR UPDATE`,
+            [attendanceId]
+        );
+        if (rows.length === 0) throw new AppError('Attendance record not found.', 404);
+        const row = rows[0];
+        const siteId = row.site_id;
+        const shiftType = normalizeShift(row.shift_type);
+        const recordDate = row.record_date;
+
+        if (!(await verifySiteAction(req, siteId, shiftType))) {
+            throw new AppError('You are not authorized to submit this site.', 403);
+        }
+        if (row.status !== 'Draft') {
+            throw new AppError(`${row.full_name}'s record is already ${row.status}.`, 409);
+        }
+        if (row.attendance_status !== 'Present' || !row.check_in_time || !row.check_out_time) {
+            throw new AppError(`${row.full_name} must be checked out before his record can be submitted alone.`, 400);
+        }
+        assertNotFutureDate(recordDate);
+
+        // Same gates as submitDay.
+        await assertWorkerDateEditable(connection, siteId, recordDate, row.worker_id);
+        await dailyGate.assertPreviousDaysDone(connection, req, { siteId, shiftType, recordDate });
+        const gate = await weekGate.previousWeekWorkerDrafts(connection, { siteId, shiftType, recordDate });
+        if (gate.days.length > 0) throw weekGate.gateError(gate);
+
+        const [openLeaves] = await connection.execute(
+            'SELECT leave_id FROM attendanceleaveperiods WHERE attendance_id = ? AND leave_end_time IS NULL LIMIT 1',
+            [attendanceId]
+        );
+        if (openLeaves.length > 0) {
+            throw new AppError(`${row.full_name} still has an active break that has not ended.`, 400);
+        }
+
+        // Missing lunch: same predicate as submitDay step 4, for this record only.
+        const [missingLunch] = await connection.execute(
+            `SELECT a.attendance_id, a.worker_id, a.check_in_time, a.check_out_time, w.full_name
+             FROM attendance a
+             JOIN workers w ON w.worker_id = a.worker_id
+             LEFT JOIN attendanceleaveperiods alp
+               ON alp.attendance_id = a.attendance_id AND alp.leave_type = 'Lunch'
+             LEFT JOIN (
+                 SELECT MIN(alp2.leave_start_time) AS site_lunch_start,
+                        MAX(alp2.leave_end_time) AS site_lunch_end
+                 FROM attendanceleaveperiods alp2
+                 JOIN attendance a2 ON a2.attendance_id = alp2.attendance_id
+                 WHERE a2.site_id = ? AND a2.shift_type = ?
+                   AND alp2.leave_type = 'Lunch' AND alp2.leave_end_time IS NOT NULL
+                   AND (a2.record_date = ? OR (a2.record_date = DATE_SUB(?, INTERVAL 1 DAY)
+                        AND a2.check_out_time IS NOT NULL AND DATE(a2.check_out_time) > a2.record_date))
+             ) site_lunch ON 1 = 1
+             WHERE a.attendance_id = ?
+               AND alp.leave_id IS NULL
+               AND (
+                    site_lunch.site_lunch_start IS NULL
+                    OR (a.check_in_time < site_lunch.site_lunch_end AND a.check_out_time > site_lunch.site_lunch_start)
+               )`,
+            [siteId, shiftType, recordDate, recordDate, attendanceId]
+        );
+
+        if (missingLunch.length > 0) {
+            const [[siteLunch]] = await connection.execute(
+                `SELECT MIN(alp.leave_start_time) AS lunch_start, MAX(alp.leave_end_time) AS lunch_end
+                 FROM attendanceleaveperiods alp
+                 JOIN attendance a ON a.attendance_id = alp.attendance_id
+                 WHERE a.site_id = ? AND a.shift_type = ? AND alp.leave_type = 'Lunch'
+                   AND alp.leave_end_time IS NOT NULL
+                   AND (a.record_date = ? OR (a.record_date = DATE_SUB(?, INTERVAL 1 DAY)
+                        AND a.check_out_time IS NOT NULL AND DATE(a.check_out_time) > a.record_date))`,
+                [siteId, shiftType, recordDate, recordDate]
+            );
+            const siteLunchStart = siteLunch?.lunch_start || null;
+            const siteLunchEnd = siteLunch?.lunch_end || null;
+            if (!decision) {
+                await connection.rollback();
+                transactionStarted = false;
+                return res.status(200).json({
+                    status: 'warning',
+                    requires_confirmation: true,
+                    message: 'This worker has no recorded lunch. Please confirm whether he worked during lunch.',
+                    lunch_period: { start: siteLunchStart, end: siteLunchEnd },
+                    missing_workers: [{ attendance_id: row.attendance_id, worker_id: row.worker_id, full_name: row.full_name }],
+                });
+            }
+            await applyLunchDecision(connection, req, missingLunch[0], decision, siteLunchStart, siteLunchEnd);
+        }
+
+        const calc = await attendanceService.calculateWorkingHours(attendanceId, connection);
+
+        const [submitted] = await connection.execute(
+            `UPDATE attendance SET status = 'Submitted'
+             WHERE attendance_id = ? AND status = 'Draft'
+               AND attendance_status = 'Present' AND check_in_time IS NOT NULL AND check_out_time IS NOT NULL`,
+            [attendanceId]
+        );
+        if (submitted.affectedRows !== 1) throw new AppError('Attendance was changed by another request.', 409);
+
+        await connection.execute(
+            `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+             VALUES ('attendance', ?, 'WORKER_SUBMITTED', ?, NULL, ?)`,
+            [attendanceId, req.user.user_id, JSON.stringify({
+                site_id: siteId, shift_type: shiftType, record_date: recordDate, worker_id: row.worker_id,
+            })]
+        );
+
+        await connection.commit();
+        transactionStarted = false;
+        return res.status(200).json({
+            status: 'success',
+            message: calc && calc.anomaly
+                ? `${row.full_name} submitted for review. Flagged for review: ${calc.anomaly.detail}`
+                : `${row.full_name} submitted for review.`,
+            submitted_records: 1,
+        });
+    } catch (error) {
+        if (transactionStarted) {
+            try { await connection.rollback(); } catch (rollbackError) { console.error('ROLLBACK ERROR:', rollbackError); }
+        }
+        console.error('SUBMIT WORKER ERROR:', error);
+        return sendOpError(res, error, 'An error occurred while submitting the worker, please try again.');
     } finally {
         connection.release();
     }

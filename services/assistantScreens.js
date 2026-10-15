@@ -15,6 +15,7 @@ const SCREENS = [
   { id: 'workers', title: 'Workers', roles: ['Admin'] },
   { id: 'attendance_review', title: 'Attendance Review', roles: ['Admin'] },
   { id: 'daily_site_report', title: 'Daily Site Report', roles: ['Admin'] },
+  { id: 'project_daily_report', title: 'Project Daily Report', roles: ['Admin'] },
   { id: 'payroll', title: 'Payroll', roles: ['Admin'] },
   { id: 'projects', title: 'Projects', roles: ['Admin'] },
   { id: 'worker_distribution', title: 'Worker Distribution', roles: ['Admin'] },
