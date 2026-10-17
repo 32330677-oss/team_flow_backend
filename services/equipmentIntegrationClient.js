@@ -50,4 +50,9 @@ const listTypes = () => call('/integration/equipment-types');
 const dailyPlant = (date, siteIds) => call(
   `/integration/daily-plant?date=${encodeURIComponent(date)}&site_ids=${siteIds.map(Number).join(',')}`);
 
-module.exports = { config, listSites, listTypes, dailyPlant };
+const listVendors = () => call('/integration/vendors');
+/** Machines on site per day, type and vendor (Working / Standby / Breakdown) over a range. */
+const plantDays = (from, to, siteIds) => call(
+  `/integration/plant-days?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&site_ids=${siteIds.map(Number).join(',')}`);
+
+module.exports = { config, listSites, listTypes, dailyPlant, listVendors, plantDays };

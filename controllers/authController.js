@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { sendPasswordResetOtp } = require('../services/emailService');
+const { accessFor } = require('../services/accessControl');
 exports.login = async (req, res) => {
     // 1. Receive identifier (email or username) along with password and device_id
     const loginIdentifier = req.body.email || req.body.username;
@@ -68,6 +69,20 @@ exports.login = async (req, res) => {
             });
         }
 
+        // 4b. Accounts of type 'User' (roles made by the Admin): they need an
+        // active role. Admin / Supervisor / StaffSupervisor are not affected.
+        let access = null;
+        if (user.role === 'User') {
+            access = await accessFor(user);
+            if (!access.role || !access.role.is_active) {
+                return res.status(403).json({
+                    status: "error",
+                    code: "NO_ACTIVE_ROLE",
+                    message: "This account has no active role. Please contact the administrator."
+                });
+            }
+        }
+
         // 5. Generate JWT with a fallback secret to prevent server crash
         const jwtSecret = process.env.JWT_SECRET;
         const token = jwt.sign(
@@ -100,7 +115,9 @@ exports.login = async (req, res) => {
                 full_name: user.full_name,
                 email: user.email,
                 role: user.role,
-                status: user.status
+                status: user.status,
+                // only for accounts of type 'User': the role given by the Admin and its permissions
+                ...(access ? { app_role: { id: access.role.role_id, name: access.role.name }, permissions: access.permissions } : {})
             }
         });
 

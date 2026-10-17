@@ -101,4 +101,24 @@ async function remove(stored) {
     } catch (_) { /* ignore */ }
 }
 
-module.exports = { DRIVER, safeName, newName, save, send, remove };
+/** A stored file as a Buffer (for files printed inside a PDF). null when it does not exist. */
+async function read(stored) {
+    const name = safeName(stored);
+    if (!name) return null;
+    if (DRIVER === 's3') {
+        try {
+            const out = await s3.send(new S3.GetObjectCommand({ Bucket: BUCKET, Key: keyOf(name) }));
+            const parts = [];
+            for await (const chunk of out.Body) parts.push(Buffer.from(chunk));
+            return Buffer.concat(parts);
+        } catch (error) {
+            if (error.name === 'NoSuchKey' || error.$metadata?.httpStatusCode === 404) return null;
+            throw error;
+        }
+    }
+    const absolute = path.join(LOCAL_DIR, name);
+    if (!absolute.startsWith(LOCAL_DIR + path.sep) || !fs.existsSync(absolute)) return null;
+    return fs.readFileSync(absolute);
+}
+
+module.exports = { DRIVER, safeName, newName, save, send, remove, read };

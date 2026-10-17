@@ -92,7 +92,7 @@ Screen: staff_attendance
 Keywords: staff, employees, office, attendance, check in, check out, absent, save draft, submit, backdated, friday, previous day
 
 ## [Admin] Admin sidebar map
-Sidebar items: "Live Operations", "Workers", "Attendance Review", "Daily Site Report", "Payroll", "Projects", "Worker Distribution", "HR Management", "Transfer Requests", "Staff Attendance & Payroll", "Supervisors Management", "Biometric Processing", "Biometric Import", "Device ID Mapping", then "Help & Assistant", "Change Password", "Log Out".
+Sidebar items: "Live Operations", "Workers", "Attendance Review", "Daily Site Report", "Payroll", "Projects", "Worker Distribution", "HR Management", "Transfer Requests", "Staff Attendance & Payroll", "Supervisors Management", "Biometric Processing", "Biometric Import", "Device ID Mapping", "Daily Progress (DPR)", "Roles & Permissions", "User Accounts", then "Help & Assistant", "Change Password", "Log Out".
 On a phone the sidebar opens from the menu button at the top left.
 Screen: live_operations
 Keywords: menu, sidebar, navigation, pages, where, find
@@ -283,3 +283,18 @@ Sidebar → "Device ID Mapping": the "Unmapped Device IDs" table shows device em
 "Existing mappings (End / Void / Impact)" opens the list of mappings: search, "End" (last valid day), "Void" (reason), "Impact" (punches and records that used it, with "Re-queue").
 Screen: device_id_mapping
 Keywords: device id, mapping, map, biometric, unmapped, fingerprint, link employee
+
+## [Admin] Roles and user accounts (accounts of type "User")
+Sidebar → "Roles & Permissions": "New Role", type any name (for example "QC Manager"), tick what the role may do and keep it "Active". A role can be renamed or changed at any time; a role used by accounts cannot be deleted (deactivate it instead).
+Sidebar → "User Accounts": "New Account" (full name, username, optional email, password of at least 8 characters, role). The row buttons edit the account, reset its password, or deactivate/activate it. The clock button at the top shows the activity log of every change.
+An account of type "User" only sees the pages its role allows. A deactivated account, or an account whose role is inactive, cannot sign in. Admin, Supervisor and Staff Supervisor accounts are not managed here and are not affected.
+Screen: roles_permissions
+Screen: user_accounts
+Keywords: role, roles, permission, permissions, user account, new user, qc manager, access, deactivate account
+
+## [Admin] Daily Progress Report (DPR) – read only
+Sidebar → "Daily Progress (DPR)": the daily progress reports of each contract (one tab per contract, e.g. 71, 26, 59), made by the accounts whose role has the DPR permissions (e.g. QC Manager). The Admin can read everything but not change it.
+Tabs: "Dashboard" (time vs physical progress, manpower, NCRs, safety, BOQ earned value), "Daily report" (the report of a date with its PDF preview), "Allocation" (crew and plant per activity), "NCR & concerns", "Issued reports" (frozen PDF / Excel of each issued report and its revisions) and "Manual vs system" (every figure typed over a value of Team Flow or the equipment system, with the system value, the reason, who and when).
+Manpower comes from the attendance of the contract's Team Flow sites (Present with a check-in, not Rejected); plant from the equipment system (Working, Standby, Breakdown). The DPR never changes the data of either system.
+Screen: dpr_admin
+Keywords: dpr, daily progress report, qc, contract 71, contract 26, contract 59, manual values, differences, issued reports, boq progress

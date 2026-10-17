@@ -87,6 +87,10 @@ app.use('/api/staff-advances', require('./routes/staffAdvanceRoutes'));
 app.use('/api/public/documents', require('./routes/publicDocumentRoutes'));
 app.use('/api/reports/daily-site', require('./routes/dailySiteReportRoutes'));
 app.use('/api/reports/project-daily', require('./routes/projectDailyReportRoutes'));
+// Roles & accounts of type 'User' (Admin), and /api/access/me for any signed-in account.
+app.use('/api/access', require('./routes/accessRoutes'));
+// Daily Progress Report (accounts with the dpr.* permissions; Admin read only).
+app.use('/api/dpr', require('./routes/dprRoutes'));
 // In-app Help Center (always on) and AI assistant (needs ANTHROPIC_API_KEY).
 app.use('/api/assistant', require('./routes/assistantRoutes'));
 // Liveness: is the process up? Kept DB-free on purpose so a slow database

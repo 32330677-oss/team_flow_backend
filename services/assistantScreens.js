@@ -16,6 +16,7 @@ const SCREENS = [
   { id: 'attendance_review', title: 'Attendance Review', roles: ['Admin'] },
   { id: 'daily_site_report', title: 'Daily Site Report', roles: ['Admin'] },
   { id: 'project_daily_report', title: 'Project Daily Report', roles: ['Admin'] },
+  { id: 'dpr_admin', title: 'Daily Progress (DPR)', roles: ['Admin'] },
   { id: 'payroll', title: 'Payroll', roles: ['Admin'] },
   { id: 'projects', title: 'Projects', roles: ['Admin'] },
   { id: 'worker_distribution', title: 'Worker Distribution', roles: ['Admin'] },
@@ -26,6 +27,8 @@ const SCREENS = [
   { id: 'biometric_processing', title: 'Biometric Processing', roles: ['Admin'] },
   { id: 'biometric_import', title: 'Biometric Import', roles: ['Admin'] },
   { id: 'device_id_mapping', title: 'Device ID Mapping', roles: ['Admin'] },
+  { id: 'roles_permissions', title: 'Roles & Permissions', roles: ['Admin'] },
+  { id: 'user_accounts', title: 'User Accounts', roles: ['Admin'] },
   // Admin: pages opened from inside other pages
   { id: 'payroll_adjustments', title: 'Payroll Adjustments', roles: ['Admin'] },
   { id: 'recycle_bin', title: 'Recycle Bin', roles: ['Admin'] },
