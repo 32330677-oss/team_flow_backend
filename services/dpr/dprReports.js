@@ -18,6 +18,7 @@ const { renderDprXlsx } = require('./dprXlsx');
 const U = require('./dprUcc');
 const { renderUccPdf } = require('./dprUccPdf');
 const { renderUccXlsx } = require('./dprUccXlsx');
+const O = require('./dprOurs');
 
 const { DprError } = C;
 
@@ -59,10 +60,27 @@ function uccFileName(model, meta, format) {
   return `Daily_Report_${code}_${d}${meta.revision ? `_Rev${meta.revision}` : ''}${meta.issued ? '' : '_DRAFT'}.${format}`;
 }
 
-async function draftFiles(contractId, date, format) {
+/** 'ucc' = the client's form, 'ours' = our design (same data). */
+function designOf(v) {
+  return v === 'ours' || v === 'dpr' ? 'ours' : 'ucc';
+}
+
+/** Our design of a client's-form model (photos read from storage). */
+async function oursFile(model, meta, format) {
+  const sec = model.sections || {};
+  // photos are printed in the photo section and on the area pages
+  const photos = sec.photos === false && sec.areas === false ? new Map() : await photoBuffers(model.photos);
+  const buf = format === 'xlsx' ? await renderDprXlsx(model, meta, photos) : await renderDprPdf(model, meta, photos);
+  const code = String((model.contract && model.contract.code) || 'DPR').replace(/[^A-Za-z0-9_-]+/g, '_');
+  const name = `DPR_${code}_${model.header.report_date}${meta.revision ? `_Rev${meta.revision}` : ''}${meta.issued ? '' : '_DRAFT'}.${format}`;
+  return { buf, name };
+}
+
+async function draftFiles(contractId, date, format, design = 'ucc') {
   if ((await templateOf(contractId)) === 'ucc') {
-    const { model } = await U.buildUcc(contractId, date);
     const meta = { revision: 0, issued: false };
+    if (designOf(design) === 'ours') return oursFile(await O.buildOurs(contractId, date), meta, format);
+    const { model } = await U.buildUcc(contractId, date);
     const imgs = await uccImages(model);
     const buf = format === 'xlsx' ? await renderUccXlsx(model, meta) : await renderUccPdf(model, meta, imgs);
     return { buf, name: uccFileName(model, meta, format) };
@@ -82,6 +100,7 @@ function fileName(model, meta, format) {
 
 function reportOut(r) {
   return {
+    template: r.template === 'dpr' ? 'dpr' : 'ucc',
     report_id: Number(r.report_id), contract_id: Number(r.contract_id), report_date: r.report_date, report_no: r.report_no,
     revision: Number(r.revision), status: r.status, notes: r.notes || '', issued_at: r.issued_at, issued_by: r.issued_by || '',
   };
@@ -96,7 +115,8 @@ async function issue(contractId, date, body, userId, { revise = false } = {}) {
   const notes = C.line(b.notes, 500, { label: 'Notes' });
   if (revise && (!notes || notes.length < 3)) throw new DprError('Write the reason of the revision.');
   const template = await templateOf(contractId);
-  const { model } = template === 'ucc' ? await U.buildUcc(contractId, date) : await M.buildDay(contractId, date);
+  const built = template === 'ucc' ? await U.buildUcc(contractId, date) : await M.buildDay(contractId, date);
+  const { model } = built;
   if (!model.sources_ok.equipment && !C.bool(b.accept_missing_sources)) {
     throw new DprError('The equipment system did not answer: plant figures are missing. Try again later, or confirm to issue without them.', 409,
       { code: 'SOURCES_MISSING', warnings: model.warnings });
@@ -105,6 +125,7 @@ async function issue(contractId, date, body, userId, { revise = false } = {}) {
     throw new DprError('Check the missing fields and warnings before issuing.', 409,
       { code: 'CONFIRM_WARNINGS', missing: model.missing, warnings: model.warnings });
   }
+  const oursModel = template === 'ucc' ? await O.buildOurs(contractId, date, built) : null;
   return C.inTransaction(async (conn) => {
     const [rows] = await conn.query(
       'SELECT report_id, revision, status FROM dpr_reports WHERE contract_id = ? AND report_date = ? ORDER BY revision DESC FOR UPDATE',
@@ -115,6 +136,8 @@ async function issue(contractId, date, body, userId, { revise = false } = {}) {
     const revision = rows.length ? Number(rows[0].revision) + 1 : 0;
     if (current) await conn.query("UPDATE dpr_reports SET status = 'Superseded' WHERE report_id = ?", [current.report_id]);
     const snapshot = { model, frozen_at: new Date().toISOString(), engine: template === 'ucc' ? 'ucc-1' : 'dpr-1' };
+    // both designs are frozen together: the client's form and our design of the same data
+    if (oursModel) snapshot.ours = oursModel;
     const [ins] = await conn.query(
       `INSERT INTO dpr_reports (contract_id, report_date, report_no, revision, status, snapshot, notes, issued_by_user_id, template, fingerprint)
        VALUES (?, ?, ?, ?, 'Issued', ?, ?, ?, ?, ?)`,
@@ -136,7 +159,7 @@ async function listReports(contractId, { from = null, to = null, limit = 400 } =
   if (to) { where.push('r.report_date <= ?'); args.push(to); }
   const [rows] = await pool.query(
     `SELECT r.report_id, r.contract_id, DATE_FORMAT(r.report_date, '%Y-%m-%d') AS report_date, r.report_no, r.revision, r.status, r.notes,
-            DATE_FORMAT(r.issued_at, '%Y-%m-%d %H:%i') AS issued_at, u.full_name AS issued_by
+            DATE_FORMAT(r.issued_at, '%Y-%m-%d %H:%i') AS issued_at, u.full_name AS issued_by, r.template
        FROM dpr_reports r LEFT JOIN users u ON u.user_id = r.issued_by_user_id
       WHERE ${where.join(' AND ')}
       ORDER BY r.report_date DESC, r.revision DESC LIMIT ${Math.min(Math.max(Number(limit) || 400, 1), 2000)}`, args);
@@ -150,14 +173,18 @@ async function getReport(reportId) {
        FROM dpr_reports r LEFT JOIN users u ON u.user_id = r.issued_by_user_id WHERE r.report_id = ?`, [reportId]);
   if (!r) throw new DprError('Report not found.', 404);
   const snap = C.json(r.snapshot) || {};
-  return { report: reportOut(r), model: snap.model };
+  return { report: reportOut(r), model: snap.model, ours: snap.ours || null };
 }
 
-async function reportFile(reportId, format) {
-  const { report, model } = await getReport(reportId);
+async function reportFile(reportId, format, design = 'ucc') {
+  const { report, model, ours } = await getReport(reportId);
   if (!model) throw new DprError('This report has no saved data.', 500);
   const meta = { revision: report.revision, issued: true, issued_at: report.issued_at, issued_by: report.issued_by,
     printed_at: report.issued_at ? `${report.issued_at.replace(' ', 'T')}:00` : undefined };
+  if (model.template === 'ucc' && designOf(design) === 'ours') {
+    if (!ours) throw new DprError('This report was issued before "our design" existed: only the client\'s form was saved.', 409);
+    return { ...(await oursFile(ours, meta, format)), report };
+  }
   if (model.template === 'ucc') {
     const imgs = await uccImages(model);
     const buf = format === 'xlsx' ? await renderUccXlsx(model, meta) : await renderUccPdf(model, meta, imgs);

@@ -533,6 +533,240 @@ function sAlloc(k, m, meta) {
   }
 }
 
+// ------------------------------------------------------------------ "our design" from the client's-form data
+// (services/dpr/dprOurs.js): staff | tradesmen and plant | tools like the client's
+// form, plus cumulative days; no allocation of people to activities.
+function emptyRow(n, text) {
+  return { cells: [text, ...Array(n - 1).fill('')], size: 6.6, colors: [COLORS.muted] };
+}
+
+/** Two tables side by side (or the second under the first when the first runs onto another page). */
+function sPair(k, y, title, left, right) {
+  const estH = 34 + Math.max(left.rows.length + 1, right.rows.length + 1) * 12;
+  if (y + estH > k.bottom && y > k.top + 40) {
+    k.doc.addPage();
+    y = k.top;
+  }
+  if (title) y = k.section(y, title);
+  const leftW = left.cols.reduce((a, c) => a + c.w, 0);
+  const startY = y;
+  const pageBefore = k.doc.bufferedPageRange().count;
+  const yLeft = k.table(y, left.cols, left.header, left.rows, { minH: 10.6 });
+  const spilled = k.doc.bufferedPageRange().count !== pageBefore;
+  const rx = spilled ? k.x0 : k.x0 + leftW + 4;
+  const scale = spilled ? k.W / right.cols.reduce((a, c) => a + c.w, 0) : 1;
+  const rcols = right.cols.map((c) => ({ ...c, w: c.w * scale }));
+  const yr = k.table(spilled ? yLeft + 5 : startY, rcols, right.header, right.rows, { x: rx, minH: 10.6 });
+  return (spilled ? yr : Math.max(yLeft, yr)) + 5;
+}
+
+function sPeopleOurs(k, y, m) {
+  const P = m.people;
+  const half = (k.W - 4) / 2;
+  const mpCols = [{ w: half - 114 }, { w: 36, align: 'center' }, { w: 42, align: 'center' }, { w: 36, align: 'center' }];
+  const mpRows = (t, label) => {
+    const rows = t.rows.map((r) => ({ cells: [r.name, fmtInt(r.total), fmtInt(r.present), fmtInt(r.absent)], boldCols: [2], size: 6.8 }));
+    if (!rows.length) rows.push(emptyRow(4, 'No row.'));
+    rows.push({ cells: [label, fmtInt(t.total.total), fmtInt(t.total.present), fmtInt(t.total.absent)], bold: true, fill: COLORS.total });
+    return rows;
+  };
+  y = sPair(k, y, '2.  MANPOWER  –  STAFF  |  TRADESMEN',
+    { cols: mpCols, header: ['Staff', 'Total', 'Present', 'Absent'], rows: mpRows(P.staff, 'TOTAL STAFF') },
+    { cols: mpCols, header: ['Tradesmen', 'Total', 'Present', 'Absent'], rows: mpRows(P.trades, 'TOTAL TRADESMEN') });
+  const plCols = [{ w: half - 120 }, { w: 42, align: 'center' }, { w: 46, align: 'center' }, { w: 32, align: 'center' }];
+  const plRows = (t, label) => {
+    const rows = t.rows.map((r) => ({ cells: [r.name, fmtInt(r.operative), fmtInt(r.breakdown), fmtInt(r.idle)], boldCols: [1], size: 6.8 }));
+    if (!rows.length) rows.push(emptyRow(4, 'No row.'));
+    rows.push({ cells: [label, fmtInt(t.total.operative), fmtInt(t.total.breakdown), fmtInt(t.total.idle)], bold: true, fill: COLORS.total });
+    return rows;
+  };
+  return sPair(k, y, 'PLANT / EQUIPMENT  |  TOOLS',
+    { cols: plCols, header: ['Plant', 'Operative', 'Breakdown', 'Idle'], rows: plRows(P.plant, 'TOTAL PLANT') },
+    { cols: plCols, header: ['Tools', 'Operative', 'Breakdown', 'Idle'], rows: plRows(P.tools, 'TOTAL TOOLS') });
+}
+
+function sSummaryOurs(k, y, m) {
+  y = k.section(y, 'RESOURCE SUMMARY', 38);
+  const S = m.summary;
+  const items = [
+    ['Total Manpower', fmtInt(S.total_manpower, { dash: false })],
+    ['Present', fmtInt(S.present, { dash: false })],
+    ['Absent', fmtInt(S.absent, { dash: false })],
+    ['Plant on Site', fmtInt(S.plant_on_site, { dash: false })],
+    ['Plant Operative', fmtInt(S.plant_operative, { dash: false })],
+  ];
+  const w = k.W / items.length;
+  items.forEach(([l, v], i) => {
+    k.cell(k.x0 + i * w, y, w, 14, l, { bold: true, size: 7, align: 'center', fill: COLORS.head });
+    k.cell(k.x0 + i * w, y + 14, w, 22, v, { bold: true, size: 12, align: 'center', color: COLORS.navy });
+  });
+  return y + 41;
+}
+
+function sBoqOurs(k, y, m) {
+  y = k.section(y, 'OVERALL PROGRESS – BOQ');
+  const cols = [{ w: 40, align: 'center' }, { w: k.W - 362 }, { w: 30, align: 'center' }, { w: 56, align: 'right' }, { w: 50, align: 'right' }, { w: 60, align: 'right' }, { w: 46, align: 'right' }, { w: 80, align: 'right' }];
+  const rows = [];
+  for (const g of m.boq.groups) {
+    if (g.name) rows.push({ span: 8, cells: [g.name, '', '', '', '', '', '', ''], bold: true, fill: COLORS.head });
+    for (const r of g.rows) {
+      if (r.row_type === 'section') rows.push({ span: 2, cells: [r.description, '', r.unit, fmtDec(r.qty), '', '', '', ''], bold: true, fill: COLORS.label, size: 6.8 });
+      else if (r.row_type === 'text') rows.push({ span: 8, cells: [r.description, '', '', '', '', '', '', ''], size: 6.4, colors: [COLORS.muted] });
+      else {
+        rows.push({ cells: [r.item_no, r.description, r.unit, fmtDec(r.qty), fmtDec(r.curr, { dash: true }), fmtDec(r.cum, { dash: true }), fmtPct(r.pct), fmtDec(r.balance)], boldCols: [0, 5], size: 6.6 });
+      }
+    }
+  }
+  if (!rows.length) rows.push(emptyRow(8, 'No BOQ item (Setup → BOQ).'));
+  return k.table(y, cols, ['Item', 'Description', 'Unit', 'Contract Qty', 'Today', 'Cum. to Date', '% Complete', 'Balance'], rows) + 5;
+}
+
+function sWorkOurs(k, y, m) {
+  y = k.section(y, '4.  WORK PROGRESS – ACTIVITIES EXECUTED & BOQ QUANTITIES');
+  const Wk = m.work;
+  const cols = [{ w: 34, align: 'center' }, { w: 104 }, { w: 58 }, { w: 26, align: 'center' }, { w: 42, align: 'right' }, { w: 38, align: 'right' },
+    { w: 42, align: 'right' }, { w: 42, align: 'right' }, { w: 36, align: 'right' }, { w: 42, align: 'right' }, { w: 40, align: 'right' }, { w: k.W - 504, align: 'right' }];
+  const rows = Wk.rows.map((a) => ({
+    cells: [a.item_no, a.description, a.location, a.unit, fmtDec(a.contract_qty, { min: 1 }), fmtDec(a.today, { min: 1 }), fmtDec(a.prev_cum, { min: 1 }),
+      fmtDec(a.cum, { min: 1 }), fmtPct(a.pct), fmtDec(a.balance, { min: 1 }), fmtDec(a.man_hours), fmtRatio(a.output_per_mh)],
+    boldCols: [0, 5, 7], size: 6.6,
+  }));
+  if (!rows.length) rows.push({ cells: ['', 'No activity entered for the day.', '', '', '', '', '', '', '', '', '', ''] });
+  y = k.table(y, cols, ['BOQ Item', 'Description', 'Location', 'Unit', 'Contract Qty', 'Today', 'Previous Cum.', 'Cum. to Date', '% Complete', 'Balance', 'Man-hours', 'Output / MH'], rows);
+  y = k.ensure(y, 14);
+  k.cell(k.x0, y, k.W - 140, 12, `Activities logged today: ${Wk.count}`, { bold: true, size: 7, color: COLORS.red, border: false });
+  k.cell(k.x0 + k.W - 140, y, 100, 12, 'Man-hours of the crews', { bold: true, size: 7, align: 'right', fill: COLORS.label });
+  k.cell(k.x0 + k.W - 40, y, 40, 12, fmtDec(Wk.man_hours), { bold: true, size: 7.5, align: 'right' });
+  return y + 17;
+}
+
+function sMaterialsOurs(k, y, m) {
+  y = k.section(y, 'DELIVERED MATERIALS AT SITE');
+  const cols = [{ w: 24, align: 'center' }, { w: 140 }, { w: 32, align: 'center' }, { w: 44, align: 'right' }, { w: 78 }, { w: 58 }, { w: 54 }, { w: 48 }, { w: k.W - 478 }];
+  const rows = (m.materials || []).map((x, i) => ({
+    cells: [String(i + 1), [x.description, x.element].filter(Boolean).join(' – '), x.unit, fmtDec(x.qty), x.supplier, x.delivery_note, x.area, x.boq_ref, x.intended_use], size: 6.6,
+  }));
+  if (!rows.length) rows.push(emptyRow(9, 'No delivery today.'));
+  return k.table(y, cols, ['No.', 'Material / Specification', 'Unit', 'Qty', 'Supplier', 'Delivery Note', 'Area', 'BOQ Ref.', 'Intended Use'], rows) + 5;
+}
+
+function sAreasOurs(k, y, m, photoBuffers) {
+  const photos = new Map((m.photos || []).map((p) => [p.photo_id, p]));
+  for (const a of m.areas || []) {
+    y = k.section(y, `${a.name}  –  DAILY PROGRESS`);
+    const cols = [{ w: 34, align: 'center' }, { w: 120 }, { w: 60 }, { w: 105 }, { w: 36, align: 'right' }, { w: 105 }, { w: 36, align: 'right' }, { w: 26, align: 'center' }, { w: k.W - 522, align: 'right' }];
+    const list = (xs) => xs.map((x) => `${x.name}${blankStr(x.nos) ? '' : ` × ${fmtDec(x.nos)}`}`).join('\n');
+    const hrs = (xs) => {
+      const vals = xs.map((x) => x.hours).filter((v) => !blankStr(v)).map(Number);
+      return vals.length ? fmtDec(String(vals.reduce((t, v) => t + v, 0))) : '';
+    };
+    const rows = a.activities.map((x) => ({ cells: [x.item_no, x.description, x.chainage, list(x.plant), hrs(x.plant), list(x.trades), hrs(x.trades), x.unit, fmtDec(x.output)], size: 6.6 }));
+    if (!rows.length) rows.push(emptyRow(9, 'Photos only.'));
+    y = k.table(y, cols, ['Bill Item', 'Activity', 'Chainage', 'Plant (No.)', 'W-HRS', 'Tradesmen (No.)', 'W-HRS', 'Unit', 'Output'], rows) + 5;
+    // the photos of this area, 2 per row, under its table
+    const own = (a.photos || []).map((id) => photos.get(id)).filter(Boolean);
+    const fw = (k.W - 6) / 2;
+    const fh = 150;
+    for (let i = 0; i < own.length; i += 2) {
+      y = k.ensure(y, fh + 16);
+      for (let j = 0; j < 2 && i + j < own.length; j += 1) {
+        const ph = own[i + j];
+        const x = k.x0 + j * (fw + 6);
+        k.doc.lineWidth(0.6).strokeColor('#8EA9DB').rect(x, y, fw, fh).stroke();
+        const buf = photoBuffers.get(ph.photo_id);
+        if (buf) {
+          try { k.doc.image(buf, x + 3, y + 3, { fit: [fw - 6, fh - 6], align: 'center', valign: 'center' }); } catch (_) { /* unreadable photo: empty frame */ }
+        }
+        k.cell(x, y + fh, fw, 12, ph.caption || ph.location || ph.boq_activity || '', { size: 6.5, fill: COLORS.yellow });
+      }
+      y += fh + 16;
+    }
+  }
+  return y;
+}
+function blankStr(v) { return v === null || v === undefined || v === ''; }
+
+/** WIR register of our design (the same entries as the client's WIR register). */
+function sWirOurs(k, y, m) {
+  y = k.section(y, '5.  WORK INSPECTION REQUEST (WIR) REGISTER');
+  const cols = [{ w: 26, align: 'center' }, { w: 62 }, { w: 150 }, { w: 60 }, { w: 80 }, { w: 50 }, { w: 60, align: 'center' }, { w: k.W - 488 }];
+  const rows = m.qa.entries.map((q, i) => ({ cells: [String(i + 1), q.ref_no, q.description, q.area, q.place, q.ms_ref, q.result, q.remarks], size: 6.8,
+    fills: [null, null, null, null, null, null, q.result === 'Rejected' ? COLORS.amber : null] }));
+  if (!rows.length) rows.push(emptyRow(8, 'No WIR today.'));
+  return k.table(y, cols, ['Sr. No.', 'WIR Ref.', 'Activity / Work Description', 'Bridge No.', 'Location / Chainage', 'MS Ref.', 'Status', 'Comments'], rows) + 5;
+}
+
+/** HSE of our design: the QC's figures and their totals to date (no man-hours, no LTIFR / TRIR). */
+function sHseOurs(k, y, m) {
+  y = k.section(y, '6.  HEALTH, SAFETY & ENVIRONMENT');
+  const H = m.hse;
+  const lw = 125;
+  const vw = (k.W - lw * 3) / 3;
+  const n0 = (v) => fmtInt(v, { dash: false });
+  const rows = [
+    [['Manpower on site today', n0(H.manpower_today)], ['Toolbox talk attendees', n0(H.tbt_attendees)], ['HSE inspections / audits today', n0(H.hse_inspections_today)]],
+    [['Incidents today', n0(H.incidents_today)], ['Near misses today', n0(H.near_misses_today)], ['First aid cases today', n0(H.first_aid_today)]],
+    [['LTI today', n0(H.lti_today)], ['PTWs issued today', n0(H.ptws_today)], ['LTI-free days', n0(H.lti_free_days)]],
+    [['Incidents to date', n0(H.incidents_to_date)], ['Near misses to date', n0(H.near_misses_to_date)], ['LTIs to date', n0(H.ltis_to_date)]],
+  ];
+  y = k.ensure(y, rows.length * 12 + 30);
+  for (const r of rows) {
+    let cx = k.x0;
+    for (const [l, v] of r) {
+      const alert = /today/.test(l) && /Incidents|Near misses|LTI|First aid/.test(l) && Number(v) > 0;
+      k.cell(cx, y, lw, 12, l, { bold: true, size: 6.8, fill: COLORS.label });
+      k.cell(cx + lw, y, vw, 12, v, { bold: true, size: 7.5, align: 'center', fill: alert ? COLORS.amber : null });
+      cx += lw + vw;
+    }
+    y += 12;
+  }
+  for (const [l, v] of [['Toolbox talk topic', H.tbt_topic], ['HSE observations & corrective actions', H.observations]]) {
+    const h = Math.max(14, k.textH(v, k.W - lw, { size: 7 }));
+    y = k.ensure(y, h);
+    k.cell(k.x0, y, lw, h, l, { bold: true, size: 6.8, fill: COLORS.label });
+    k.cell(k.x0 + lw, y, k.W - lw, h, v, { size: 7 });
+    y += h;
+  }
+  return y + 5;
+}
+
+function renderOursBody(k, m, photoBuffers) {
+  const doc = k.doc;
+  const on = m.sections || {};
+  const show = (key) => on[key] !== false;
+  let y = drawHeader(k, m, k.meta);
+  if (show('weather')) y = sWeather(k, y, m);
+  if (show('manpower')) y = sPeopleOurs(k, y, m);
+  if (show('summary')) y = sSummaryOurs(k, y, m);
+  const p2 = ['work', 'qa', 'hse'].some(show);
+  if (p2) { doc.addPage(); y = k.top; }
+  if (show('work')) y = sWorkOurs(k, y, m);
+  if (show('qa')) y = sWirOurs(k, y, m);
+  if (show('hse')) y = sHseOurs(k, y, m);
+  if (show('boq') && (m.boq.groups || []).some((g) => g.rows.length)) {
+    doc.addPage();
+    y = sBoqOurs(k, k.top, m);
+  }
+  if (show('materials') && (m.materials || []).length) y = sMaterialsOurs(k, y, m);
+  const areas = show('areas') ? (m.areas || []) : [];
+  if (areas.length) {
+    doc.addPage();
+    y = sAreasOurs(k, k.top, m, photoBuffers);
+  }
+  const p3 = ['ncr', 'concerns', 'plan', 'remarks', 'signatures'].some(show);
+  if (p3) { doc.addPage(); y = k.top; }
+  if (show('ncr')) y = sNcr(k, y, m);
+  if (show('concerns')) y = sConcerns(k, y, m);
+  if (show('plan')) y = sPlan(k, y, m);
+  if (show('remarks')) y = sRemarks(k, y, m);
+  if (show('signatures')) y = sSignatures(k, y, m);
+  // photos already printed on an area page are not printed again
+  const onAreas = new Set(areas.flatMap((a) => a.photos || []));
+  const rest = (m.photos || []).filter((p) => !onAreas.has(p.photo_id));
+  if (show('photos') && rest.length) sPhotos(k, { ...m, photos: rest }, photoBuffers);
+  return y;
+}
+
 // ------------------------------------------------------------------ main
 /**
  * @param {object} m          report model
@@ -555,29 +789,34 @@ function renderDprPdf(m, meta = {}, photoBuffers = new Map()) {
       const on = m.sections || {};
       const show = (key) => on[key] !== false;
 
-      // page 1
-      let y = drawHeader(k, m, meta);
-      if (show('weather')) y = sWeather(k, y, m);
-      if (show('manpower')) y = sManpower(k, y, m);
-      if (show('subcon')) y = sSubcon(k, y, m);
-      if (show('summary')) y = sSummary(k, y, m);
-      // page 2
-      const p2 = ['work', 'qa', 'hse'].some(show);
-      if (p2) { doc.addPage(); y = k.top; }
-      if (show('work')) y = sWork(k, y, m);
-      if (show('qa')) y = sQa(k, y, m);
-      if (show('hse')) y = sHse(k, y, m);
-      // page 3
-      const p3 = ['ncr', 'concerns', 'plan', 'remarks', 'signatures'].some(show);
-      if (p3) { doc.addPage(); y = k.top; }
-      if (show('ncr')) y = sNcr(k, y, m);
-      if (show('concerns')) y = sConcerns(k, y, m);
-      if (show('plan')) y = sPlan(k, y, m);
-      if (show('remarks')) y = sRemarks(k, y, m);
-      if (show('signatures')) y = sSignatures(k, y, m);
-      // page 4+
-      if (show('photos')) sPhotos(k, m, photoBuffers);
-      if (show('alloc')) sAlloc(k, m, meta);
+      k.meta = meta;
+      if (m.design === 'ours') {
+        renderOursBody(k, m, photoBuffers);
+      } else {
+        // page 1
+        let y = drawHeader(k, m, meta);
+        if (show('weather')) y = sWeather(k, y, m);
+        if (show('manpower')) y = sManpower(k, y, m);
+        if (show('subcon')) y = sSubcon(k, y, m);
+        if (show('summary')) y = sSummary(k, y, m);
+        // page 2
+        const p2 = ['work', 'qa', 'hse'].some(show);
+        if (p2) { doc.addPage(); y = k.top; }
+        if (show('work')) y = sWork(k, y, m);
+        if (show('qa')) y = sQa(k, y, m);
+        if (show('hse')) y = sHse(k, y, m);
+        // page 3
+        const p3 = ['ncr', 'concerns', 'plan', 'remarks', 'signatures'].some(show);
+        if (p3) { doc.addPage(); y = k.top; }
+        if (show('ncr')) y = sNcr(k, y, m);
+        if (show('concerns')) y = sConcerns(k, y, m);
+        if (show('plan')) y = sPlan(k, y, m);
+        if (show('remarks')) y = sRemarks(k, y, m);
+        if (show('signatures')) y = sSignatures(k, y, m);
+        // page 4+
+        if (show('photos')) sPhotos(k, m, photoBuffers);
+        if (show('alloc')) sAlloc(k, m, meta);
+      }
 
       // footer + DRAFT mark on every page
       const range = doc.bufferedPageRange();

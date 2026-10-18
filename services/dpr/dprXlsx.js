@@ -121,7 +121,9 @@ function dprSheet(wb, m, meta) {
     S.gap();
   }
 
-  if (show('manpower')) {
+  const ours = m.design === 'ours';
+  if (ours && show('manpower')) oursPeople(S, m);
+  if (!ours && show('manpower')) {
     const P = m.manpower;
     S.section('2.  OWN MANPOWER BY TRADE  &  OWN PLANT / EQUIPMENT');
     S.head([{ v: 'Trade', span: 2 }, { v: 'Category' }, { v: 'Today' }, { v: 'Allocated' }, { v: 'Idle / Indirect' }, { v: 'Cum. Man-days' },
@@ -145,7 +147,7 @@ function dprSheet(wb, m, meta) {
     S.gap();
   }
 
-  if (show('subcon')) {
+  if (!ours && show('subcon')) {
     const Sb = m.subcontractors;
     S.section('3.  SUBCONTRACTOR RESOURCES (MANPOWER & PLANT)');
     S.head([{ v: 'Subcontractor', span: 3 }, { v: 'Resource', span: 3 }, { v: 'Type' }, { v: 'Today' }, { v: 'Allocated' }, { v: 'Idle' }, { v: 'Cum. Man-/Equip-days', span: 2 }, { v: 'Cum. Hours', span: 2 }]);
@@ -160,7 +162,8 @@ function dprSheet(wb, m, meta) {
     S.gap();
   }
 
-  if (show('summary')) {
+  if (ours && show('summary')) oursSummary(S, m);
+  if (!ours && show('summary')) {
     const Su = m.summary;
     S.section('RESOURCE SUMMARY');
     S.head([{ v: 'Total Manpower on Site', span: 3 }, { v: 'Total Plant on Site', span: 3 }, { v: 'Man-hours Today', span: 3 }, { v: 'Cum. Man-days', span: 2 }, { v: 'Cum. Man-hours', span: 3 }]);
@@ -170,7 +173,11 @@ function dprSheet(wb, m, meta) {
     S.gap();
   }
 
-  if (show('work')) {
+  if (ours && show('work')) {
+    ws.getRow(S.r - 1).addPageBreak();
+    oursWork(S, m);
+  }
+  if (!ours && show('work')) {
     const Wk = m.work;
     ws.getRow(S.r - 1).addPageBreak();
     S.section('4.  WORK PROGRESS – ACTIVITIES EXECUTED & BOQ QUANTITIES');
@@ -185,7 +192,8 @@ function dprSheet(wb, m, meta) {
     S.gap();
   }
 
-  if (show('qa')) {
+  if (ours && show('qa')) oursWir(S, m);
+  if (!ours && show('qa')) {
     S.section('5.  QUALITY ASSURANCE / QUALITY CONTROL');
     S.head([{ v: 'Type' }, { v: 'Ref No.' }, { v: 'Description / Activity', span: 5 }, { v: 'Location', span: 2 }, { v: 'Result', span: 2 }, { v: 'Remarks', span: 3 }]);
     for (const q of m.qa.entries) {
@@ -195,7 +203,8 @@ function dprSheet(wb, m, meta) {
     S.gap();
   }
 
-  if (show('hse')) {
+  if (ours && show('hse')) oursHse(S, m);
+  if (!ours && show('hse')) {
     const Hs = m.hse;
     S.section('6.  HEALTH, SAFETY & ENVIRONMENT');
     const lv = (l, v, fmt = INT) => [{ v: l, span: 3, bold: true, fill: LABEL, size: 7 }, { v, fmt, bold: true, align: 'center' }];
@@ -213,6 +222,12 @@ function dprSheet(wb, m, meta) {
     S.gap();
   }
 
+  if (ours && show('boq') && (m.boq.groups || []).some((g) => g.rows.length)) {
+    ws.getRow(S.r - 1).addPageBreak();
+    oursBoq(S, m);
+  }
+  if (ours && show('materials') && (m.materials || []).length) oursMaterials(S, m);
+  if (ours && show('areas') && (m.areas || []).length) oursAreas(S, m);
   if (show('ncr')) {
     ws.getRow(S.r - 1).addPageBreak();
     S.section(`7.  NON-CONFORMANCE REPORTS – OPEN AS OF REPORT DATE  (Open / closed today: ${m.ncr.count})`);
@@ -312,6 +327,126 @@ function allocSheet(wb, m, meta) {
   S.row([{ v: `Activities logged today: ${nAct}`, span: total, bold: true, color: RED }], { border: false });
 }
 
+// ------------------------------------------------------------------ "our design" (services/dpr/dprOurs.js)
+function oursPeople(S, m) {
+  const P = m.people;
+  const table = (t, label, fields) => {
+    const rows = t.rows.map((r) => [{ v: r.name, span: 4 }, ...fields.map((f, i) => ({ v: n(r[f]), fmt: INT, align: 'center', bold: i === (fields[0] === 'total' ? 1 : 0) }))]);
+    rows.push([{ v: label, span: 4, bold: true, fill: TOTAL }, ...fields.map((f) => ({ v: n(t.total[f]), fmt: INT, bold: true, fill: TOTAL, align: 'center' }))]);
+    return rows;
+  };
+  const pair = (left, right) => {
+    const rows = Math.max(left.length, right.length);
+    for (let i = 0; i < rows; i += 1) S.row([...(left[i] || [{ v: '', span: 7 }]), ...(right[i] || [{ v: '', span: 7 }])], { height: 12 });
+  };
+  const MP = ['total', 'present', 'absent'];
+  const PL = ['operative', 'breakdown', 'idle'];
+  S.section('2.  MANPOWER  –  STAFF  |  TRADESMEN');
+  S.head([{ v: 'Staff', span: 4 }, { v: 'Total' }, { v: 'Present' }, { v: 'Absent' }, { v: 'Tradesmen', span: 4 }, { v: 'Total' }, { v: 'Present' }, { v: 'Absent' }]);
+  pair(table(P.staff, 'TOTAL STAFF', MP), table(P.trades, 'TOTAL TRADESMEN', MP));
+  S.gap();
+  S.section('PLANT / EQUIPMENT  |  TOOLS');
+  S.head([{ v: 'Plant', span: 4 }, { v: 'Operative' }, { v: 'Breakdown' }, { v: 'Idle' }, { v: 'Tools', span: 4 }, { v: 'Operative' }, { v: 'Breakdown' }, { v: 'Idle' }]);
+  pair(table(P.plant, 'TOTAL PLANT', PL), table(P.tools, 'TOTAL TOOLS', PL));
+  S.gap();
+}
+
+function oursSummary(S, m) {
+  const Su = m.summary;
+  S.section('RESOURCE SUMMARY');
+  S.head([{ v: 'Total Manpower', span: 3 }, { v: 'Present', span: 3 }, { v: 'Absent', span: 2 }, { v: 'Plant on Site', span: 3 }, { v: 'Plant Operative', span: 3 }]);
+  const big = (v, span) => ({ v: n(v), span, fmt: '#,##0', bold: true, align: 'center', size: 13, color: NAVY });
+  S.row([big(Su.total_manpower, 3), big(Su.present, 3), big(Su.absent, 2), big(Su.plant_on_site, 3), big(Su.plant_operative, 3)], { height: 24 });
+  S.gap();
+}
+
+function oursBoq(S, m) {
+  S.section('OVERALL PROGRESS – BOQ');
+  S.head([{ v: 'Item' }, { v: 'Description', span: 6 }, { v: 'Unit' }, { v: 'Contract Qty' }, { v: 'Today' }, { v: 'Cum. to Date' }, { v: '% Complete' }, { v: 'Balance', span: 2 }]);
+  for (const g of m.boq.groups) {
+    if (g.name) S.row([{ v: g.name, span: 14, bold: true, fill: HEAD }]);
+    for (const r of g.rows) {
+      if (r.row_type === 'section') S.row([{ v: r.description, span: 7, bold: true, fill: LABEL }, { v: r.unit, align: 'center', fill: LABEL }, { v: n(r.qty), fmt: DEC0, fill: LABEL, align: 'right' }, { v: '', span: 5, fill: LABEL }]);
+      else if (r.row_type === 'text') S.row([{ v: r.description, span: 14, size: 7 }]);
+      else {
+        S.row([{ v: r.item_no, bold: true, align: 'center' }, { v: r.description, span: 6, size: 7 }, { v: r.unit, align: 'center' }, { v: n(r.qty), fmt: DEC0, align: 'right' },
+          { v: n(r.curr), fmt: DEC0, align: 'right' }, { v: n(r.cum), fmt: DEC0, align: 'right', bold: true }, { v: r.pct, fmt: PCT, align: 'right' }, { v: n(r.balance), fmt: DEC0, span: 2, align: 'right' }], { height: 14 });
+      }
+    }
+  }
+  S.gap();
+}
+
+function oursWir(S, m) {
+  S.section('5.  WORK INSPECTION REQUEST (WIR) REGISTER');
+  S.head([{ v: 'Sr. No.' }, { v: 'WIR Ref.' }, { v: 'Activity / Work Description', span: 4 }, { v: 'Bridge No.', span: 2 }, { v: 'Location / Chainage', span: 2 }, { v: 'MS Ref.' }, { v: 'Status' }, { v: 'Comments', span: 2 }]);
+  m.qa.entries.forEach((q, i) => {
+    S.row([{ v: i + 1, align: 'center' }, { v: q.ref_no }, { v: q.description, span: 4, size: 7 }, { v: q.area, span: 2, size: 7 }, { v: q.place, span: 2, size: 7 },
+      { v: q.ms_ref, size: 7 }, { v: q.result, align: 'center', size: 7 }, { v: q.remarks, span: 2, size: 7 }], { height: 14 });
+  });
+  if (!m.qa.entries.length) S.row([{ v: 'No WIR today.', span: 14 }]);
+  S.gap();
+}
+
+function oursHse(S, m) {
+  const Hs = m.hse;
+  S.section('6.  HEALTH, SAFETY & ENVIRONMENT');
+  const lv = (l, v) => [{ v: l, span: 3, bold: true, fill: LABEL, size: 7 }, { v, fmt: '0', bold: true, align: 'center' }];
+  const rr = [
+    [lv('Manpower on site today', Hs.manpower_today), lv('Toolbox talk attendees', Hs.tbt_attendees), lv('HSE inspections / audits today', Hs.hse_inspections_today)],
+    [lv('Incidents today', Hs.incidents_today), lv('Near misses today', Hs.near_misses_today), lv('First aid cases today', Hs.first_aid_today)],
+    [lv('LTI today', Hs.lti_today), lv('PTWs issued today', Hs.ptws_today), lv('LTI-free days', Hs.lti_free_days)],
+    [lv('Incidents to date', Hs.incidents_to_date), lv('Near misses to date', Hs.near_misses_to_date), lv('LTIs to date', Hs.ltis_to_date)],
+  ];
+  for (const r of rr) S.row([...r[0], ...r[1], ...r[2], { v: '', span: 2 }], { height: 13 });
+  S.row([{ v: 'Toolbox talk topic', span: 3, bold: true, fill: LABEL, size: 7 }, { v: Hs.tbt_topic, span: 11 }], { height: 14 });
+  S.row([{ v: 'HSE observations & corrective actions', span: 3, bold: true, fill: LABEL, size: 7 }, { v: Hs.observations, span: 11 }], { height: 26 });
+  S.gap();
+}
+
+function oursWork(S, m) {
+  const Wk = m.work;
+  S.section('4.  WORK PROGRESS – ACTIVITIES EXECUTED & BOQ QUANTITIES');
+  S.head([{ v: 'BOQ Item' }, { v: 'Description', span: 2 }, { v: 'Location' }, { v: 'Unit' }, { v: 'Contract Qty' }, { v: 'Today' }, { v: 'Previous Cum.' }, { v: 'Cum. to Date' }, { v: '% Complete' }, { v: 'Balance' }, { v: 'Man-hours' }, { v: 'Output / MH', span: 2 }]);
+  for (const a of Wk.rows) {
+    S.row([{ v: a.item_no, bold: true, align: 'center' }, { v: a.description, span: 2, size: 7 }, { v: a.location, size: 7 }, { v: a.unit, align: 'center' }, { v: n(a.contract_qty), fmt: DEC, align: 'right' },
+      { v: n(a.today), fmt: DEC, align: 'right', bold: true }, { v: n(a.prev_cum), fmt: DEC, align: 'right' }, { v: n(a.cum), fmt: DEC, align: 'right', bold: true }, { v: a.pct, fmt: PCT, align: 'right' },
+      { v: n(a.balance), fmt: DEC, align: 'right' }, { v: n(a.man_hours), fmt: DEC0, align: 'right' }, { v: a.output_per_mh, fmt: R2, align: 'right', span: 2 }], { height: 24 });
+  }
+  if (!Wk.rows.length) S.row([{ v: 'No activity entered for the day.', span: 14 }]);
+  S.row([{ v: `Activities logged today: ${Wk.count}`, span: 8, bold: true, color: RED }, { v: 'Man-hours of the crews', span: 3, bold: true, fill: LABEL, align: 'right' }, { v: n(Wk.man_hours), fmt: DEC0, bold: true, span: 3, align: 'right' }], { border: false });
+  S.gap();
+}
+
+function oursMaterials(S, m) {
+  S.section('DELIVERED MATERIALS AT SITE');
+  S.head([{ v: 'No.' }, { v: 'Material / Specification', span: 3 }, { v: 'Unit' }, { v: 'Qty' }, { v: 'Supplier', span: 2 }, { v: 'Delivery Note' }, { v: 'Area' }, { v: 'BOQ Ref.' }, { v: 'Intended Use', span: 3 }]);
+  (m.materials || []).forEach((x, i) => {
+    S.row([{ v: i + 1, align: 'center' }, { v: [x.description, x.element].filter(Boolean).join(' – '), span: 3, size: 7 }, { v: x.unit, align: 'center' }, { v: n(x.qty), fmt: DEC0, align: 'right' },
+      { v: x.supplier, span: 2, size: 7 }, { v: x.delivery_note, size: 7 }, { v: x.area, size: 7 }, { v: x.boq_ref, size: 7 }, { v: x.intended_use, span: 3, size: 7 }], { height: 14 });
+  });
+  S.gap();
+}
+
+function oursAreas(S, m) {
+  const list = (xs) => xs.map((x) => `${x.name}${x.nos === null || x.nos === undefined || x.nos === '' ? '' : ` × ${x.nos}`}`).join('\n');
+  const hrs = (xs) => {
+    const vals = xs.map((x) => x.hours).filter((v) => v !== null && v !== undefined && v !== '').map(Number);
+    return vals.length ? vals.reduce((t, v) => t + v, 0) : null;
+  };
+  for (const a of m.areas || []) {
+    S.section(`${a.name}  –  DAILY PROGRESS`);
+    S.head([{ v: 'Bill Item' }, { v: 'Activity', span: 3 }, { v: 'Chainage' }, { v: 'Plant (No.)', span: 2 }, { v: 'W-HRS' }, { v: 'Tradesmen (No.)', span: 2 }, { v: 'W-HRS' }, { v: 'Unit' }, { v: 'Output', span: 2 }]);
+    for (const x of a.activities) {
+      const h = Math.max(14, 11 * Math.max(x.plant.length, x.trades.length, 1));
+      S.row([{ v: x.item_no, align: 'center' }, { v: x.description, span: 3, size: 7 }, { v: x.chainage, size: 7 }, { v: list(x.plant), span: 2, size: 7 }, { v: hrs(x.plant), fmt: DEC0, align: 'right' },
+        { v: list(x.trades), span: 2, size: 7 }, { v: hrs(x.trades), fmt: DEC0, align: 'right' }, { v: x.unit, align: 'center' }, { v: n(x.output), fmt: DEC0, span: 2, align: 'right' }], { height: h });
+    }
+    if (!a.activities.length) S.row([{ v: 'Photos only.', span: 14 }]);
+    S.gap();
+  }
+}
+
 /** @returns {Promise<Buffer>} */
 async function renderDprXlsx(m, meta = {}, photoBuffers = new Map()) {
   const wb = new ExcelJS.Workbook();
@@ -319,8 +454,12 @@ async function renderDprXlsx(m, meta = {}, photoBuffers = new Map()) {
   wb.created = new Date();
   const on = m.sections || {};
   dprSheet(wb, m, meta);
-  if (on.photos !== false) photoSheet(wb, m, photoBuffers);
-  if (on.alloc !== false) allocSheet(wb, m, meta);
+  if (m.design === 'ours') {
+    if (on.photos !== false && (m.photos || []).length) photoSheet(wb, m, photoBuffers);
+  } else {
+    if (on.photos !== false) photoSheet(wb, m, photoBuffers);
+    if (on.alloc !== false) allocSheet(wb, m, meta);
+  }
   return Buffer.from(await wb.xlsx.writeBuffer());
 }
 

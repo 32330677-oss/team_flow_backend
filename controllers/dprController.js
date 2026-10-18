@@ -206,11 +206,11 @@ exports.photoFile = wrap('photoFile', async (req, res) => {
 exports.copyDay = wrap('copyDay', async (req, res) => ok(res, await Day.copyDay(cid(req), dateParam(req), C.id((req.body || {}).from_contract_id, 'contract to copy from'), (req.body || {}).parts, uid(req))));
 
 exports.draftPdf = wrap('draftPdf', async (req, res) => {
-  const { buf, name } = await Reports.draftFiles(cid(req), dateParam(req), 'pdf');
+  const { buf, name } = await Reports.draftFiles(cid(req), dateParam(req), 'pdf', req.query.design);
   return sendFile(res, buf, name, PDF, true);
 });
 exports.draftXlsx = wrap('draftXlsx', async (req, res) => {
-  const { buf, name } = await Reports.draftFiles(cid(req), dateParam(req), 'xlsx');
+  const { buf, name } = await Reports.draftFiles(cid(req), dateParam(req), 'xlsx', req.query.design);
   return sendFile(res, buf, name, XLSX, false);
 });
 exports.issue = wrap('issue', async (req, res) => ok(res, await Reports.issue(cid(req), dateParam(req), req.body, uid(req)), 201));
@@ -221,12 +221,12 @@ exports.listReports = wrap('listReports', async (req, res) => ok(res, await Repo
   from: C.date(req.query.from, { label: 'from' }), to: C.date(req.query.to, { label: 'to' }),
 })));
 exports.reportPdf = wrap('reportPdf', async (req, res) => {
-  const { buf, name, report } = await Reports.reportFile(C.id(req.params.rid, 'report'), 'pdf');
+  const { buf, name, report } = await Reports.reportFile(C.id(req.params.rid, 'report'), 'pdf', req.query.design);
   if (report.contract_id !== cid(req)) throw new C.DprError('Report not found.', 404);
   return sendFile(res, buf, name, PDF, true);
 });
 exports.reportXlsx = wrap('reportXlsx', async (req, res) => {
-  const { buf, name, report } = await Reports.reportFile(C.id(req.params.rid, 'report'), 'xlsx');
+  const { buf, name, report } = await Reports.reportFile(C.id(req.params.rid, 'report'), 'xlsx', req.query.design);
   if (report.contract_id !== cid(req)) throw new C.DprError('Report not found.', 404);
   return sendFile(res, buf, name, XLSX, false);
 });

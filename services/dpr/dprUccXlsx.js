@@ -168,10 +168,56 @@ function addMainSheet(wb, m, meta) {
     }
     r += 1;
   }
+  const Hs = m.hse;
+  if (secOn(m, 'hse') && Hs && Hs.filled) {
+    r = bar(ws, r, title(m, 'hse', 'HEALTH, SAFETY & ENVIRONMENT'), 8);
+    const grid = [
+      ['Manpower on site today', Hs.manpower_today, 'Toolbox talk attendees', Hs.tbt_attendees, 'HSE inspections / audits today', Hs.hse_inspections_today],
+      ['Incidents today', Hs.incidents_today, 'Near misses today', Hs.near_misses_today, 'First aid cases today', Hs.first_aid_today],
+      ['LTI today', Hs.lti_today, 'PTWs issued today', Hs.ptws_today, 'LTI-free days', Hs.lti_free_days],
+      ['Incidents to date', Hs.incidents_to_date, 'Near misses to date', Hs.near_misses_to_date, 'LTIs to date', Hs.ltis_to_date],
+    ];
+    for (const g of grid) r = writeRow(ws, r, [...g, '', '']);
+    for (const [l, v] of [['Toolbox talk topic', Hs.tbt_topic], ['HSE observations & corrective actions', Hs.observations]]) {
+      ws.mergeCells(r, 2, r, 8);
+      r = writeRow(ws, r, [l, v]);
+    }
+    r += 1;
+  }
+  if (secOn(m, 'plan') && m.next_day_plan) {
+    r = bar(ws, r, title(m, 'plan', 'PLANNED ACTIVITIES – NEXT WORKING DAY'), 8);
+    ws.mergeCells(r, 1, r, 8);
+    r = writeRow(ws, r, [m.next_day_plan]);
+    r += 1;
+  }
+  const ncr = (m.ncr && m.ncr.entries) || [];
+  if (secOn(m, 'ncr') && ncr.length) {
+    r = bar(ws, r, title(m, 'ncr', 'NON-CONFORMANCE REPORTS – OPEN AS OF REPORT DATE'), 8);
+    r = writeRow(ws, r, ['NCR No.', 'Date Raised', 'Description', 'Corrective Action', 'Responsible', 'Target Date', 'Status', 'Days Open'], { bold: true, fill: HEAD, align: 'center' });
+    for (const x of ncr) r = writeRow(ws, r, [x.ncr_no, fmtDate(x.date_raised), x.description, x.corrective_action, x.responsible, fmtDate(x.target_date), x.status, x.days_open]);
+    r += 1;
+  }
+  const conc = (m.concerns && m.concerns.entries) || [];
+  if (secOn(m, 'concerns') && conc.length) {
+    r = bar(ws, r, title(m, 'concerns', 'AREAS OF CONCERN / DELAYS / CONSTRAINTS – OPEN AS OF REPORT DATE'), 8);
+    r = writeRow(ws, r, ['Date Raised', 'Issue', 'Impact', 'Severity', 'Action Required', 'By Whom', 'Target Date', ''], { bold: true, fill: HEAD, align: 'center' });
+    for (const x of conc) r = writeRow(ws, r, [fmtDate(x.date_raised), x.issue, x.impact, x.severity, x.action_required, x.by_whom, fmtDate(x.target_date), '']);
+    r += 1;
+  }
   if (secOn(m, 'notes') && m.notes) {
     r = bar(ws, r, title(m, 'notes', 'REMARKS'), 8);
     ws.mergeCells(r, 1, r, 8);
-    writeRow(ws, r, [m.notes]);
+    r = writeRow(ws, r, [m.notes]);
+    r += 1;
+  }
+  if (secOn(m, 'signatures')) {
+    const Sg = m.signatures || {};
+    r = bar(ws, r, title(m, 'signatures', 'SIGNATURES'), 8);
+    r = writeRow(ws, r, ['PREPARED BY (CONTRACTOR)', '', '', 'REVIEWED BY (CONTRACTOR)', '', '', "CONSULTANT'S REPRESENTATIVE", ''], { bold: true, fill: HEAD, align: 'center' });
+    r = writeRow(ws, r, [Sg.prepared_by || '', '', '', Sg.reviewed_by || '', '', '', Sg.consultant_rep || '', '']);
+    ws.getRow(r).height = 36;
+    r = writeRow(ws, r, ['Signature:', '', '', 'Signature:', '', '', 'Signature:', '']);
+    writeRow(ws, r, ['Date:', '', '', 'Date:', '', '', 'Date:', '']);
   }
 }
 

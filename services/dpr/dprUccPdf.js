@@ -616,6 +616,94 @@ function sNotes(k, y) {
   return y + h + 8;
 }
 
+// ------------------------------------------------------------------ HSE, next working day
+function sHse(k, y) {
+  const m = k.m;
+  const H = m.hse;
+  if (!H || !H.filled) return y;
+  y = k.ensure(y, 110);
+  y = k.bar(y, sub(m, title(m, 'hse', 'HEALTH, SAFETY & ENVIRONMENT')), 80);
+  const lw = 140;
+  const vw = (k.W - lw * 3) / 3;
+  const n0 = (v) => (v === null || v === undefined ? '' : String(v));
+  const rows = [
+    [['Manpower on site today', H.manpower_today], ['Toolbox talk attendees', H.tbt_attendees], ['HSE inspections / audits today', H.hse_inspections_today]],
+    [['Incidents today', H.incidents_today], ['Near misses today', H.near_misses_today], ['First aid cases today', H.first_aid_today]],
+    [['LTI today', H.lti_today], ['PTWs issued today', H.ptws_today], ['LTI-free days', H.lti_free_days]],
+    [['Incidents to date', H.incidents_to_date], ['Near misses to date', H.near_misses_to_date], ['LTIs to date', H.ltis_to_date]],
+  ];
+  for (const r of rows) {
+    let cx = k.x0;
+    for (const [l, v] of r) {
+      k.cell(cx, y, lw, 13, l, { bold: true, size: 6.8, fill: COL.head });
+      k.cell(cx + lw, y, vw, 13, n0(v), { bold: true, size: 7.5, align: 'center' });
+      cx += lw + vw;
+    }
+    y += 13;
+  }
+  for (const [l, v] of [['Toolbox talk topic', H.tbt_topic], ['HSE observations & corrective actions', H.observations]]) {
+    const h = Math.max(14, k.textH(v, k.W - lw, { size: 7 }));
+    y = k.ensure(y, h);
+    k.cell(k.x0, y, lw, h, l, { bold: true, size: 6.8, fill: COL.head });
+    k.cell(k.x0 + lw, y, k.W - lw, h, v, { size: 7 });
+    y += h;
+  }
+  return y + 8;
+}
+function sPlan(k, y) {
+  const m = k.m;
+  if (!m.next_day_plan) return y;
+  y = k.bar(y, sub(m, title(m, 'plan', 'PLANNED ACTIVITIES – NEXT WORKING DAY')), 30);
+  const h = Math.max(28, k.textH(m.next_day_plan, k.W, { size: 7.5, pad: 4 }));
+  y = k.ensure(y, h);
+  k.cell(k.x0, y, k.W, h, m.next_day_plan, { size: 7.5, pad: 4, valign: 'top' });
+  return y + h + 8;
+}
+
+// ------------------------------------------------------------------ registers open on the day, signatures
+function sNcr(k, y) {
+  const m = k.m;
+  const list = (m.ncr && m.ncr.entries) || [];
+  if (!list.length) return y;
+  y = k.bar(y, sub(m, title(m, 'ncr', 'NON-CONFORMANCE REPORTS – OPEN AS OF REPORT DATE')), 40);
+  const W = k.W;
+  const cols = [{ head: 'NCR No.', w: W * 0.09, align: 'center' }, { head: 'Date Raised', w: W * 0.1, align: 'center' }, { head: 'Description', w: W * 0.25 },
+    { head: 'Corrective Action', w: W * 0.22 }, { head: 'Responsible', w: W * 0.1, align: 'center' }, { head: 'Target Date', w: W * 0.1, align: 'center' },
+    { head: 'Status', w: W * 0.07, align: 'center' }, { head: 'Days Open', w: W * 0.07, align: 'center' }];
+  const rows = list.map((x) => ({ cells: [x.ncr_no, fmtDate(x.date_raised), x.description, x.corrective_action, x.responsible, fmtDate(x.target_date), x.status, String(x.days_open)],
+    colors: [null, null, null, null, null, null, x.status === 'Open' ? COL.red : null] }));
+  return k.table(y, cols, rows, { minH: 13, size: 6.8, headSize: 6.4 }) + 10;
+}
+function sConcerns(k, y) {
+  const m = k.m;
+  const list = (m.concerns && m.concerns.entries) || [];
+  if (!list.length) return y;
+  y = k.bar(y, sub(m, title(m, 'concerns', 'AREAS OF CONCERN / DELAYS / CONSTRAINTS – OPEN AS OF REPORT DATE')), 40);
+  const W = k.W;
+  const cols = [{ head: 'Date Raised', w: W * 0.1, align: 'center' }, { head: 'Issue', w: W * 0.26 }, { head: 'Impact', w: W * 0.09, align: 'center' },
+    { head: 'Severity', w: W * 0.09, align: 'center' }, { head: 'Action Required', w: W * 0.24 }, { head: 'By Whom', w: W * 0.11, align: 'center' },
+    { head: 'Target Date', w: W * 0.11, align: 'center' }];
+  const rows = list.map((x) => ({ cells: [fmtDate(x.date_raised), x.issue, x.impact, x.severity, x.action_required, x.by_whom, fmtDate(x.target_date)] }));
+  return k.table(y, cols, rows, { minH: 13, size: 6.8, headSize: 6.4 }) + 10;
+}
+function sSignatures(k, y) {
+  const m = k.m;
+  const S = m.signatures || {};
+  y = k.ensure(y + 4, 95);
+  y = k.bar(y, sub(m, title(m, 'signatures', 'SIGNATURES')), 80);
+  const w = k.W / 3;
+  const heads = ['PREPARED BY (CONTRACTOR)', 'REVIEWED BY (CONTRACTOR)', "CONSULTANT'S REPRESENTATIVE"];
+  const names = [S.prepared_by, S.reviewed_by, S.consultant_rep];
+  heads.forEach((t, i) => {
+    const x = k.x0 + i * w;
+    k.cell(x, y, w, 14, t, { bold: true, size: 7, align: 'center', fill: COL.head });
+    k.cell(x, y + 14, w, 36, 'Signature:', { size: 6.5, valign: 'top', color: COL.muted });
+    k.cell(x, y + 50, w, 13, names[i] || '', { bold: true, size: 7 });
+    k.cell(x, y + 63, w, 12, 'Date:', { size: 6.5, color: COL.muted });
+  });
+  return y + 80;
+}
+
 // ------------------------------------------------------------------ photos
 function photoPages(k, y, photos, buffers, heading) {
   const m = k.m;
@@ -693,6 +781,10 @@ function renderUccPdf(m, meta = {}, images = { photos: new Map(), pages: new Map
       if (secOn(m, 'plant')) y = sPlant(k, y);
       if (secOn(m, 'boq')) y = sBoq(k, y);
       if (secOn(m, 'activities')) y = sActivities(k, y);
+      if (secOn(m, 'hse')) y = sHse(k, y);
+      if (secOn(m, 'plan')) y = sPlan(k, y);
+      if (secOn(m, 'ncr')) y = sNcr(k, y);
+      if (secOn(m, 'concerns')) y = sConcerns(k, y);
       if (secOn(m, 'notes')) y = sNotes(k, y);
       if (secOn(m, 'photos')) y = sPhotos(k, y, images.photos || new Map());
       if (secOn(m, 'areas')) y = sAreas(k, y, images.photos || new Map());
@@ -701,6 +793,7 @@ function renderUccPdf(m, meta = {}, images = { photos: new Map(), pages: new Map
         if (secOn(m, 'materials')) y = sMaterials(k, y);
         if (secOn(m, 'wir')) y = sWir(k, y);
       }
+      if (secOn(m, 'signatures')) y = sSignatures(k, y);
 
       // page numbers, footer, DRAFT mark
       const range = doc.bufferedPageRange();

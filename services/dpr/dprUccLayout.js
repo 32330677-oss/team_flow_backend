@@ -78,8 +78,13 @@ const SECTIONS = [
       },
     ],
   },
+  { key: 'hse', label: 'Health, safety & environment', title: 'HEALTH, SAFETY & ENVIRONMENT' },
+  { key: 'plan', label: 'Planned activities – next working day', title: 'PLANNED ACTIVITIES – NEXT WORKING DAY' },
+  { key: 'ncr', label: 'NCRs open on the day (register)', title: 'NON-CONFORMANCE REPORTS – OPEN AS OF REPORT DATE' },
+  { key: 'concerns', label: 'Areas of concern open on the day (register)', title: 'AREAS OF CONCERN / DELAYS / CONSTRAINTS – OPEN AS OF REPORT DATE' },
   { key: 'notes', label: 'General remarks', title: 'REMARKS', default: false },
   { key: 'photos', label: 'Photos', title: '{code} ACTIVITIES PHOTO:' },
+  { key: 'signatures', label: 'Signatures (prepared / reviewed / consultant)', title: 'SIGNATURES' },
 ];
 
 /** Columns the client's form does not print (the QC can switch them on). */

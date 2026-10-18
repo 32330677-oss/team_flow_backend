@@ -521,3 +521,91 @@ test('U8 issue (frozen, fingerprint), change after issue, impact preview, revise
   for (const n of NAMES) assert.ok(!r.text.includes(n));
   assert.deepEqual(await checksums(), before, 'Team Flow tables never written');
 });
+
+test('U9 our design from the same data: weather details, HSE, plan; PDF / Excel on demand; both frozen at issue', async () => {
+  let r = await qc.get(day(C.c71, D2));
+  const v = r.body.data.version;
+  r = await qc.patch(day(C.c71, D2), { version: v, fields: { weather_am: 'Sunny', wind: '12', hours_lost: '0.5', incidents: 1, near_misses: 2, tbt_topic: 'Working at height', next_day_plan: 'Continue excavation' } });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  r = await qc.get(day(C.c71, D2));
+  const dd = r.body.data.day;
+  assert.deepEqual([dd.weather_am, dd.wind, dd.hours_lost, dd.incidents, dd.near_misses, dd.tbt_topic, dd.next_day_plan],
+    ['Sunny', '12', '0.5', 1, 2, 'Working at height', 'Continue excavation']);
+  const m = r.body.data.model;
+  // the client's form is unchanged by our design
+  const ucc = await qc.raw(`${day(C.c71, D2)}/pdf`);
+  assert.equal(ucc.buf.slice(0, 4).toString(), '%PDF');
+  const pdf = await qc.raw(`${day(C.c71, D2)}/pdf?design=ours`);
+  assert.equal(pdf.status, 200);
+  assert.equal(pdf.buf.slice(0, 4).toString(), '%PDF');
+  const xl = await qc.raw(`${day(C.c71, D2)}/xlsx?design=ours`);
+  assert.equal(xl.status, 200);
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(xl.buf);
+  const ws = wb.getWorksheet('DPR');
+  assert.ok(ws, wb.worksheets.map((w) => w.name).join());
+  assert.ok(!wb.getWorksheet('Alloc'), 'no allocation in our design');
+  const texts = [];
+  let tradesPresent = null;
+  let incidents = null;
+  ws.eachRow((row) => {
+    row.eachCell((cell) => { if (typeof cell.value === 'string') texts.push(cell.value); });
+    if (row.getCell(8).value === 'TOTAL TRADESMEN') tradesPresent = row.getCell(13).value;
+    for (let c = 1; c <= 14; c += 1) if (incidents === null && row.getCell(c).value === 'Incidents today') incidents = row.getCell(c + 3).value;
+  });
+  assert.equal(tradesPresent, Number(m.manpower.trades.total.present.v), 'same figures as the client\'s form');
+  assert.equal(incidents, 1);
+  for (const t of ['Working at height', 'Continue excavation', 'Sunny', 'TOTAL STAFF', 'TOTAL TOOLS']) assert.ok(texts.includes(t), t);
+  assert.ok(texts.includes('OVERALL PROGRESS – BOQ'), 'the whole BOQ (optional section)');
+  assert.ok(texts.includes('5.  WORK INSPECTION REQUEST (WIR) REGISTER'), 'WIR register like the client');
+  assert.ok(!texts.some((t) => /LTIFR|Safe man-hours|Cumulative man-hours|Man-hours today/i.test(t)), 'HSE without man-hours');
+  assert.ok(!texts.some((t) => /Cum\. Man-days|Cum\. Equip-days|SUBCONTRACTOR RESOURCES/.test(t)), 'no cumulative days, subcontractors in the tables');
+  // the sections of our design can change for this day only
+  r = await qc.get(day(C.c71, D2));
+  assert.ok(r.body.data.ours_sections.some((x) => x.key === 'boq'));
+  assert.equal(r.body.data.ours_sections_day, null);
+  let rr = await qc.patch(day(C.c71, D2), { version: r.body.data.version, fields: { sections: { boq: false } } });
+  assert.equal(rr.status, 200, JSON.stringify(rr.body));
+  const xl2 = await qc.raw(`${day(C.c71, D2)}/xlsx?design=ours`);
+  const wb2 = new ExcelJS.Workbook();
+  await wb2.xlsx.load(xl2.buf);
+  const t2 = [];
+  wb2.getWorksheet('DPR').eachRow((row) => row.eachCell((c) => t2.push(String(c.value))));
+  assert.ok(!t2.includes('OVERALL PROGRESS – BOQ'), 'switched off for this day');
+  r = await qc.get(day(C.c71, D2));
+  rr = await qc.patch(day(C.c71, D2), { version: r.body.data.version, fields: { sections: null } });
+  assert.equal(rr.status, 200);
+  for (const n of NAMES) assert.ok(!texts.some((t) => t.includes(n)), 'no names');
+  // HSE, the next working day, the open NCRs and the signatures are in the client's form too
+  r = await qc.post(`/api/dpr/contracts/${C.c71}/registers/ncr`, { ncr_no: 'NCR-U9', date_raised: D1, description: 'Cover to rebar' });
+  assert.equal(r.status, 201, JSON.stringify(r.body));
+  const ux = await qc.raw(`${day(C.c71, D2)}/xlsx`);
+  const uwb = new ExcelJS.Workbook();
+  await uwb.xlsx.load(ux.buf);
+  const ut = [];
+  uwb.getWorksheet('Daily Report').eachRow((row) => row.eachCell((c) => ut.push(String(c.value))));
+  for (const t of ['HEALTH, SAFETY & ENVIRONMENT', 'PLANNED ACTIVITIES – NEXT WORKING DAY', 'Continue excavation', 'Working at height',
+    'NON-CONFORMANCE REPORTS – OPEN AS OF REPORT DATE', 'NCR-U9', 'SIGNATURES']) assert.ok(ut.includes(t), t);
+  // 59: area page + materials appear in our design too
+  const p59 = await qc.raw(`${day(C.c59, D2)}/pdf?design=ours`);
+  assert.equal(p59.buf.slice(0, 4).toString(), '%PDF');
+  // issue: both designs are frozen
+  r = await qc.post(`${day(C.c71, D2)}/issue`, { accept_warnings: true });
+  assert.equal(r.status, 201, JSON.stringify(r.body));
+  const rid = r.body.data.report_id;
+  r = await qc.get(`/api/dpr/contracts/${C.c71}/reports`);
+  assert.equal(r.body.data.find((x) => x.report_id === rid).template, 'ucc');
+  for (const u of [`reports/${rid}/pdf`, `reports/${rid}/pdf?design=ours`, `reports/${rid}/xlsx?design=ours`]) {
+    const f = await qc.raw(`/api/dpr/contracts/${C.c71}/${u}`);
+    assert.equal(f.status, 200, u);
+  }
+  // a later change does not touch the frozen copy of our design
+  const before9 = await qc.raw(`/api/dpr/contracts/${C.c71}/reports/${rid}/xlsx?design=ours`);
+  r = await qc.get(day(C.c71, D2));
+  await qc.patch(day(C.c71, D2), { version: r.body.data.version, fields: { tbt_topic: 'Changed later' } });
+  const after9 = await qc.raw(`/api/dpr/contracts/${C.c71}/reports/${rid}/xlsx?design=ours`);
+  const read = async (buf) => { const w = new ExcelJS.Workbook(); await w.xlsx.load(buf); const out = []; w.getWorksheet('DPR').eachRow((row) => row.eachCell((c) => out.push(String(c.value)))); return out; };
+  assert.ok((await read(before9.buf)).includes('Working at height'));
+  assert.ok(!(await read(after9.buf)).includes('Changed later'));
+  assert.deepEqual(await checksums(), before, 'Team Flow tables never written');
+});

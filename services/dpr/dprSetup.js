@@ -754,6 +754,7 @@ async function getSetup(contractId) {
     fixed_pages: pages,
     lists: C.LISTS,
     sections: C.SECTIONS,
+    ours_sections: C.OURS_SECTIONS,
     ucc: { sections: UL.SECTIONS, layout: UL.effective(contract.layout, null), linkable: UL.LINKABLE, count_modes: S.COUNT_MODES,
       form_defaults: UL.FORM_DEFAULTS, list_defaults: UL.LIST_DEFAULTS },
     totals: {

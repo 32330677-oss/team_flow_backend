@@ -393,6 +393,61 @@ async function headerOf(c, date) {
   };
 }
 
+// ------------------------------------------------------------------ HSE (the QC's counts, no man-hours)
+const HSE_FIELDS = ['tbt_topic', 'tbt_attendees', 'hse_inspections', 'incidents', 'near_misses', 'first_aid', 'lti', 'ptws', 'hse_observations'];
+async function hseOf(c, date, day, manpower) {
+  const [rows] = await pool.query(
+    `SELECT DATE_FORMAT(report_date, '%Y-%m-%d') AS d, lti, incidents, near_misses FROM dpr_days
+      WHERE contract_id = ? AND report_date BETWEEN ? AND ?`, [c.contract_id, c.commencement_date, date]);
+  const int = (v) => (blank(v) ? 0 : Math.trunc(Number(v)) || 0);
+  const t = day || {};
+  const ltiDates = rows.filter((r) => int(r.lti) > 0).map((r) => r.d).sort();
+  const lastLti = ltiDates.length ? ltiDates[ltiDates.length - 1] : dateOf(dayNo(c.commencement_date) - 1);
+  return {
+    // printed only when something was typed for the day (0 counts as typed)
+    filled: HSE_FIELDS.some((k) => !blank(t[k])),
+    manpower_today: Number(manpower.grand.present.v || 0),
+    tbt_topic: t.tbt_topic || '',
+    tbt_attendees: int(t.tbt_attendees),
+    hse_inspections_today: int(t.hse_inspections),
+    incidents_today: int(t.incidents),
+    near_misses_today: int(t.near_misses),
+    first_aid_today: int(t.first_aid),
+    lti_today: int(t.lti),
+    ptws_today: int(t.ptws),
+    observations: t.hse_observations || '',
+    last_lti_date: lastLti,
+    lti_free_days: dayNo(date) - dayNo(lastLti),
+    ltis_to_date: rows.reduce((a, r) => a + int(r.lti), 0),
+    incidents_to_date: rows.reduce((a, r) => a + int(r.incidents), 0),
+    near_misses_to_date: rows.reduce((a, r) => a + int(r.near_misses), 0),
+  };
+}
+
+// ------------------------------------------------------------------ NCR / concerns open on the report date
+async function registersOn(cid, date) {
+  const [[ncrRows], [concernRows]] = await Promise.all([
+    pool.query('SELECT * FROM dpr_ncr WHERE contract_id = ? AND is_deleted = 0 ORDER BY date_raised, ncr_id', [cid]),
+    pool.query('SELECT * FROM dpr_concerns WHERE contract_id = ? AND is_deleted = 0 ORDER BY date_raised, concern_id', [cid]),
+  ]);
+  const openAt = (raised, status, closed) => !blank(raised) && raised <= date && (status !== 'Closed' || (!blank(closed) && closed >= date));
+  const dn = dayNo(date);
+  const ncr = ncrRows.filter((x) => openAt(x.date_raised, x.status, x.date_closed)).map((x) => {
+    const closedShown = x.status === 'Closed' && !blank(x.date_closed) && x.date_closed <= date;
+    return {
+      ncr_no: x.ncr_no || '', date_raised: x.date_raised, description: x.description || '', corrective_action: x.corrective_action || '',
+      responsible: x.responsible || '', target_date: x.target_date || null, status: closedShown ? 'Closed' : 'Open',
+      days_open: (closedShown ? dayNo(x.date_closed) : dn) - dayNo(x.date_raised),
+    };
+  });
+  const concerns = concernRows.filter((x) => openAt(x.date_raised, x.status, x.date_closed)).map((x) => ({
+    date_raised: x.date_raised, issue: x.issue || '', impact: x.impact || '', severity: x.severity || '',
+    action_required: x.action_required || '', by_whom: x.by_whom || '', target_date: x.target_date || null,
+    status: x.status === 'Closed' && !blank(x.date_closed) && x.date_closed <= date ? 'Closed' : 'Open',
+  }));
+  return { ncr: { entries: ncr, count: ncr.length }, concerns: { entries: concerns, count: concerns.length } };
+}
+
 // ------------------------------------------------------------------ the whole day
 /**
  * @returns {Promise<{model, contract, day}>} model = what is printed + where each figure comes from.
@@ -439,6 +494,8 @@ async function buildUcc(contractId, date) {
     boq_activity: p.boq_activity || '', location: p.location || '', caption: p.caption || '', area_id: p.area_id === null ? null : Number(p.area_id),
   }));
   const fixedPages = await Setup.listFixedPages(c.contract_id, { activeOnly: true });
+  const hse = await hseOf(c, date, day, manpower);
+  const registers = await registersOn(c.contract_id, date);
 
   // area pages: areas with an activity or a photo that day
   const areas = areasAll.filter((a) => a.is_active || activities.some((x) => x.area_id === a.area_id)).map((a) => {
@@ -510,6 +567,11 @@ async function buildUcc(contractId, date) {
     materials,
     wir,
     notes: (notesDay && notesDay.remarks) || '',
+    hse,
+    next_day_plan: (day && day.next_day_plan) || '',
+    ncr: registers.ncr,
+    concerns: registers.concerns,
+    signatures: { prepared_by: c.prepared_by || '', reviewed_by: c.reviewed_by || '', consultant_rep: c.consultant_rep || '' },
     photos: photoList,
     fixed_pages: fixedPages.map((p) => ({ page_id: p.page_id, title: p.title, file_name: p.file_name, content_type: p.content_type })),
     lists: c.lists,

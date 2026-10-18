@@ -117,6 +117,7 @@ const SECTIONS = [
   { key: 'subcon', label: '3. Subcontractor resources' },
   { key: 'summary', label: 'Resource summary' },
   { key: 'work', label: '4. Work progress (BOQ)' },
+  { key: 'boq', label: 'Overall progress – whole BOQ' },
   { key: 'qa', label: '5. QA / QC' },
   { key: 'hse', label: '6. Health, safety & environment' },
   { key: 'ncr', label: '7. Non-conformance reports' },
@@ -124,10 +125,15 @@ const SECTIONS = [
   { key: 'plan', label: '9. Planned activities' },
   { key: 'remarks', label: '10. General remarks' },
   { key: 'signatures', label: 'Signatures' },
+  { key: 'materials', label: 'Delivered materials' },
+  { key: 'areas', label: 'Area / bridge pages' },
   { key: 'photos', label: '11. Site photographs' },
   { key: 'alloc', label: 'Resource allocation matrix (Alloc)' },
 ];
 const SECTION_KEYS = SECTIONS.map((s) => s.key);
+/** Sections of "our design" (client's-form data): no allocation, subcontractors are in the tables. */
+const OURS_SECTIONS = SECTIONS.filter((s) => !['alloc', 'subcon'].includes(s.key))
+  .map((s) => (s.key === 'qa' ? { ...s, label: '5. WIR register' } : s));
 
 function sectionFlags(raw, base) {
   const r = json(raw) || {};
@@ -186,5 +192,5 @@ async function getContractRow(conn, contractId) {
 
 module.exports = {
   DprError, text, line, isDate, date, decimal, integer, id, oneOf, bool, ids, json,
-  LISTS, SECTIONS, SECTION_KEYS, sectionFlags, inTransaction, logChange, logRowChanges, getContractRow,
+  LISTS, SECTIONS, SECTION_KEYS, OURS_SECTIONS, sectionFlags, inTransaction, logChange, logRowChanges, getContractRow,
 };
