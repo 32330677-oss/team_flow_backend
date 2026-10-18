@@ -21,6 +21,7 @@
 
 const pool = require('../../config/db');
 const equipment = require('../equipmentIntegrationClient');
+const settingsCache = require('../settingsCache');
 
 const CACHE_MS = 60 * 1000;
 const cache = new Map();
@@ -314,6 +315,21 @@ function workersV2(siteIds, from, to, mode) {
  * attendance at all is recorded for that day (then the QC fills them).
  * @returns {Promise<{date, name, present, absent, total}[]>}
  */
+/**
+ * The weekly rest day of Team Flow on a date (read only): the day before
+ * attendance_week_start_day (Saturday by default -> Friday), like the daily gate.
+ */
+async function isRestDay(d) {
+  const ws = Number(await settingsCache.getSettingForDate('attendance_week_start_day', d, '6'));
+  const rest = ((Number.isInteger(ws) && ws >= 0 && ws <= 6 ? ws : 6) + 6) % 7;
+  return new Date(`${d}T00:00:00Z`).getUTCDay() === rest;
+}
+
+/**
+ * Staff per position each day: employed staff (total) and their attendance.
+ * On the weekly rest day only the staff who were recorded present that day are
+ * counted (nobody when nothing was recorded).
+ */
 function staffV2(from, to, mode) {
   if (from > to) return Promise.resolve([]);
   const key = `s2|${mode}|${from}|${to}`;
@@ -338,10 +354,15 @@ function staffV2(from, to, mode) {
     const out = [];
     for (let d = from; d <= to; d = nextDay(d)) {
       const dayAtt = attBy.get(d) || null;
+      const rest = await isRestDay(d);
       const byPos = new Map();
       for (const s of staff) {
         const employed = (!s.hire || s.hire <= d) && (s.term ? s.term >= d : s.status === 'Active');
         if (!employed) continue;
+        if (rest) {
+          const a = dayAtt ? dayAtt.get(Number(s.staff_id)) : null;
+          if (!a || !a.p) continue; // rest day: only who worked
+        }
         const name = posLabel(s.position);
         const k = norm(name);
         const o = byPos.get(k) || { date: d, name, total: 0, present: dayAtt ? 0 : null, absent: dayAtt ? 0 : null };
@@ -450,5 +471,5 @@ async function staffPositions() {
 
 module.exports = {
   manpowerDays, plantDays, plantPending, systemCounts, sourceOptions, cleanMap, hasSource, norm, clearCache,
-  COUNT_MODES, workersV2, staffV2, plantV2, sitesToday, staffPositions, posLabel, nextDay,
+  COUNT_MODES, workersV2, staffV2, isRestDay, plantV2, sitesToday, staffPositions, posLabel, nextDay,
 };

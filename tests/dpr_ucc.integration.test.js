@@ -132,6 +132,14 @@ function api(token) {
   };
 }
 
+const settingsCache = require('../services/settingsCache');
+/** Team Flow's weekly rest day = the weekday of `date` (setting attendance_week_start_day = the day after). */
+async function setRestDay(date) {
+  const dow = new Date(`${date}T00:00:00Z`).getUTCDay();
+  await q("INSERT INTO system_settings (setting_key, setting_value) VALUES ('attendance_week_start_day', ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)", [String((dow + 1) % 7)]);
+  await settingsCache.refresh();
+}
+
 let qc;
 let editor; // dpr.edit without dpr.override
 const admin = () => client(1, 'Admin');
@@ -151,6 +159,8 @@ test.before(async () => {
   process.env.EQUIPMENT_INTEGRATION_TOKEN = EQ_TOKEN;
   base = await startServer();
   await seedTeamFlow();
+  // the weekly rest day of Team Flow on a day no test uses (the dates move with today)
+  await setRestDay(d(-6));
   Sources.clearCache();
   const all = ['dpr.view', 'dpr.edit', 'dpr.override', 'dpr.registers', 'dpr.issue', 'dpr.revise', 'dpr.setup'];
   let r = await admin().post('/api/access/roles', { name: 'QC Manager', permissions: all });
@@ -608,4 +618,20 @@ test('U9 our design from the same data: weather details, HSE, plan; PDF / Excel 
   assert.ok((await read(before9.buf)).includes('Working at height'));
   assert.ok(!(await read(after9.buf)).includes('Changed later'));
   assert.deepEqual(await checksums(), before, 'Team Flow tables never written');
+});
+
+test('U10 the weekly rest day: staff counted only when recorded present that day', async () => {
+  await setRestDay(D3);
+  Sources.clearCache();
+  let r = await qc.get(day(C.c71, D3));
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  // D3: 881 present, 882 absent -> on a rest day only 881 counts
+  let se = rowOf(r.body.data.model, 'staff', 'SITE ENGINEER');
+  assert.deepEqual(vals(se, ['total', 'present']), ['1', '1']);
+  assert.equal(rowOf(r.body.data.model, 'staff', 'HSE OFFICER').cells.total.v, '0', 'not recorded on the rest day: not counted');
+  await setRestDay(d(-6));
+  Sources.clearCache();
+  r = await qc.get(day(C.c71, D3));
+  se = rowOf(r.body.data.model, 'staff', 'SITE ENGINEER');
+  assert.equal(se.cells.total.v, '2', 'a normal day: every employed staff member');
 });
