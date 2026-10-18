@@ -1,7 +1,7 @@
 -- =====================================================================
 -- Rollback of 2026_10_user_dpr (accounts of type "User" + roles + DPR).
 --
--- Removes ONLY what 01_ddl.sql added: the 19 new tables and the value 'User'
+-- Removes ONLY what 01_ddl.sql and 02_ucc_v2.sql added: the new tables and the value 'User'
 -- of users.role. Nothing else is touched.
 --
 -- Refuses, and changes NOTHING, while an account of type 'User' exists
@@ -23,7 +23,12 @@ BEGIN
   IF v_users > 0 THEN
     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Accounts of type User still exist (run 98_remove_user_accounts.sql first). Nothing changed.';
   END IF;
-  -- DPR (children first)
+  -- DPR v2 tables (02_ucc_v2.sql), then the DPR tables (children first)
+  DROP TABLE IF EXISTS dpr_activity_crews;
+  DROP TABLE IF EXISTS dpr_materials;
+  DROP TABLE IF EXISTS dpr_fixed_pages;
+  DROP TABLE IF EXISTS dpr_areas;
+  DROP TABLE IF EXISTS dpr_manual_values;
   DROP TABLE IF EXISTS dpr_reports;
   DROP TABLE IF EXISTS dpr_change_log;
   DROP TABLE IF EXISTS dpr_overrides;

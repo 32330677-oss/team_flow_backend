@@ -45,6 +45,7 @@ function resetDatabase({ migrate = true } = {}) {
     sh(`${MYSQL} ${DB_NAME} < migrations/2026_10_biometric_import_files/01_ddl.sql`);
     sh(`${MYSQL} ${DB_NAME} < migrations/2026_10_project_daily_report/01_ddl.sql`);
     sh(`${MYSQL} ${DB_NAME} < migrations/2026_10_user_dpr/01_ddl.sql`);
+    sh(`${MYSQL} ${DB_NAME} < migrations/2026_10_user_dpr/02_ucc_v2.sql`);
   }
 }
 

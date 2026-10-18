@@ -15,6 +15,9 @@ const C = require('./dprCommon');
 const M = require('./dprModel');
 const { renderDprPdf } = require('./dprPdf');
 const { renderDprXlsx } = require('./dprXlsx');
+const U = require('./dprUcc');
+const { renderUccPdf } = require('./dprUccPdf');
+const { renderUccXlsx } = require('./dprUccXlsx');
 
 const { DprError } = C;
 
@@ -29,7 +32,41 @@ async function photoBuffers(photos) {
   return out;
 }
 
+/** The files (photos, fixed pages) a client's-form report prints. */
+async function uccImages(model) {
+  const lay = model.layout || { sections: {} };
+  const photos = lay.sections.photos === false && lay.sections.areas === false ? [] : (model.photos || []);
+  const pages = lay.sections.cover === false ? [] : (model.fixed_pages || []);
+  const out = { photos: new Map(), pages: new Map() };
+  for (const p of photos) {
+    try { const b = await fileStorage.read(p.file_name); if (b) out.photos.set(p.photo_id, b); } catch (_) { /* empty frame */ }
+  }
+  for (const p of pages) {
+    try { const b = await fileStorage.read(p.file_name); if (b) out.pages.set(p.page_id, b); } catch (_) { /* skipped */ }
+  }
+  return out;
+}
+
+async function templateOf(contractId) {
+  const [[r]] = await pool.query('SELECT template FROM dpr_contracts WHERE contract_id = ?', [contractId]);
+  if (!r) throw new DprError('Contract not found.', 404);
+  return r.template === 'dpr' ? 'dpr' : 'ucc';
+}
+
+function uccFileName(model, meta, format) {
+  const code = String((model.contract && model.contract.code) || 'DPR').replace(/[^A-Za-z0-9_-]+/g, '_');
+  const d = model.header.report_date;
+  return `Daily_Report_${code}_${d}${meta.revision ? `_Rev${meta.revision}` : ''}${meta.issued ? '' : '_DRAFT'}.${format}`;
+}
+
 async function draftFiles(contractId, date, format) {
+  if ((await templateOf(contractId)) === 'ucc') {
+    const { model } = await U.buildUcc(contractId, date);
+    const meta = { revision: 0, issued: false };
+    const imgs = await uccImages(model);
+    const buf = format === 'xlsx' ? await renderUccXlsx(model, meta) : await renderUccPdf(model, meta, imgs);
+    return { buf, name: uccFileName(model, meta, format) };
+  }
   const { model } = await M.buildDay(contractId, date);
   const meta = { revision: 0, issued: false };
   const photos = model.sections.photos !== false ? await photoBuffers(model.photos) : new Map();
@@ -58,7 +95,8 @@ async function issue(contractId, date, body, userId, { revise = false } = {}) {
   const b = body || {};
   const notes = C.line(b.notes, 500, { label: 'Notes' });
   if (revise && (!notes || notes.length < 3)) throw new DprError('Write the reason of the revision.');
-  const { model } = await M.buildDay(contractId, date);
+  const template = await templateOf(contractId);
+  const { model } = template === 'ucc' ? await U.buildUcc(contractId, date) : await M.buildDay(contractId, date);
   if (!model.sources_ok.equipment && !C.bool(b.accept_missing_sources)) {
     throw new DprError('The equipment system did not answer: plant figures are missing. Try again later, or confirm to issue without them.', 409,
       { code: 'SOURCES_MISSING', warnings: model.warnings });
@@ -76,11 +114,11 @@ async function issue(contractId, date, body, userId, { revise = false } = {}) {
     if (revise && !current) throw new DprError('This day is not issued yet: issue it first.', 409);
     const revision = rows.length ? Number(rows[0].revision) + 1 : 0;
     if (current) await conn.query("UPDATE dpr_reports SET status = 'Superseded' WHERE report_id = ?", [current.report_id]);
-    const snapshot = { model, frozen_at: new Date().toISOString(), engine: 'dpr-1' };
+    const snapshot = { model, frozen_at: new Date().toISOString(), engine: template === 'ucc' ? 'ucc-1' : 'dpr-1' };
     const [ins] = await conn.query(
-      `INSERT INTO dpr_reports (contract_id, report_date, report_no, revision, status, snapshot, notes, issued_by_user_id)
-       VALUES (?, ?, ?, ?, 'Issued', ?, ?, ?)`,
-      [contractId, date, model.header.report_no, revision, JSON.stringify(snapshot), notes, userId]);
+      `INSERT INTO dpr_reports (contract_id, report_date, report_no, revision, status, snapshot, notes, issued_by_user_id, template, fingerprint)
+       VALUES (?, ?, ?, ?, 'Issued', ?, ?, ?, ?, ?)`,
+      [contractId, date, model.header.report_no, revision, JSON.stringify(snapshot), notes, userId, template, model.fingerprint || null]);
     await C.logChange(conn, { contractId, date, entity: 'report', entityId: ins.insertId, field: revise ? 'revised' : 'issued',
       oldValue: current ? `Rev.${current.revision}` : null, newValue: `${model.header.report_no} Rev.${revision}`, userId });
     const [[r]] = await conn.query(
@@ -120,6 +158,11 @@ async function reportFile(reportId, format) {
   if (!model) throw new DprError('This report has no saved data.', 500);
   const meta = { revision: report.revision, issued: true, issued_at: report.issued_at, issued_by: report.issued_by,
     printed_at: report.issued_at ? `${report.issued_at.replace(' ', 'T')}:00` : undefined };
+  if (model.template === 'ucc') {
+    const imgs = await uccImages(model);
+    const buf = format === 'xlsx' ? await renderUccXlsx(model, meta) : await renderUccPdf(model, meta, imgs);
+    return { buf, name: uccFileName(model, meta, format), report };
+  }
   const photos = model.sections && model.sections.photos === false ? new Map() : await photoBuffers(model.photos);
   const buf = format === 'xlsx' ? await renderDprXlsx(model, meta, photos) : await renderDprPdf(model, meta, photos);
   return { buf, name: fileName(model, meta, format), report };
@@ -127,6 +170,7 @@ async function reportFile(reportId, format) {
 
 /** Dashboard of the contract on a date + which of the last 30 days are issued. */
 async function dashboard(contractId, date) {
+  if ((await templateOf(contractId)) === 'ucc') return uccDashboard(contractId, date);
   const { model } = await M.buildDay(contractId, date);
   const from = model.dashboard.last_30_days[0].date;
   const [rows] = await pool.query(
@@ -160,4 +204,55 @@ async function dashboard(contractId, date) {
   };
 }
 
-module.exports = { draftFiles, issue, listReports, getReport, reportFile, dashboard };
+/** Dashboard of a client's-form contract: today's totals, BOQ progress, last 30 days. */
+async function uccDashboard(contractId, date) {
+  const { model } = await U.buildUcc(contractId, date);
+  const dn = Date.parse(`${date}T00:00:00Z`);
+  const from = new Date(dn - 29 * 86400000).toISOString().slice(0, 10);
+  const days = await U.series(contractId, from, date);
+  const [rows] = await pool.query(
+    `SELECT DATE_FORMAT(report_date, '%Y-%m-%d') AS d, MAX(revision) AS rev FROM dpr_reports
+      WHERE contract_id = ? AND report_date BETWEEN ? AND ? AND status = 'Issued' GROUP BY report_date`, [contractId, from, date]);
+  const issued = new Map(rows.map((r) => [r.d, Number(r.rev)]));
+  const [typedRows] = await pool.query(
+    `SELECT DATE_FORMAT(x.report_date, '%Y-%m-%d') AS d FROM (
+       SELECT report_date FROM dpr_days WHERE contract_id = ? AND report_date BETWEEN ? AND ?
+       UNION SELECT report_date FROM dpr_activities WHERE contract_id = ? AND report_date BETWEEN ? AND ? AND is_deleted = 0
+       UNION SELECT report_date FROM dpr_qa WHERE contract_id = ? AND report_date BETWEEN ? AND ? AND is_deleted = 0
+       UNION SELECT report_date FROM dpr_photos WHERE contract_id = ? AND report_date BETWEEN ? AND ? AND is_deleted = 0
+       UNION SELECT report_date FROM dpr_materials WHERE contract_id = ? AND report_date BETWEEN ? AND ? AND is_deleted = 0
+       UNION SELECT from_date FROM dpr_manual_values WHERE contract_id = ? AND from_date BETWEEN ? AND ? AND reverted_at IS NULL
+     ) x`, Array(6).fill([contractId, from, date]).flat());
+  const typed = new Set(typedRows.map((r) => r.d));
+  const boq = [];
+  for (const g of model.boq.groups) {
+    for (const r of g.rows) {
+      if (r.row_type !== 'item') continue;
+      const q = r.cells.qty.v !== null ? Number(r.cells.qty.v) : (r.cells.budget.v !== null ? Number(r.cells.budget.v) : null);
+      const cum = Number(r.cells.cum.v || 0);
+      boq.push({ group: g.name, item_no: r.item_no, description: r.description, unit: r.unit, qty: r.cells.qty.v, budget: r.cells.budget.v,
+        curr: r.cells.curr.v, cum: r.cells.cum.v, balance: r.cells.balance.v, pct: q ? cum / q : null, over: r.over });
+    }
+  }
+  const withQ = boq.filter((b) => b.pct !== null);
+  return {
+    template: 'ucc',
+    contract: model.contract,
+    date,
+    header: model.header,
+    today: {
+      staff: model.manpower.staff.total.total.v, trades: model.manpower.trades.total.total.v, manpower: model.manpower.grand.total.v,
+      present: model.manpower.grand.present.v, absent: model.manpower.grand.absent.v,
+      plant_operative: model.plant.plant.total.operative.v, plant_breakdown: model.plant.plant.total.breakdown.v, plant_idle: model.plant.plant.total.idle.v,
+      activities: model.activities.length, wir: model.wir.length, materials: model.materials.length, photos: model.photos.length,
+    },
+    boq,
+    boq_items_done: withQ.filter((b) => b.pct >= 1).length,
+    boq_items_started: withQ.filter((b) => b.pct > 0).length,
+    boq_items: boq.length,
+    days: days.map((d) => ({ ...d, status: issued.has(d.date) ? 'Issued' : (typed.has(d.date) ? 'Draft' : 'None'), revision: issued.has(d.date) ? issued.get(d.date) : null })),
+    warnings: model.warnings,
+  };
+}
+
+module.exports = { draftFiles, issue, listReports, getReport, reportFile, dashboard, uccImages };

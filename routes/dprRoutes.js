@@ -24,6 +24,7 @@ const DAY = '/contracts/:cid/days/:date';
 router.get('/options', VIEW, c.options);
 router.get('/source-options', SETUP, c.sourceOptions);
 router.get('/differences', VIEW, c.differences);
+router.get('/team-flow-today', VIEW, c.teamFlowToday);
 
 // contracts & setup
 router.get('/contracts', VIEW, c.listContracts);
@@ -41,6 +42,14 @@ router.put('/contracts/:cid/lines-order', SETUP, c.reorderLines);
 router.post('/contracts/:cid/boq', SETUP, c.saveBoq);
 router.put('/contracts/:cid/boq/:id', SETUP, c.saveBoq);
 router.post('/contracts/:cid/boq-import', SETUP, c.xlsxUpload, c.importBoq);
+router.put('/contracts/:cid/boq-order', SETUP, c.reorderBoq);
+router.delete('/contracts/:cid/boq/:id', SETUP, c.deleteBoq);
+router.post('/contracts/:cid/default-lines', SETUP, c.loadDefaultLines);
+router.post('/contracts/:cid/areas', SETUP, c.saveArea);
+router.put('/contracts/:cid/areas/:id', SETUP, c.saveArea);
+router.post('/contracts/:cid/fixed-pages', SETUP, c.photoUpload, c.addFixedPage);
+router.put('/contracts/:cid/fixed-pages/:id', SETUP, c.updateFixedPage);
+router.get('/contracts/:cid/fixed-pages/:id/file', VIEW, c.fixedPageFile);
 
 // dashboard, archive, registers
 router.get('/contracts/:cid/dashboard', VIEW, c.dashboard);
@@ -64,6 +73,14 @@ router.get(`${DAY}/overrides/:lineId`, VIEW, c.overrideHistory);
 router.post(`${DAY}/activities`, EDIT, c.saveActivity);
 router.put(`${DAY}/activities/:id`, EDIT, c.saveActivity);
 router.delete(`${DAY}/activities/:id`, EDIT, c.deleteActivity);
+router.put(`${DAY}/activities-order`, EDIT, c.reorderActivities);
+router.post(`${DAY}/materials`, EDIT, c.saveMaterial);
+router.put(`${DAY}/materials/:id`, EDIT, c.saveMaterial);
+router.delete(`${DAY}/materials/:id`, EDIT, c.deleteMaterial);
+router.put(`${DAY}/manual`, EDIT, c.setManual);
+router.post(`${DAY}/manual/preview`, VIEW, c.previewManual);
+router.post(`${DAY}/manual/revert`, EDIT, c.revertManual);
+router.get(`${DAY}/manual/history`, VIEW, c.manualHistory);
 router.post(`${DAY}/qa`, EDIT, c.saveQa);
 router.put(`${DAY}/qa/:id`, EDIT, c.saveQa);
 router.delete(`${DAY}/qa/:id`, EDIT, c.deleteQa);

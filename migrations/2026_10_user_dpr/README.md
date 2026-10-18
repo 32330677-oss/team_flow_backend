@@ -16,7 +16,10 @@ read-only API (`/api/integration/*`).
 |---|---|
 | `01_ddl.sql` | Installs everything. Idempotent: running it twice changes nothing. |
 | `98_remove_user_accounts.sql` | OPTIONAL, before a rollback: deletes the accounts of type `User` (and only them). All or nothing. |
-| `99_rollback.sql` | Removes the 19 tables and the value `'User'`. Refuses (changes nothing) while a `User` account exists. |
+| `02_ucc_v2.sql` | DPR v2 (the client's form UCC-IMS-CM-3003A + full control of the QC). Run AFTER `01_ddl.sql`. Adds columns to `dpr_*` tables and 5 new `dpr_*` tables (manual values with scope, areas, crews, materials, fixed pages). Idempotent. |
+| `92_rollback_v2.sql` | Removes only what `02_ucc_v2.sql` added. Refuses while staff / tool rows or activities without BOQ item exist. |
+| `97_reset_dpr_test_data.sql` | OPTIONAL: clears the DPR test data (A: daily data only, B: everything). Works before and after `02`. |
+| `99_rollback.sql` | Removes all the DPR / roles tables (v2 included) and the value `'User'`. Refuses (changes nothing) while a `User` account exists. |
 
 ## Install (Aiven)
 
@@ -24,6 +27,13 @@ read-only API (`/api/integration/*`).
    `mysqldump -h HOST -P PORT -u avnadmin -p --single-transaction --routines defaultdb > backup_before_user_dpr.sql`
 2. `mysql -h HOST -P PORT -u avnadmin -p defaultdb < 01_ddl.sql`
 3. Check: `SHOW TABLES LIKE 'dpr%';` (15 rows) and `SHOW TABLES LIKE 'app%';` (4 rows).
+
+## Install v2 (after 01 is installed)
+
+1. Backup (as above).
+2. `mysql -h HOST -P PORT -u avnadmin -p defaultdb < 02_ucc_v2.sql`
+3. Check: `SHOW TABLES LIKE 'dpr%';` (20 rows) and `SHOW COLUMNS FROM dpr_contracts LIKE 'template';` (1 row).
+4. Optional: `97_reset_dpr_test_data.sql` to clear the test days (keeps the setup).
 
 ## Rollback
 

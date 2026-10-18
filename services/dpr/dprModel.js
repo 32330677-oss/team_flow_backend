@@ -150,7 +150,7 @@ async function loadInput(contractId, date) {
 
   const [acts] = await pool.query(
     `SELECT a.activity_id, DATE_FORMAT(a.report_date, '%Y-%m-%d') AS d, a.sort_order, a.boq_id, a.location, a.qty, a.remarks
-       FROM dpr_activities a WHERE a.contract_id = ? AND a.report_date <= ? AND a.is_deleted = 0
+       FROM dpr_activities a WHERE a.contract_id = ? AND a.report_date <= ? AND a.is_deleted = 0 AND a.boq_id IS NOT NULL
       ORDER BY a.report_date, a.sort_order, a.activity_id`, [cid, date]);
   const [alloc] = await pool.query(
     `SELECT al.activity_id, al.line_id, al.count_value FROM dpr_activity_alloc al

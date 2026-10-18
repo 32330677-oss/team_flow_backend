@@ -120,7 +120,8 @@ async function plantPending(siteIds, date) {
 
 /**
  * A line's source map, cleaned:
- *   { tf: ['Steel Fixer', ...], eq: [{ type: 'Excavator', vendor: 'Al Waha' | null }, ...] }
+ *   { tf: ['Steel Fixer', ...], sp: ['SITE ENGINEER', ...] (staff positions, v2),
+ *     eq: [{ type: 'Excavator', vendor: 'Al Waha' | null }, ...] }
  */
 function cleanMap(raw) {
   let m = raw;
@@ -128,11 +129,16 @@ function cleanMap(raw) {
     try { m = JSON.parse(m); } catch (_) { m = null; }
   }
   const tf = [];
+  const sp = [];
   const eq = [];
   if (m && typeof m === 'object') {
     for (const x of Array.isArray(m.tf) ? m.tf : []) {
       const s = String(x || '').trim().replace(/\s+/g, ' ').slice(0, 100);
       if (s && !tf.some((y) => norm(y) === norm(s))) tf.push(s);
+    }
+    for (const x of Array.isArray(m.sp) ? m.sp : []) {
+      const s = String(x || '').trim().replace(/\s+/g, ' ').slice(0, 100);
+      if (s && !sp.some((y) => norm(y) === norm(s))) sp.push(s);
     }
     for (const x of Array.isArray(m.eq) ? m.eq : []) {
       const type = String((x && x.type) || '').trim().slice(0, 100);
@@ -140,10 +146,10 @@ function cleanMap(raw) {
       if (type && !eq.some((y) => norm(y.type) === norm(type) && norm(y.vendor) === norm(vendor))) eq.push({ type, vendor });
     }
   }
-  return { tf, eq };
+  return sp.length ? { tf, sp, eq } : { tf, eq };
 }
 
-const hasSource = (m) => m.tf.length > 0 || m.eq.length > 0;
+const hasSource = (m) => m.tf.length > 0 || m.eq.length > 0 || (m.sp || []).length > 0;
 
 /**
  * System counts per day and line.
@@ -244,4 +250,205 @@ async function sourceOptions({ tfSiteIds = [] } = {}) {
   };
 }
 
-module.exports = { manpowerDays, plantDays, plantPending, systemCounts, sourceOptions, cleanMap, hasSource, norm, clearCache };
+// =====================================================================
+// v2 (the client's form): Total / Present / Absent per position, staff from
+// the staff list, plant as Operative / Breakdown / Idle, people per site.
+// COUNTS ONLY: no name, no salary, nothing personal leaves these functions.
+// =====================================================================
+const COUNT_MODES = ['recorded', 'checked_in', 'approved'];
+const ABSENT_STATES = ['Absent', 'Sick', 'Vacation', 'Holiday'];
+
+/**
+ * SQL pieces of the counting mode:
+ *   recorded   = any attendance record of the day (Draft, Submitted, Approved; not Rejected)
+ *   checked_in = as recorded, but "Present" needs a check-in time
+ *   approved   = only approved records
+ */
+function modeSql(mode, a) {
+  const m = COUNT_MODES.includes(mode) ? mode : 'recorded';
+  const present = m === 'checked_in'
+    ? `(${a}.attendance_status = 'Present' AND ${a}.check_in_time IS NOT NULL)`
+    : `${a}.attendance_status = 'Present'`;
+  const status = m === 'approved' ? `${a}.status = 'Approved'` : `${a}.status <> 'Rejected'`;
+  return { present, absent: `${a}.attendance_status IN ('Absent','Sick','Vacation','Holiday')`, status };
+}
+
+/**
+ * Workers per day and position on the given sites: a worker is PRESENT if one of his
+ * records of the day is present, otherwise ABSENT if one is absent / sick / vacation /
+ * holiday. Counted once a day (two shifts = one person). Total = present + absent.
+ * @returns {Promise<{date, name, present, absent, total}[]>}
+ */
+function workersV2(siteIds, from, to, mode) {
+  if (!siteIds.length || from > to) return Promise.resolve([]);
+  const key = `w2|${mode}|${[...siteIds].sort((a, b) => a - b).join(',')}|${from}|${to}`;
+  return cached(key, async () => {
+    const q = modeSql(mode, 'a');
+    const [rows] = await pool.query(
+      `SELECT x.d, x.pos, SUM(x.p) AS present, SUM(CASE WHEN x.p = 0 AND x.ab = 1 THEN 1 ELSE 0 END) AS absent
+         FROM (SELECT DATE_FORMAT(a.record_date, '%Y-%m-%d') AS d, a.worker_id, w.job_position AS pos,
+                      MAX(CASE WHEN ${q.present} THEN 1 ELSE 0 END) AS p,
+                      MAX(CASE WHEN ${q.absent} THEN 1 ELSE 0 END) AS ab
+                 FROM attendance a JOIN workers w ON w.worker_id = a.worker_id
+                WHERE a.site_id IN (?) AND a.record_date BETWEEN ? AND ? AND ${q.status}
+                GROUP BY d, a.worker_id, w.job_position) x
+        GROUP BY x.d, x.pos`, [siteIds, from, to]);
+    const out = new Map();
+    for (const r of rows) {
+      const name = posLabel(r.pos);
+      const k = `${r.d}|${norm(name)}`;
+      const o = out.get(k) || { date: r.d, name, present: 0, absent: 0, total: 0 };
+      o.present += Number(r.present);
+      o.absent += Number(r.absent);
+      o.total = o.present + o.absent;
+      out.set(k, o);
+    }
+    return [...out.values()];
+  });
+}
+
+/**
+ * Staff per day and position (staff have no site: the whole staff list is read).
+ * Total = staff employed that day (hired, not terminated, not inactive).
+ * Present / absent = from the staff attendance of the day; null when no staff
+ * attendance at all is recorded for that day (then the QC fills them).
+ * @returns {Promise<{date, name, present, absent, total}[]>}
+ */
+function staffV2(from, to, mode) {
+  if (from > to) return Promise.resolve([]);
+  const key = `s2|${mode}|${from}|${to}`;
+  return cached(key, async () => {
+    const [staff] = await pool.query(
+      `SELECT staff_id, position, DATE_FORMAT(hire_date, '%Y-%m-%d') AS hire, DATE_FORMAT(termination_date, '%Y-%m-%d') AS term, status
+         FROM staff_members WHERE status <> 'Inactive'`);
+    const q = modeSql(mode, 'sa');
+    const [att] = await pool.query(
+      `SELECT DATE_FORMAT(sa.record_date, '%Y-%m-%d') AS d, sa.staff_id,
+              MAX(CASE WHEN ${q.present} THEN 1 ELSE 0 END) AS p,
+              MAX(CASE WHEN ${q.absent} THEN 1 ELSE 0 END) AS ab
+         FROM staff_attendance sa
+        WHERE sa.record_date BETWEEN ? AND ? AND ${q.status}
+        GROUP BY d, sa.staff_id`, [from, to]);
+    const attBy = new Map();
+    for (const r of att) {
+      const m = attBy.get(r.d) || new Map();
+      m.set(Number(r.staff_id), { p: Number(r.p), ab: Number(r.ab) });
+      attBy.set(r.d, m);
+    }
+    const out = [];
+    for (let d = from; d <= to; d = nextDay(d)) {
+      const dayAtt = attBy.get(d) || null;
+      const byPos = new Map();
+      for (const s of staff) {
+        const employed = (!s.hire || s.hire <= d) && (s.term ? s.term >= d : s.status === 'Active');
+        if (!employed) continue;
+        const name = posLabel(s.position);
+        const k = norm(name);
+        const o = byPos.get(k) || { date: d, name, total: 0, present: dayAtt ? 0 : null, absent: dayAtt ? 0 : null };
+        o.total += 1;
+        if (dayAtt) {
+          const a = dayAtt.get(Number(s.staff_id));
+          if (a && a.p) o.present += 1;
+          else if (a && a.ab) o.absent += 1;
+        }
+        byPos.set(k, o);
+      }
+      out.push(...byPos.values());
+    }
+    return out;
+  });
+}
+
+function nextDay(d) {
+  const t = new Date(`${d}T00:00:00Z`);
+  t.setUTCDate(t.getUTCDate() + 1);
+  return t.toISOString().slice(0, 10);
+}
+
+/**
+ * Machines per day, type and vendor: Operative (Working), Breakdown, Idle (Standby).
+ * @returns {Promise<{ok, error?, rows: {date, type_name, vendor_name, operative, breakdown, idle}[]}>}
+ */
+async function plantV2(siteIds, from, to) {
+  const r = await plantDays(siteIds, from, to);
+  return {
+    ok: r.ok,
+    error: r.error,
+    rows: (r.rows || []).map((x) => ({
+      date: x.date, type_name: x.type_name, vendor_name: x.vendor_name,
+      operative: Number(x.working) || 0, breakdown: Number(x.breakdown) || 0, idle: Number(x.standby) || 0,
+    })),
+  };
+}
+
+/**
+ * Workers of the day on EVERY Team Flow site (counts only), for the QC's check:
+ * assigned, present, absent, not recorded yet - per site and shift.
+ */
+async function sitesToday(date, mode) {
+  const q = modeSql(mode, 'a');
+  const [sites] = await pool.query(
+    `SELECT site_id, site_name, site_status FROM sites ORDER BY site_status = 'Active' DESC, site_name`);
+  const assignedSql = (by) => `SELECT site_id${by ? ', shift_type' : ''}, COUNT(DISTINCT worker_id) AS n FROM workersiteassignments
+      WHERE assigned_date <= ? AND (unassigned_date IS NULL OR unassigned_date >= ?)
+      GROUP BY site_id${by ? ', shift_type' : ''}`;
+  const attSql = (by) => `SELECT x.site_id${by ? ', x.shift_type' : ''}, SUM(x.p) AS present,
+            SUM(CASE WHEN x.p = 0 AND x.ab = 1 THEN 1 ELSE 0 END) AS absent, COUNT(*) AS recorded
+       FROM (SELECT a.site_id${by ? ', a.shift_type' : ''}, a.worker_id,
+                    MAX(CASE WHEN ${q.present} THEN 1 ELSE 0 END) AS p,
+                    MAX(CASE WHEN ${q.absent} THEN 1 ELSE 0 END) AS ab
+               FROM attendance a WHERE a.record_date = ? AND ${q.status}
+              GROUP BY a.site_id${by ? ', a.shift_type' : ''}, a.worker_id) x
+      GROUP BY x.site_id${by ? ', x.shift_type' : ''}`;
+  const [[asgShift], [asgSite], [attShift], [attSite]] = await Promise.all([
+    pool.query(assignedSql(true), [date, date]), pool.query(assignedSql(false), [date, date]),
+    pool.query(attSql(true), [date]), pool.query(attSql(false), [date]),
+  ]);
+  const key = (s, sh) => `${s}|${sh}`;
+  const asg = new Map(asgShift.map((r) => [key(r.site_id, r.shift_type), Number(r.n)]));
+  const at = new Map(attShift.map((r) => [key(r.site_id, r.shift_type), r]));
+  const asgS = new Map(asgSite.map((r) => [Number(r.site_id), Number(r.n)]));
+  const atS = new Map(attSite.map((r) => [Number(r.site_id), r]));
+  const nums = (a, n) => {
+    const present = a ? Number(a.present) : 0;
+    const absent = a ? Number(a.absent) : 0;
+    const recorded = a ? Number(a.recorded) : 0;
+    return { assigned: n, present, absent, recorded, not_recorded: Math.max(n - recorded, 0) };
+  };
+  const out = [];
+  for (const s of sites) {
+    const shifts = [];
+    for (const sh of ['Day', 'Night']) {
+      const a = at.get(key(s.site_id, sh));
+      const n = asg.get(key(s.site_id, sh)) || 0;
+      if (!a && !n) continue;
+      shifts.push({ shift: sh, ...nums(a, n) });
+    }
+    if (!shifts.length && s.site_status !== 'Active') continue;
+    // the site's own figures count each person once (two shifts = one person)
+    out.push({ site_id: Number(s.site_id), site_name: s.site_name, status: s.site_status, shifts,
+      ...nums(atS.get(Number(s.site_id)), asgS.get(Number(s.site_id)) || 0) });
+  }
+  return out;
+}
+
+/** Staff positions with the number of staff employed now (counts only). */
+async function staffPositions() {
+  const [rows] = await pool.query(
+    `SELECT position AS pos, COUNT(*) AS n FROM staff_members
+      WHERE status = 'Active' AND (termination_date IS NULL OR termination_date >= CURDATE())
+      GROUP BY position`);
+  const m = new Map();
+  for (const r of rows) {
+    const name = posLabel(r.pos);
+    const o = m.get(norm(name)) || { name, staff: 0 };
+    o.staff += Number(r.n);
+    m.set(norm(name), o);
+  }
+  return [...m.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+module.exports = {
+  manpowerDays, plantDays, plantPending, systemCounts, sourceOptions, cleanMap, hasSource, norm, clearCache,
+  COUNT_MODES, workersV2, staffV2, plantV2, sitesToday, staffPositions, posLabel, nextDay,
+};

@@ -14,6 +14,7 @@ const Setup = require('../services/dpr/dprSetup');
 const Day = require('../services/dpr/dprDay');
 const Reports = require('../services/dpr/dprReports');
 const Sources = require('../services/dpr/dprSources');
+const MV = require('../services/dpr/dprManual');
 
 const PDF = 'application/pdf';
 const XLSX = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
@@ -93,8 +94,21 @@ exports.options = wrap('options', async (req, res) => ok(res, {
 }));
 exports.sourceOptions = wrap('sourceOptions', async (req, res) => {
   const ids = String(req.query.tf_site_ids || '').split(',').map(Number).filter((n) => Number.isInteger(n) && n > 0);
-  return ok(res, await Sources.sourceOptions({ tfSiteIds: ids }));
+  const [opts, staff] = await Promise.all([Sources.sourceOptions({ tfSiteIds: ids }), Sources.staffPositions()]);
+  return ok(res, { ...opts, sp_positions: staff });
 });
+/** Workers of the day on every Team Flow site (counts only). */
+exports.teamFlowToday = wrap('teamFlowToday', async (req, res) => {
+  const d = C.date(req.query.date, { label: 'date' }) || businessToday();
+  if (d > businessToday()) throw new C.DprError('The date cannot be in the future.');
+  let mode = C.oneOf(req.query.mode, Sources.COUNT_MODES, { label: 'mode' });
+  if (!mode && req.query.contract_id) {
+    const c = (await Setup.listContracts()).find((x) => x.contract_id === C.id(req.query.contract_id, 'contract'));
+    mode = c ? c.count_mode : null;
+  }
+  return ok(res, { date: d, mode: mode || 'recorded', sites: await Sources.sitesToday(d, mode || 'recorded') });
+});
+const perms = (req) => (req.access && req.access.permissions) || [];
 
 // ------------------------------------------------------------------ contracts & setup
 exports.listContracts = wrap('listContracts', async (req, res) => ok(res, await Setup.listContracts()));
@@ -110,6 +124,26 @@ exports.saveLine = wrap('saveLine', async (req, res) => ok(res, await Setup.save
 exports.setLineActive = wrap('setLineActive', async (req, res) => ok(res, await Setup.setLineActive(cid(req), C.id(req.params.id), C.bool((req.body || {}).is_active), uid(req))));
 exports.reorderLines = wrap('reorderLines', async (req, res) => ok(res, await Setup.reorderLines(cid(req), (req.body || {}).kind, (req.body || {}).line_ids, uid(req))));
 
+exports.loadDefaultLines = wrap('loadDefaultLines', async (req, res) => ok(res, await Setup.loadDefaultLines(cid(req), (req.body || {}).kinds, uid(req))));
+exports.reorderBoq = wrap('reorderBoq', async (req, res) => ok(res, await Setup.reorderBoq(cid(req), (req.body || {}).boq_ids, uid(req))));
+exports.deleteBoq = wrap('deleteBoq', async (req, res) => ok(res, await Setup.deleteBoqRow(cid(req), C.id(req.params.id), uid(req))));
+exports.saveArea = wrap('saveArea', async (req, res) => ok(res, await Setup.saveArea(cid(req), req.params.id ? C.id(req.params.id) : null, req.body, uid(req)), req.params.id ? 200 : 201));
+exports.addFixedPage = wrap('addFixedPage', async (req, res) => {
+  const contractId = cid(req);
+  if (!req.file || !req.file.buffer || !req.file.buffer.length) throw new C.DprError('Choose a picture (JPG or PNG).');
+  const ext = path.extname(req.file.originalname || '').toLowerCase();
+  const type = (IMAGE_TYPES[ext] || ['image/jpeg'])[0];
+  if (type === 'image/webp') throw new C.DprError('Use a JPG or PNG picture for printed pages.');
+  const name = await fileStorage.save(fileStorage.newName('dpr_page', req.file.originalname), req.file.buffer, type);
+  return ok(res, await Setup.addFixedPage(contractId, name, type, req.body, uid(req)), 201);
+});
+exports.updateFixedPage = wrap('updateFixedPage', async (req, res) => ok(res, await Setup.updateFixedPage(cid(req), C.id(req.params.id), req.body, uid(req))));
+exports.fixedPageFile = wrap('fixedPageFile', async (req, res) => {
+  const p = await Setup.fixedPageFile(cid(req), C.id(req.params.id));
+  const sent = await fileStorage.send(res, p.file_name);
+  if (!sent && !res.headersSent) return res.status(404).json({ status: 'error', message: 'File not found.' });
+  return undefined;
+});
 exports.saveBoq = wrap('saveBoq', async (req, res) => ok(res, await Setup.saveBoq(cid(req), req.params.id ? C.id(req.params.id) : null, req.body, uid(req)), req.params.id ? 200 : 201));
 exports.importBoq = wrap('importBoq', async (req, res) => {
   if (!req.file || !req.file.buffer || !req.file.buffer.length) throw new C.DprError('Choose the BOQ Excel file.');
@@ -136,6 +170,18 @@ exports.history = wrap('history', async (req, res) => ok(res, await Day.history(
 
 exports.saveActivity = wrap('saveActivity', async (req, res) => ok(res, await Day.saveActivity(cid(req), dateParam(req), req.params.id ? C.id(req.params.id) : null, req.body, uid(req)), req.params.id ? 200 : 201));
 exports.deleteActivity = wrap('deleteActivity', async (req, res) => { await Day.deleteActivity(cid(req), dateParam(req), C.id(req.params.id), uid(req)); return ok(res, null); });
+exports.reorderActivities = wrap('reorderActivities', async (req, res) => ok(res, await Day.reorderActivities(cid(req), dateParam(req), (req.body || {}).activity_ids, uid(req))));
+exports.saveMaterial = wrap('saveMaterial', async (req, res) => ok(res, await Day.saveMaterial(cid(req), dateParam(req), req.params.id ? C.id(req.params.id) : null, req.body, uid(req)), req.params.id ? 200 : 201));
+exports.deleteMaterial = wrap('deleteMaterial', async (req, res) => { await Day.deleteMaterial(cid(req), dateParam(req), C.id(req.params.id), uid(req)); return ok(res, null); });
+// manual values (client's form)
+exports.setManual = wrap('setManual', async (req, res) => ok(res, await Day.setManual(cid(req), dateParam(req), req.body, uid(req), perms(req))));
+exports.previewManual = wrap('previewManual', async (req, res) => ok(res, await Day.previewManual(cid(req), dateParam(req), req.body, businessToday())));
+exports.revertManual = wrap('revertManual', async (req, res) => ok(res, await Day.revertManual(cid(req), dateParam(req), req.body, uid(req), perms(req))));
+exports.manualHistory = wrap('manualHistory', async (req, res) => {
+  const key = String(req.query.key || '');
+  if (!MV.KEY_RE.test(key)) throw new C.DprError('Unknown figure.');
+  return ok(res, await MV.historyOf(cid(req), key));
+});
 exports.saveQa = wrap('saveQa', async (req, res) => ok(res, await Day.saveQa(cid(req), dateParam(req), req.params.id ? C.id(req.params.id) : null, req.body, uid(req)), req.params.id ? 200 : 201));
 exports.deleteQa = wrap('deleteQa', async (req, res) => { await Day.deleteQa(cid(req), dateParam(req), C.id(req.params.id), uid(req)); return ok(res, null); });
 

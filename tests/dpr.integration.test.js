@@ -164,15 +164,15 @@ test.after(async () => {
 test('D1 contracts are data: created by the role holder, each one independent; Admin reads only', async () => {
   let r = await admin().post('/api/dpr/contracts', { code: '99', title: 'x' });
   assert.equal(r.status, 403, 'Admin cannot set up (dpr.view only)');
-  r = await qc.post('/api/dpr/contracts', { code: '71', title: 'T2 above ground', commencement_date: D0, original_completion: d(300),
+  r = await qc.post('/api/dpr/contracts', { template: 'dpr', code: '71', title: 'T2 above ground', commencement_date: D0, original_completion: d(300),
     contract_value: '1000000', hrs_mp: '10', hrs_pl: '8', tf_site_ids: [70], eq_site_ids: [8], company_name: 'ASIK', project_name: 'T2' });
   assert.equal(r.status, 201, JSON.stringify(r.body));
   C.c71 = r.body.data.contract_id;
-  r = await qc.post('/api/dpr/contracts', { code: '26', title: 'T2 underground', commencement_date: D0, hrs_mp: '10', hrs_pl: '10', tf_site_ids: [70], eq_site_ids: [8] });
+  r = await qc.post('/api/dpr/contracts', { template: 'dpr', code: '26', title: 'T2 underground', commencement_date: D0, hrs_mp: '10', hrs_pl: '10', tf_site_ids: [70], eq_site_ids: [8] });
   C.c26 = r.body.data.contract_id;
-  r = await qc.post('/api/dpr/contracts', { code: '59', title: 'Bridges', commencement_date: D0, tf_site_ids: [71] });
+  r = await qc.post('/api/dpr/contracts', { template: 'dpr', code: '59', title: 'Bridges', commencement_date: D0, tf_site_ids: [71] });
   C.c59 = r.body.data.contract_id;
-  r = await qc.post('/api/dpr/contracts', { code: '71', title: 'dup' });
+  r = await qc.post('/api/dpr/contracts', { template: 'dpr', code: '71', title: 'dup' });
   assert.equal(r.status, 409);
   await qc.put(`/api/dpr/contracts/${C.c71}`, { copy_from_ids: [C.c26, C.c71] });
   r = await qc.put(`/api/dpr/contracts/${C.c26}`, { copy_from_ids: [C.c71] });
@@ -215,7 +215,7 @@ test('D2 setup: lines mapped to system names (a name counts on one line only), B
   const buf = Buffer.from(await wb.xlsx.writeBuffer());
   r = await qc.upload(`/api/dpr/contracts/${C.c71}/boq-import`, 'file', buf, 'boq.xlsx');
   assert.equal(r.status, 200, JSON.stringify(r.body));
-  assert.deepEqual(r.body.data, { added: 2, updated: 0, total: 2 });
+  assert.deepEqual(r.body.data, { added: 2, updated: 0, headings: 0, total: 2 });
   r = await qc.get(`/api/dpr/contracts/${C.c71}`);
   assert.equal(r.body.data.boq.length, 2);
   assert.equal(r.body.data.boq[1].contract_qty, '50.5000');
