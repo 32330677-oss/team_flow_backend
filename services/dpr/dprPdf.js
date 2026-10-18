@@ -437,17 +437,19 @@ function sSignatures(k, y, m) {
   return y + 80;
 }
 
-function sPhotos(k, m, photoBuffers) {
+function sPhotos(k, m, photoBuffers, { placeholders = true } = {}) {
   const doc = k.doc;
   const photos = (m.photos || []).slice().sort((a, b) => a.slot - b.slot);
   const perPage = 6;
   const pages = Math.max(1, Math.ceil(photos.length / perPage));
+  // our design: only the photos taken (no empty "PHOTO n" frames)
+  const slots = (p) => (placeholders ? perPage : Math.min(perPage, photos.length - p * perPage));
   for (let p = 0; p < pages; p += 1) {
     doc.addPage();
     let y = k.section(k.top, p === 0 ? '11.  SITE PHOTOGRAPHS' : '11.  SITE PHOTOGRAPHS (continued)');
     const fw = (k.W - 6) / 2;
     const fh = 205;
-    for (let i = 0; i < perPage; i += 1) {
+    for (let i = 0; i < slots(p); i += 1) {
       const ph = photos[p * perPage + i];
       const col = i % 2;
       const row = Math.floor(i / 2);
@@ -763,7 +765,7 @@ function renderOursBody(k, m, photoBuffers) {
   // photos already printed on an area page are not printed again
   const onAreas = new Set(areas.flatMap((a) => a.photos || []));
   const rest = (m.photos || []).filter((p) => !onAreas.has(p.photo_id));
-  if (show('photos') && rest.length) sPhotos(k, { ...m, photos: rest }, photoBuffers);
+  if (show('photos') && rest.length) sPhotos(k, { ...m, photos: rest }, photoBuffers, { placeholders: false });
   return y;
 }
 
