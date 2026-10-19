@@ -1283,8 +1283,6 @@ async function exportStaffPayrollPdf(req, res) {
 
         let totalWorked = 0;
         let totalPaidHours = 0;
-        const periodNotes = [];
-        const leaveNotes = [];
         rows.forEach((r, index) => {
             const partial = isPartialPeriod(r, batch);
             const from = exportDateOnly(r.employed_from);
@@ -1298,14 +1296,6 @@ async function exportStaffPayrollPdf(req, res) {
                 // One line per period, then the total, in the employee's own cells.
                 paidCell = [...pb.periods.map((p) => fmt(p.paid_hours)), `= ${fmt(pb.paid)}`].join('\n');
                 rateCell = [...pb.periods.map((p) => Number(p.hourly_rate).toFixed(RATE_DIGITS)), ''].join('\n');
-                periodNotes.push(`${r.staff_unique_id} ${r.full_name}: ` + pb.periods.map((p) =>
-                    `${periodLabel(p)}: ${fmt(p.paid_hours)} h x ${Number(p.hourly_rate).toFixed(RATE_DIGITS)} = ${amount(p.amount)}`
-                ).join('   +   ') + `   =   ${amount(pb.periods.reduce((t, p) => t + Number(p.amount), 0))} ${currency}`);
-            }
-            if (pb.has && (pb.paidLeave || pb.excess)) {
-                leaveNotes.push(`${r.staff_unique_id} ${r.full_name}:` +
-                    (pb.paidLeave ? ` paid-leave hours ${fmt(pb.paidLeave)}` : '') +
-                    (pb.excess ? ` | hours above daily standard ${fmt(pb.excess)}` : ''));
             }
             const values = {
                 no: index + 1,
@@ -1355,14 +1345,8 @@ async function exportStaffPayrollPdf(req, res) {
                 'Paid Hrs = Required Hrs - shortage not covered by overtime = Worked Hrs - (OT Earned - OT Used) + paid-leave hours - hours above the daily standard.',
                 'Unused overtime (OT Earned - OT Used) is not paid in the salary: it only covers shortage on worked days.',
             ];
-            if (periodNotes.length) {
-                lines.push('Salary or daily hours changed inside the period: one line per period in Paid Hrs / Hourly Rate, each period at its own rate:');
-                periodNotes.forEach((n) => lines.push(`   ${n}`));
-            }
-            if (leaveNotes.length) {
-                lines.push('Paid-leave hours (credited as standard hours) and hours above the daily standard:');
-                leaveNotes.forEach((n) => lines.push(`   ${n}`));
-            }
+            lines.push('When the salary or the daily hours changed inside the period, Paid Hrs and Hourly Rate show one line per period; '
+                + 'each period is paid at its own rate and the periods add up to the total.');
             y += 8;
             lines.forEach((line, i) => {
                 if (y > doc.page.height - doc.page.margins.bottom - 12) { doc.addPage(); y = doc.page.margins.top; }
