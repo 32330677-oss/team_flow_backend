@@ -1102,27 +1102,28 @@ async function exportStaffPayrollPdf(req, res) {
         const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
 
         // Total width must stay <= 770pt (printable width of landscape A4).
+        // Header labels carry their own line breaks so no word is cut.
         const columns = [
             { key: 'no', label: 'No.', width: 18 },
             { key: 'staff_id', label: 'Staff ID', width: 40 },
-            { key: 'full_name', label: 'Full Name', width: 70, align: 'left' },
-            { key: 'position', label: 'Position', width: 40, align: 'left' },
-            { key: 'monthly_salary', label: `Monthly Salary (${currency})`, width: 46 },
+            { key: 'full_name', label: 'Full Name', width: 70, align: 'left', fit: true },
+            { key: 'position', label: 'Position', width: 46, align: 'left', fit: true },
+            { key: 'monthly_salary', label: `Monthly\nSalary (${currency})`, width: 46 },
             { key: 'employed', label: 'Employed', width: 46, wrap: true },
-            { key: 'prorated_base', label: `Prorated Base (${currency})`, width: 46 },
-            { key: 'present_days', label: 'Present Days', width: 28 },
-            { key: 'paid_leave_days', label: 'Paid Leave', width: 28 },
-            { key: 'mgmt_paid_days', label: 'Mgmt-Paid Absence', width: 32 },
-            { key: 'unpaid_absence_days', label: 'Unpaid Absence', width: 32 },
-            { key: 'worked_hours', label: 'Worked Hrs', width: 34 },
-            { key: 'required_hours', label: 'Required Hrs', width: 34 },
-            { key: 'ot_earned_hours', label: 'OT Earned', width: 32 },
-            { key: 'ot_used_hours', label: 'OT Used', width: 30 },
-            { key: 'shortage_hours', label: 'Shortage Hrs', width: 32 },
-            { key: 'paid_hours', label: 'Paid Hrs', width: 36, wrap: true },
-            { key: 'hourly_rate', label: `Hourly Rate (${currency})`, width: 40, wrap: true },
-            { key: 'advance', label: `Advance Deduction (${currency})`, width: 38 },
-            { key: 'net_salary', label: `Net Salary (${currency})`, width: 48 },
+            { key: 'prorated_base', label: `Prorated\nBase (${currency})`, width: 46 },
+            { key: 'present_days', label: 'Present\nDays', width: 30 },
+            { key: 'paid_leave_days', label: 'Paid\nLeave', width: 30 },
+            { key: 'mgmt_paid_days', label: 'Mgmt-\nPaid\nAbsence', width: 32 },
+            { key: 'unpaid_absence_days', label: 'Unpaid\nAbsence', width: 32 },
+            { key: 'worked_hours', label: 'Worked\nHrs', width: 34 },
+            { key: 'required_hours', label: 'Required\nHrs', width: 34 },
+            { key: 'ot_earned_hours', label: 'OT\nEarned', width: 32 },
+            { key: 'ot_used_hours', label: 'OT\nUsed', width: 30 },
+            { key: 'shortage_hours', label: 'Shortage\nHrs', width: 34 },
+            { key: 'paid_hours', label: 'Paid\nHrs', width: 36, wrap: true },
+            { key: 'hourly_rate', label: `Hourly\nRate (${currency})`, width: 46, wrap: true },
+            { key: 'advance', label: `Advance\nDeduction\n(${currency})`, width: 38 },
+            { key: 'net_salary', label: `Net Salary\n(${currency})`, width: 48 },
         ];
         const tableWidth = columns.reduce((s, c) => s + c.width, 0);
         const startX = doc.page.margins.left + Math.max(0, (pageWidth - tableWidth) / 2);
@@ -1193,10 +1194,11 @@ async function exportStaffPayrollPdf(req, res) {
             const h = 28;
             let x = startX;
             doc.rect(startX, y, tableWidth, h).fill(BRAND.charcoal);
-            doc.fillColor(BRAND.white).font('Helvetica-Bold').fontSize(7);
+            doc.fillColor(BRAND.white).font('Helvetica-Bold').fontSize(6.3);
             columns.forEach((col) => {
                 doc.rect(x, y, col.width, h).stroke(BRAND.charcoal);
-                doc.text(col.label, x + 2, y + 4, { width: col.width - 4, height: h - 4, align: 'center' });
+                const lines = col.label.split('\n').length;
+                doc.text(col.label, x + 2, y + Math.max(2, (h - lines * 7.3) / 2), { width: col.width - 4, height: h - 2, align: 'center', lineGap: 0 });
                 x += col.width;
             });
             doc.fillColor(BRAND.ink);
@@ -1222,6 +1224,14 @@ async function exportStaffPayrollPdf(req, res) {
                 doc.rect(x, y, col.width, h).stroke(BRAND.grid);
                 const text = String(values[col.key] ?? '');
                 const lines = text.split('\n').length;
+                // Text columns: shrink the font (down to 4.6pt) so the longest
+                // word fits instead of being cut in the middle ("SUPERVI SOR").
+                let size = 7.2;
+                if (col.fit && text) {
+                    const longest = Math.max(...text.split(/\s+/).map((w) => doc.widthOfString(w)));
+                    if (longest > col.width - 6) size = Math.max(4.6, 7.2 * (col.width - 6) / longest);
+                }
+                doc.fontSize(size);
                 const top = col.wrap ? y + Math.max(3, (h - lines * LINE_H) / 2) : y + (h - 8) / 2;
                 doc.text(text, x + 3, top, {
                     width: col.width - 6,
@@ -1230,6 +1240,7 @@ async function exportStaffPayrollPdf(req, res) {
                     lineBreak: Boolean(col.wrap),
                     lineGap: 0,
                 });
+                doc.fontSize(7.2);
                 x += col.width;
             });
             return y + h;
