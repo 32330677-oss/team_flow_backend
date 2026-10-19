@@ -153,6 +153,16 @@ async function start() {
             }
         }
         await require('./services/staffAdvanceService').assertStaffAdvanceSchema(db); // migrations/2026_10_staff_advances
+        {
+            // migrations/2026_10_staff_payroll_hours (Worked Hrs / Paid Hrs / Hourly Rate in staff payroll reports)
+            const [[h]] = await db.query(
+                `SELECT COUNT(*) AS n FROM information_schema.COLUMNS
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'staff_payroll'
+                   AND COLUMN_NAME IN ('worked_hours','paid_hours','hourly_rate_exact','pay_detail')`);
+            if (Number(h.n) !== 4) {
+                throw new Error('Staff payroll hour columns are missing. Run migrations/2026_10_staff_payroll_hours/01_ddl.sql before starting this version.');
+            }
+        }
     } catch (error) {
         console.error(`FATAL: ${error.message}`);
         process.exit(1);

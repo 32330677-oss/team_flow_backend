@@ -305,6 +305,11 @@ let managementPaidDays = 0;
 let unpaidAbsenceDays = 0;
 const workedShortfallByDate = new Map();   // D3: date -> worked-day shortfall hours
 const absenceShortfallByDate = new Map();  // D3: date -> absence shortfall hours
+// Display-only totals (Worked Hrs / Paid Hrs in the reports). They never feed
+// the salary formula below.
+let workedHoursRaw = 0;          // regular + overtime actually worked (incl. worked Fridays)
+let paidLeaveHoursRaw = 0;       // paid leave + management-paid absence, credited as standard hours
+let excessRegularRaw = 0;        // regular hours recorded above that day's standard (not paid as regular)
 const addTo = (map, key, v) => map.set(key, (map.get(key) || 0) + v);
 
 // الجمعة: خارج requiredDays/requiredHours تمامًا. تُحسب أوفر تايم كامل
@@ -316,6 +321,7 @@ for (const record of records) {
     if (isFriday(recordDateStr) && isDateInEmployment(recordDateStr)
         && record.attendance_status === 'Present' && Number(record.is_friday_worked) === 1) {
         dailyOtEarned += Number(record.regular_hours || 0) + Number(record.overtime_hours || 0);
+        workedHoursRaw += Number(record.regular_hours || 0) + Number(record.overtime_hours || 0);
         presentDaysCount += 1;
     }
 }
@@ -340,10 +346,13 @@ for (const dateStr of calendarDates) {
         addTo(workedShortfallByDate, dateStr, Math.max(0, dailyStandardHours - regHours));
         actualRegularRaw += regHours;
         dailyOtEarned += Number(record.overtime_hours || 0);
+        workedHoursRaw += regHours + Number(record.overtime_hours || 0);
+        excessRegularRaw += Math.max(0, regHours - dailyStandardHours);
         presentDaysCount += 1;
     } else if (record.attendance_status === 'Absent') {
         if (Number(record.is_management_paid_absence) === 1) {
             actualRegularRaw += dailyStandardHours;
+            paidLeaveHoursRaw += dailyStandardHours;
             managementPaidDays += 1;
         } else {
             absenceShortfall += dailyStandardHours;   // ← لا يُغطى من الـ OT
@@ -352,6 +361,7 @@ for (const dateStr of calendarDates) {
         }
     } else if (paidLeaveTypesFor(dateStr).includes(record.attendance_status) && Number(record.is_paid) === 1) {
         actualRegularRaw += dailyStandardHours;
+        paidLeaveHoursRaw += dailyStandardHours;
         paidLeaveDays += 1;
     } else {
         // إجازة من نوع غير مدرج بـ paid_leave_types، أو is_paid = 0
@@ -402,6 +412,7 @@ if (segments.length === 1) {
         const segBase = Number(seg.monthly_salary) * ratio;
         const segRate = segRequired > 0 ? segBase / segRequired : 0;
         seg.dates.forEach((dt) => rateByDate.set(dt, segRate));
+        seg.rateRaw = segRate; // display-only (pay periods in the report)
         baseSum += segBase;
         periodHoursSum += segPeriodHours * (seg.dates.length / requiredDays);
         return {
@@ -423,6 +434,42 @@ if (segments.length === 1) {
 }
 const calculatedNet    = money(proratedBaseSalary - salaryDeduction);
 const hourlyRate       = money(hourlyRateRaw); // هاد بس للعرض/التخزين بالتقرير
+
+// Display-only: the hours the salary was paid for, so that
+//   paid_hours x hourly_rate = prorated base - salary deduction
+// can be checked by hand. With a mid-period salary / hours change there is
+// one entry per period (own hours, own rate); the periods add up to the total.
+const paidHours = round2(requiredHours - uncoveredShortageHours);
+let payPeriods = null;
+if (segmentDetails) {
+    const uncoveredShare = workedDayShortfall > 0 ? uncoveredWorked / workedDayShortfall : 0;
+    payPeriods = segments.map((seg, i) => {
+        const segRequired = seg.dates.reduce((sum, dt) => sum + standardHoursByDate.get(dt), 0);
+        const segAbsence = seg.dates.reduce((sum, dt) => sum + (absenceShortfallByDate.get(dt) || 0), 0);
+        const segWorked = seg.dates.reduce((sum, dt) => sum + (workedShortfallByDate.get(dt) || 0), 0);
+        const segPaidRaw = segRequired - segAbsence - segWorked * uncoveredShare;
+        const segRateRaw = seg.rateRaw || 0;
+        return {
+            from: segmentDetails[i].from, to: segmentDetails[i].to,
+            monthly_salary: Number(seg.monthly_salary), standard_daily_hours: Number(seg.standard_daily_hours),
+            paid_hours: round2(segPaidRaw), hourly_rate: Number(segRateRaw.toFixed(8)),
+            amount: money(segPaidRaw * segRateRaw),
+        };
+    });
+    // Rounding cents/hundredths land on the last period so the periods add up
+    // exactly to the stored totals.
+    const last = payPeriods[payPeriods.length - 1];
+    const otherHours = payPeriods.slice(0, -1).reduce((s, p) => s + p.paid_hours, 0);
+    const otherAmount = payPeriods.slice(0, -1).reduce((s, p) => s + p.amount, 0);
+    last.paid_hours = round2(paidHours - otherHours);
+    last.amount = money(calculatedNet - otherAmount);
+}
+const payDetail = {
+    paid_leave_hours: round2(paidLeaveHoursRaw),
+    excess_regular_hours: round2(excessRegularRaw),
+    calculated_salary: calculatedNet,
+    periods: payPeriods,
+};
 // Retro pay: net = this period's salary + pending adjustments (never below 0).
 let adjustmentsAmount = 0;
 let adjustmentIdsForStaff = [];
@@ -456,8 +503,9 @@ const netSalary        = money(calculatedNet + adjustmentsAmount - advanceDeduct
                      required_hours, ot_earned_hours, ot_used_hours, ot_remaining_hours,
                      shortage_hours, salary_deduction_amount,
                      employed_from, employed_to, prorated_base_salary, period_required_hours, adjustments_amount,
-                     advance_deduction_amount)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                     advance_deduction_amount,
+                     worked_hours, paid_hours, hourly_rate_exact, pay_detail)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                              [
                     batchId, staff.staff_id, staff.monthly_salary, requiredDays,
                     presentDaysCount, paidLeaveDays, managementPaidDays, unpaidAbsenceDays,
@@ -466,6 +514,7 @@ const netSalary        = money(calculatedNet + adjustmentsAmount - advanceDeduct
                     shortageHours, salaryDeduction,
                     effectiveStart, effectiveEnd, proratedBaseSalary, periodRequiredHours, adjustmentsAmount.toFixed(2),
                     advanceDeduction.toFixed(2),
+                    round2(workedHoursRaw), paidHours, hourlyRateRaw.toFixed(8), JSON.stringify(payDetail),
                 ]
             );
             if (!payrollResult.insertId) continue;
@@ -746,6 +795,34 @@ function isPartialPeriod(row, batch) {
     return Boolean((from && from > start) || (to && to < end));
 }
 
+/**
+ * Hours / rate breakdown stored at generation (migrations/2026_10_staff_payroll_hours).
+ * Old rows (generated before that) return has = false and are shown as "-".
+ *   paid_hours x hourly_rate = prorated base - salary deduction
+ * With a salary / standard-hours change inside the period, periods[] holds
+ * one entry per period (own hours, own rate, own amount) adding up to the total.
+ */
+function payBreakdown(row) {
+    let detail = row.pay_detail;
+    if (typeof detail === 'string') {
+        try { detail = JSON.parse(detail); } catch (_) { detail = null; }
+    }
+    const has = row.paid_hours !== null && row.paid_hours !== undefined;
+    const periods = detail && Array.isArray(detail.periods) && detail.periods.length > 1 ? detail.periods : null;
+    return {
+        has,
+        worked: row.worked_hours === null || row.worked_hours === undefined ? null : Number(row.worked_hours),
+        paid: has ? Number(row.paid_hours) : null,
+        rate: row.hourly_rate_exact === null || row.hourly_rate_exact === undefined ? null : Number(row.hourly_rate_exact),
+        paidLeave: Number(detail?.paid_leave_hours || 0),
+        excess: Number(detail?.excess_regular_hours || 0),
+        salary: detail && detail.calculated_salary !== undefined ? Number(detail.calculated_salary) : null,
+        periods,
+    };
+}
+const RATE_DIGITS = 6;
+const periodLabel = (p) => `${exportDateOnly(p.from)} to ${exportDateOnly(p.to)}`;
+
 // ============================================================
 // GET /api/staff-payroll/batch/:batchId/export.xlsx
 // Streams a formatted Excel report for one staff payroll batch:
@@ -794,11 +871,15 @@ async function exportStaffPayrollExcel(req, res) {
             { header: 'Paid Leave Days', key: 'paid_leave_days', width: 9 },
             { header: 'Mgmt-Paid Absence', key: 'management_paid_days', width: 10 },
             { header: 'Unpaid Absence', key: 'unpaid_absence_days', width: 9 },
+            { header: 'Worked Hrs', key: 'worked_hours', width: 10, hours: true },
             { header: 'Required Hrs', key: 'required_hours', width: 10 },
             { header: 'OT Earned', key: 'ot_earned_hours', width: 9 },
             { header: 'OT Used', key: 'ot_used_hours', width: 9 },
             { header: 'OT Remaining', key: 'ot_remaining_hours', width: 10 },
             { header: 'Shortage Hrs', key: 'shortage_hours', width: 10 },
+            { header: 'Paid Hrs', key: 'paid_hours', width: 10, hours: true },
+            { header: `Hourly Rate (${currency})`, key: 'hourly_rate', width: 12, rate: true },
+            { header: 'Pay Periods (salary / hours changed inside the period)', key: 'pay_periods', width: 46, wrap: true },
             { header: `Deduction (${currency})`, key: 'salary_deduction_amount', width: 12, money: true },
             { header: `Advance Deduction (${currency})`, key: 'advance_deduction_amount', width: 13, money: true },
             { header: 'Advance Voucher(s)', key: 'advance_vouchers', width: 18 },
@@ -853,8 +934,13 @@ async function exportStaffPayrollExcel(req, res) {
             .filter((a) => Number(a.staff_id) === Number(staffId)).map((a) => a.voucher_no))].join(', ');
         const partialFill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF4CC' } };
 
+        let totalWorked = 0;
+        let totalPaidHours = 0;
         rows.forEach((r, index) => {
             const prorated = Number(r.prorated_base_salary ?? r.monthly_salary_snapshot ?? 0);
+            const pb = payBreakdown(r);
+            if (pb.worked !== null) totalWorked += pb.worked;
+            if (pb.has) totalPaidHours += pb.paid;
             const row = sheet.addRow({
                 number: index + 1,
                 staff_id: r.staff_unique_id,
@@ -874,12 +960,27 @@ async function exportStaffPayrollExcel(req, res) {
                 ot_used_hours: Number(r.ot_used_hours || 0),
                 ot_remaining_hours: Number(r.ot_remaining_hours || 0),
                 shortage_hours: Number(r.shortage_hours || 0),
+                worked_hours: pb.worked !== null ? pb.worked : '-',
+                paid_hours: pb.has ? pb.paid : '-',
+                // Several periods: no single rate is exact, so the rate cell
+                // lists each period's rate (Pay Periods shows hours x rate).
+                hourly_rate: pb.periods
+                    ? pb.periods.map((p) => Number(p.hourly_rate).toFixed(RATE_DIGITS)).join('\n')
+                    : (pb.rate !== null ? Number(pb.rate.toFixed(RATE_DIGITS)) : '-'),
+                pay_periods: pb.periods
+                    ? pb.periods.map((p) => `${periodLabel(p)}: ${Number(p.paid_hours).toFixed(2)} h x ${Number(p.hourly_rate).toFixed(RATE_DIGITS)} = ${Number(p.amount).toFixed(2)}`).join('\n')
+                    : '',
                 salary_deduction_amount: Number(r.salary_deduction_amount || 0),
                 advance_deduction_amount: Number(r.advance_deduction_amount || 0),
                 advance_vouchers: vouchersOf(r.staff_id),
                 net_salary: Number(r.net_salary || 0),
                 signature: '',
             });
+            if (pb.periods) {
+                row.getCell(colIndex('pay_periods')).alignment = { wrapText: true, vertical: 'middle' };
+                row.getCell(colIndex('hourly_rate')).alignment = { wrapText: true, vertical: 'middle', horizontal: 'right' };
+                row.height = Math.max(15, 13 * pb.periods.length + 2);
+            }
             if (isPartialPeriod(r, batch)) {
                 ['employed_from', 'employed_to', 'prorated_base'].forEach((k) => {
                     row.getCell(colIndex(k)).fill = partialFill;
@@ -894,6 +995,8 @@ async function exportStaffPayrollExcel(req, res) {
         const totalRow = sheet.addRow({
             full_name: 'GRAND TOTAL',
             prorated_base: money(totals.prorated_base),
+            worked_hours: Math.round(totalWorked * 100) / 100,
+            paid_hours: Math.round(totalPaidHours * 100) / 100,
             salary_deduction_amount: money(totals.salary_deduction_amount),
             advance_deduction_amount: money(totals.advance_deduction_amount),
             net_salary: money(totals.net_salary),
@@ -901,8 +1004,23 @@ async function exportStaffPayrollExcel(req, res) {
         totalRow.font = { bold: true };
 
         columns.forEach((c, i) => {
-            if (!c.money) return;
-            for (let r = 6; r <= sheet.rowCount; r += 1) sheet.getCell(r, i + 1).numFmt = '#,##0.00';
+            const fmtStr = c.money || c.hours ? '#,##0.00' : (c.rate ? `0.${'0'.repeat(RATE_DIGITS)}` : null);
+            if (!fmtStr) return;
+            for (let r = 6; r <= sheet.rowCount; r += 1) sheet.getCell(r, i + 1).numFmt = fmtStr;
+        });
+
+        // How the hours give the salary (same notes as the PDF).
+        sheet.addRow([]);
+        [
+            'HOW TO READ THE HOURS',
+            'Paid Hrs x Hourly Rate = Prorated Base - Deduction.   Net Salary = Paid Hrs x Hourly Rate + adjustments - Advance Deduction.',
+            'Paid Hrs = Required Hrs - shortage not covered by overtime = Worked Hrs - (OT Earned - OT Used) + paid-leave hours - hours above the daily standard.',
+            'Unused overtime (OT Remaining) is not paid in the salary: it only covers shortage on worked days.',
+            'Pay Periods: when the salary or the daily hours changed inside the period, each period is paid at its own rate; the periods add up to Paid Hrs and to the salary.',
+        ].forEach((t, i) => {
+            const nr = sheet.addRow([t]);
+            sheet.mergeCells(`A${nr.number}:${lastCol}${nr.number}`);
+            nr.font = i === 0 ? { bold: true } : { italic: true, size: 9 };
         });
 
         sheet.views = [{ state: 'frozen', xSplit: 3, ySplit: 5 }];
@@ -983,25 +1101,28 @@ async function exportStaffPayrollPdf(req, res) {
 
         const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
 
-        // Total width 766pt: fits the 770pt printable width of landscape A4.
+        // Total width must stay <= 770pt (printable width of landscape A4).
         const columns = [
-            { key: 'no', label: 'No.', width: 22 },
-            { key: 'staff_id', label: 'Staff ID', width: 44 },
-            { key: 'full_name', label: 'Full Name', width: 80, align: 'left' },
-            { key: 'position', label: 'Position', width: 46, align: 'left' },
-            { key: 'monthly_salary', label: `Monthly Salary (${currency})`, width: 56 },
-            { key: 'employed', label: 'Employed', width: 58, wrap: true },
-            { key: 'prorated_base', label: `Prorated Base (${currency})`, width: 56 },
-            { key: 'present_days', label: 'Present Days', width: 34 },
-            { key: 'paid_leave_days', label: 'Paid Leave', width: 34 },
-            { key: 'mgmt_paid_days', label: 'Mgmt-Paid Absence', width: 40 },
-            { key: 'unpaid_absence_days', label: 'Unpaid Absence', width: 40 },
-            { key: 'required_hours', label: 'Required Hrs', width: 40 },
-            { key: 'ot_earned_hours', label: 'OT Earned', width: 40 },
-            { key: 'ot_used_hours', label: 'OT Used', width: 34 },
-            { key: 'shortage_hours', label: 'Shortage Hrs', width: 38 },
-            { key: 'advance', label: `Advance Deduction (${currency})`, width: 48 },
-            { key: 'net_salary', label: `Net Salary (${currency})`, width: 56 },
+            { key: 'no', label: 'No.', width: 18 },
+            { key: 'staff_id', label: 'Staff ID', width: 40 },
+            { key: 'full_name', label: 'Full Name', width: 70, align: 'left' },
+            { key: 'position', label: 'Position', width: 40, align: 'left' },
+            { key: 'monthly_salary', label: `Monthly Salary (${currency})`, width: 46 },
+            { key: 'employed', label: 'Employed', width: 46, wrap: true },
+            { key: 'prorated_base', label: `Prorated Base (${currency})`, width: 46 },
+            { key: 'present_days', label: 'Present Days', width: 28 },
+            { key: 'paid_leave_days', label: 'Paid Leave', width: 28 },
+            { key: 'mgmt_paid_days', label: 'Mgmt-Paid Absence', width: 32 },
+            { key: 'unpaid_absence_days', label: 'Unpaid Absence', width: 32 },
+            { key: 'worked_hours', label: 'Worked Hrs', width: 34 },
+            { key: 'required_hours', label: 'Required Hrs', width: 34 },
+            { key: 'ot_earned_hours', label: 'OT Earned', width: 32 },
+            { key: 'ot_used_hours', label: 'OT Used', width: 30 },
+            { key: 'shortage_hours', label: 'Shortage Hrs', width: 32 },
+            { key: 'paid_hours', label: 'Paid Hrs', width: 36, wrap: true },
+            { key: 'hourly_rate', label: `Hourly Rate (${currency})`, width: 40, wrap: true },
+            { key: 'advance', label: `Advance Deduction (${currency})`, width: 38 },
+            { key: 'net_salary', label: `Net Salary (${currency})`, width: 48 },
         ];
         const tableWidth = columns.reduce((s, c) => s + c.width, 0);
         const startX = doc.page.margins.left + Math.max(0, (pageWidth - tableWidth) / 2);
@@ -1082,25 +1203,36 @@ async function exportStaffPayrollPdf(req, res) {
             return y + h;
         }
 
+        // Rows grow when a cell has several lines (pay periods); single
+        // lines keep the original 24pt row.
+        const LINE_H = 8.6;
+        const rowHeight = (values) => {
+            const lines = Math.max(2, ...columns.map((c) => String(values[c.key] ?? '').split('\n').length));
+            return lines <= 2 ? ROW_H : Math.ceil(6 + lines * LINE_H);
+        };
         function drawRow(y, values, opts = {}) {
+            const h = rowHeight(values);
             let x = startX;
             if (opts.fill) {
-                doc.rect(startX, y, tableWidth, ROW_H).fill(opts.fill);
+                doc.rect(startX, y, tableWidth, h).fill(opts.fill);
                 doc.fillColor(BRAND.ink);
             }
             doc.font(opts.bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(7.2);
             columns.forEach((col) => {
-                doc.rect(x, y, col.width, ROW_H).stroke(BRAND.grid);
+                doc.rect(x, y, col.width, h).stroke(BRAND.grid);
                 const text = String(values[col.key] ?? '');
-                doc.text(text, x + 3, col.wrap ? y + 3 : y + 8, {
+                const lines = text.split('\n').length;
+                const top = col.wrap ? y + Math.max(3, (h - lines * LINE_H) / 2) : y + (h - 8) / 2;
+                doc.text(text, x + 3, top, {
                     width: col.width - 6,
-                    height: ROW_H - 4,
+                    height: h - 4,
                     align: col.align || 'center',
                     lineBreak: Boolean(col.wrap),
+                    lineGap: 0,
                 });
                 x += col.width;
             });
-            return y + ROW_H;
+            return y + h;
         }
 
         // Signature block. Always drawn: when it does not fit under the
@@ -1138,12 +1270,33 @@ async function exportStaffPayrollPdf(req, res) {
             return drawTableHeaderRow(doc.page.margins.top);
         };
 
+        let totalWorked = 0;
+        let totalPaidHours = 0;
+        const periodNotes = [];
+        const leaveNotes = [];
         rows.forEach((r, index) => {
-            if (y > bottomLimit) y = newPageWithHeader();
             const partial = isPartialPeriod(r, batch);
             const from = exportDateOnly(r.employed_from);
             const to = exportDateOnly(r.employed_to);
-            y = drawRow(y, {
+            const pb = payBreakdown(r);
+            if (pb.worked !== null) totalWorked += pb.worked;
+            if (pb.has) totalPaidHours += pb.paid;
+            let paidCell = pb.has ? fmt(pb.paid) : '-';
+            let rateCell = pb.rate !== null ? pb.rate.toFixed(RATE_DIGITS) : '-';
+            if (pb.periods) {
+                // One line per period, then the total, in the employee's own cells.
+                paidCell = [...pb.periods.map((p) => fmt(p.paid_hours)), `= ${fmt(pb.paid)}`].join('\n');
+                rateCell = [...pb.periods.map((p) => Number(p.hourly_rate).toFixed(RATE_DIGITS)), ''].join('\n');
+                periodNotes.push(`${r.staff_unique_id} ${r.full_name}: ` + pb.periods.map((p) =>
+                    `${periodLabel(p)}: ${fmt(p.paid_hours)} h x ${Number(p.hourly_rate).toFixed(RATE_DIGITS)} = ${amount(p.amount)}`
+                ).join('   +   ') + `   =   ${amount(pb.periods.reduce((t, p) => t + Number(p.amount), 0))} ${currency}`);
+            }
+            if (pb.has && (pb.paidLeave || pb.excess)) {
+                leaveNotes.push(`${r.staff_unique_id} ${r.full_name}:` +
+                    (pb.paidLeave ? ` paid-leave hours ${fmt(pb.paidLeave)}` : '') +
+                    (pb.excess ? ` | hours above daily standard ${fmt(pb.excess)}` : ''));
+            }
+            const values = {
                 no: index + 1,
                 staff_id: r.staff_unique_id,
                 full_name: r.full_name,
@@ -1160,9 +1313,14 @@ async function exportStaffPayrollPdf(req, res) {
                 ot_earned_hours: fmt(r.ot_earned_hours),
                 ot_used_hours: fmt(r.ot_used_hours),
                 shortage_hours: fmt(r.shortage_hours),
+                worked_hours: pb.worked !== null ? fmt(pb.worked) : '-',
+                paid_hours: paidCell,
+                hourly_rate: rateCell,
                 advance: num(r.advance_deduction_amount) ? amount(r.advance_deduction_amount) : '-',
                 net_salary: amount(r.net_salary),
-            }, { fill: partial ? BRAND.goldLight : (index % 2 === 1 ? BRAND.goldPale : null) });
+            };
+            if (y + rowHeight(values) > doc.page.height - doc.page.margins.bottom) y = newPageWithHeader();
+            y = drawRow(y, values, { fill: partial ? BRAND.goldLight : (index % 2 === 1 ? BRAND.goldPale : null) });
         });
 
         if (y > bottomLimit) y = newPageWithHeader();
@@ -1170,9 +1328,39 @@ async function exportStaffPayrollPdf(req, res) {
             full_name: 'GRAND TOTAL',
             prorated_base: amount(totalProrated),
             ot_earned_hours: fmt(totalOtEarned),
+            worked_hours: fmt(totalWorked),
+            paid_hours: fmt(totalPaidHours),
             advance: totalAdvance ? amount(totalAdvance) : '-',
             net_salary: amount(totalNet),
         }, { bold: true, fill: BRAND.goldMid });
+
+        // How the hours give the salary (so anyone can check a row by hand).
+        {
+            const left = doc.page.margins.left;
+            const width = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+            const lines = [
+                'HOW TO READ THE HOURS',
+                `Paid Hrs x Hourly Rate = Prorated Base - shortage deduction.   Net Salary = Paid Hrs x Hourly Rate + adjustments - Advance Deduction.`,
+                'Paid Hrs = Required Hrs - shortage not covered by overtime = Worked Hrs - (OT Earned - OT Used) + paid-leave hours - hours above the daily standard.',
+                'Unused overtime (OT Earned - OT Used) is not paid in the salary: it only covers shortage on worked days.',
+            ];
+            if (periodNotes.length) {
+                lines.push('Salary or daily hours changed inside the period: one line per period in Paid Hrs / Hourly Rate, each period at its own rate:');
+                periodNotes.forEach((n) => lines.push(`   ${n}`));
+            }
+            if (leaveNotes.length) {
+                lines.push('Paid-leave hours (credited as standard hours) and hours above the daily standard:');
+                leaveNotes.forEach((n) => lines.push(`   ${n}`));
+            }
+            y += 8;
+            lines.forEach((line, i) => {
+                if (y > doc.page.height - doc.page.margins.bottom - 12) { doc.addPage(); y = doc.page.margins.top; }
+                doc.font(i === 0 ? 'Helvetica-Bold' : 'Helvetica').fontSize(i === 0 ? 8 : 7)
+                    .fillColor(i === 0 ? BRAND.charcoal : BRAND.ink).text(line, left, y, { width });
+                y = doc.y + 1.5;
+            });
+            doc.fillColor(BRAND.ink);
+        }
 
         // Retro pay: list of adjustments included in the nets above.
         const pdfAdjustments = await payrollAdjustments.listForBatch(pool, 'Staff', batchId);
