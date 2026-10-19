@@ -284,6 +284,71 @@ exports.getAssignedStaffIdsForSupervisor = async (supervisorUserId, executor = d
 };
 
 
+/**
+ * A Staff Supervisor's scope on ONE date (not today):
+ *  - editableIds: staff assigned to this supervisor on that date. He records
+ *    and submits their attendance (also after a termination or a transfer,
+ *    for the days that were his).
+ *  - viewOnlyIds: staff assigned to this supervisor only AFTER that date, while
+ *    another supervisor had them on that date. He sees that day read-only; he
+ *    may only fix it if the Admin rejected it (Rejected record).
+ *  - since: staff_id -> first date this supervisor has them (for the message).
+ * A day on which NO supervisor had the employee stays editable by the
+ * supervisor who has them later (nobody else could record it).
+ */
+exports.getSupervisorScopeOnDate = async (supervisorUserId, date, executor = db) => {
+  const [rows] = await executor.execute(
+    `SELECT staff_id,
+            DATE_FORMAT(assigned_date, '%Y-%m-%d') AS assigned_date,
+            DATE_FORMAT(unassigned_date, '%Y-%m-%d') AS unassigned_date
+     FROM staff_supervisor_assignments
+     WHERE supervisor_user_id = ?`,
+    [supervisorUserId]
+  );
+  const editable = new Set();
+  const later = new Map();
+  for (const r of rows) {
+    const id = Number(r.staff_id);
+    if (r.assigned_date <= date && (!r.unassigned_date || r.unassigned_date >= date)) editable.add(id);
+    else if (r.assigned_date > date) {
+      if (!later.has(id) || r.assigned_date < later.get(id)) later.set(id, r.assigned_date);
+    }
+  }
+  for (const id of editable) later.delete(id);
+  const viewOnly = new Set();
+  if (later.size) {
+    // Who had them on that date? If nobody did, the day stays editable here.
+    const ids = [...later.keys()];
+    const [others] = await executor.execute(
+      `SELECT DISTINCT staff_id FROM staff_supervisor_assignments
+       WHERE staff_id IN (${ids.map(() => '?').join(',')})
+         AND supervisor_user_id <> ?
+         AND ${activeOn('', '?')}`,
+      [...ids, supervisorUserId, date, date]
+    );
+    const coveredByOther = new Set(others.map((o) => Number(o.staff_id)));
+    for (const id of ids) {
+      if (coveredByOther.has(id)) viewOnly.add(id);
+      else editable.add(id);
+    }
+  }
+  return {
+    editableIds: [...editable],
+    viewOnlyIds: [...viewOnly],
+    since: Object.fromEntries([...later.entries()]),
+  };
+};
+
+/** Staff assigned to this supervisor on at least one day of [from, to]. */
+exports.getStaffIdsAssignedDuring = async (supervisorUserId, from, to, executor = db) => {
+  const [rows] = await executor.execute(
+    `SELECT DISTINCT staff_id FROM staff_supervisor_assignments
+     WHERE supervisor_user_id = ? AND assigned_date <= ? AND (unassigned_date IS NULL OR unassigned_date >= ?)`,
+    [supervisorUserId, to, from]
+  );
+  return rows.map((r) => Number(r.staff_id));
+};
+
 // GET /api/staff/my-assigned-staff  (StaffSupervisor only)
 exports.getMyAssignedStaff = async (req, res) => {
   const supervisorId = req.user.user_id;

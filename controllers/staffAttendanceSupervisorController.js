@@ -1,5 +1,8 @@
 const db = require('../config/db');
-const { getAssignedStaffIdsForSupervisor } = require('./staffSupervisorAssignmentController');
+const {
+  getSupervisorScopeOnDate,
+  getStaffIdsAssignedDuring,
+} = require('./staffSupervisorAssignmentController');
 const {
   isValidDateOnly,
   isFriday,
@@ -41,11 +44,15 @@ function formatToMySqlDateTime(value) {
 }
 
 // GET /api/staff-attendance/supervisor/day?date=YYYY-MM-DD
-// Returns every assigned staff member (Active, plus Inactive ones who still
-// have an attendance record on this historical date) with their record (if
-// any) for that date, including Draft records, so the supervisor sees what
-// was saved earlier. Terminated staff are excluded implicitly because
-// termination closes the supervisor assignment (see staffLifecycleController).
+// Returns the staff in this supervisor's scope ON THAT DATE (not today) with
+// their record (if any), including Draft records:
+//  - staff assigned to him on that date: editable (can_edit = true). This
+//    keeps a terminated / transferred employee visible for his last days.
+//  - staff assigned to him only later, while another supervisor had them on
+//    that date: view only (can_edit = false), except a Rejected record, which
+//    he may fix and resubmit.
+// Employment on that date still decides (staff_status_history spans); a
+// record that already exists is always shown.
 exports.getDayView = async (req, res) => {
   const { date } = req.query;
   if (!isValidDateOnly(date)) {
@@ -53,7 +60,9 @@ exports.getDayView = async (req, res) => {
   }
   const supervisorId = req.user.user_id;
   try {
-    const assignedIds = await getAssignedStaffIdsForSupervisor(supervisorId);
+    const scope = await getSupervisorScopeOnDate(supervisorId, date);
+    const editableSet = new Set(scope.editableIds);
+    const assignedIds = [...scope.editableIds, ...scope.viewOnlyIds];
     if (assignedIds.length === 0) {
       return res.status(200).json({ status: 'success', data: [] });
     }
@@ -78,10 +87,22 @@ exports.getDayView = async (req, res) => {
     const eligibleRows = [];
     for (const row of rows) {
       const spans = await getActiveSpansOverlapping(row.staff_id, date, date);
-      if (spans.length > 0 || row.staff_attendance_id) eligibleRows.push(row);
+      if (!(spans.length > 0 || row.staff_attendance_id)) continue;
+      const editable = editableSet.has(Number(row.staff_id));
+      row.can_edit = editable || row.status === 'Rejected';
+      row.view_only = !editable;
+      if (!editable) {
+        row.view_only_reason = `Assigned to you from ${scope.since[row.staff_id] || 'a later date'}. ` +
+          'This day was recorded by the previous supervisor' +
+          (row.status === 'Rejected' ? '; the Admin rejected it, so you can correct and resubmit it.' : '.');
+      }
+      eligibleRows.push(row);
     }
     const locked = await findLockedStaffBatch(db, { date });
-    const gate = await weekGate.previousWeekStaffDrafts(db, { staffIds: assignedIds, recordDate: date });
+    // Previous-week drafts that are THIS supervisor's: staff he had during that week.
+    const prevWeek = await weekGate.previousWeekBounds(date);
+    const gateStaffIds = await getStaffIdsAssignedDuring(supervisorId, prevWeek.prevStart, prevWeek.prevEnd);
+    const gate = await weekGate.previousWeekStaffDrafts(db, { staffIds: gateStaffIds, recordDate: date });
 
     res.status(200).json({
       status: 'success',
@@ -170,16 +191,21 @@ if (record_date > maxAllowed) {
   const results = { updated: [], skipped: [] };
 
   try {
-    const assignedIds = await getAssignedStaffIdsForSupervisor(supervisorId, connection);
-    if (assignedIds.length === 0) {
-      throw new AppError('No active staff members are assigned to this supervisor.');
-    }
+    // Scope ON record_date (not today): see getSupervisorScopeOnDate.
+    const scope = await getSupervisorScopeOnDate(supervisorId, record_date, connection);
+    const assignedIds = scope.editableIds;
     const assignedSet = new Set(assignedIds);
+    const viewOnlySet = new Set(scope.viewOnlyIds);
+    if (assignedIds.length === 0 && viewOnlySet.size === 0) {
+      throw new AppError('No staff members were assigned to you on this date.');
+    }
 
     await connection.beginTransaction();
     await assertStaffDateEditable(connection, record_date);   // D-02
     if (mode === 'submit' && !isResubmit) {
-      const gate = await weekGate.previousWeekStaffDrafts(connection, { staffIds: assignedIds, recordDate: record_date });
+      const prevWeek = await weekGate.previousWeekBounds(record_date);
+      const gateStaffIds = await getStaffIdsAssignedDuring(supervisorId, prevWeek.prevStart, prevWeek.prevEnd, connection);
+      const gate = await weekGate.previousWeekStaffDrafts(connection, { staffIds: gateStaffIds, recordDate: record_date });
       if (gate.days.length > 0) throw weekGate.gateError(gate);   // §10
     }
 
@@ -205,7 +231,7 @@ if (record_date > maxAllowed) {
          FROM staff_members sm
          LEFT JOIN staff_attendance sa
            ON sa.staff_id = sm.staff_id AND sa.record_date = ?
-         WHERE sm.staff_id IN (${assignedIds.map(() => '?').join(',')})
+         WHERE sm.staff_id IN (${assignedIds.length ? assignedIds.map(() => '?').join(',') : 'NULL'})
          ORDER BY sm.full_name`,
         [record_date, ...assignedIds]
       );
@@ -248,11 +274,26 @@ if (record_date > maxAllowed) {
       }
 
       if (!assignedSet.has(staffId)) {
-        results.skipped.push({
-          staff_id: staffId,
-          reason: 'Staff member is not assigned to you.'
-        });
-        continue;
+        // Assigned to this supervisor only after record_date: that day is the
+        // previous supervisor's. Allowed only to fix a record the Admin
+        // rejected, and only by submitting it (a Draft would hide it from both).
+        let allowedRejectedFix = false;
+        if (viewOnlySet.has(staffId) && !isDraftMode) {
+          const [[cur]] = await connection.execute(
+            'SELECT status FROM staff_attendance WHERE staff_id = ? AND record_date = ? LIMIT 1',
+            [staffId, record_date]
+          );
+          allowedRejectedFix = Boolean(cur && cur.status === 'Rejected');
+        }
+        if (!allowedRejectedFix) {
+          results.skipped.push({
+            staff_id: staffId,
+            reason: viewOnlySet.has(staffId)
+              ? 'This day belongs to the previous supervisor (view only). It can be changed here only after the Admin rejects it.'
+              : 'Staff member is not assigned to you on this date.'
+          });
+          continue;
+        }
       }
 
       // Friday is a non-working day by default.
@@ -706,7 +747,7 @@ if (status === 'Present' && !biometricInOnlyDraft) {
          FROM staff_attendance sa
          JOIN staff_members sm ON sm.staff_id = sa.staff_id
          WHERE sa.record_date = ? AND sa.status = 'Draft'
-           AND sa.staff_id IN (${assignedIds.map(() => '?').join(',')})
+           AND sa.staff_id IN (${assignedIds.length ? assignedIds.map(() => '?').join(',') : 'NULL'})
          FOR UPDATE OF sa`,
         [record_date, ...assignedIds]
       );
@@ -824,7 +865,16 @@ exports.getWeekStatus = async (req, res) => {
       days.push(d.toISOString().slice(0, 10));
     }
 
-    const assignedIds = await getAssignedStaffIdsForSupervisor(req.user.user_id);
+    // Scope per day (who was his on THAT day), see getSupervisorScopeOnDate.
+    const scopeByDay = new Map();
+    const allIds = new Set();
+    for (const day of days) {
+      const sc = await getSupervisorScopeOnDate(req.user.user_id, day);
+      scopeByDay.set(day, { editable: new Set(sc.editableIds), viewOnly: new Set(sc.viewOnlyIds) });
+      sc.editableIds.forEach((id) => allIds.add(id));
+      sc.viewOnlyIds.forEach((id) => allIds.add(id));
+    }
+    const assignedIds = [...allIds];
     const spansByStaff = new Map();
     for (const id of assignedIds) spansByStaff.set(id, await getActiveSpans(id));
 
@@ -841,14 +891,20 @@ exports.getWeekStatus = async (req, res) => {
 
     const data = days.map((day) => {
       const recs = recordsByDay.get(day);
+      const sc = scopeByDay.get(day);
       const counts = { Draft: 0, Submitted: 0, Approved: 0, Rejected: 0 };
-      for (const s of recs.values()) if (counts[s] !== undefined) counts[s] += 1;
+      for (const [id, st] of recs.entries()) {
+        if (counts[st] === undefined) continue;
+        // View-only staff count only when the Admin rejected their record
+        // (that is the one thing this supervisor may fix on that day).
+        if (sc.editable.has(id) || (sc.viewOnly.has(id) && st === 'Rejected')) counts[st] += 1;
+      }
 
       const friday = isFriday(day);
       let expected = 0;
       let missing = 0;
       if (!friday && day <= today) {
-        for (const id of assignedIds) {
+        for (const id of sc.editable) {
           const employed = (spansByStaff.get(id) || []).some((s) => day >= s.start && (!s.end || day <= s.end));
           if (!employed) continue;
           expected += 1;
