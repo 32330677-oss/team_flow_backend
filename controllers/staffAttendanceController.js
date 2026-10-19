@@ -97,7 +97,7 @@ exports.getPendingStaffAttendance = async (req, res) => {
 // Reviews ONE staff attendance record inside its own transaction on the given
 // connection. Shared by the single and the bulk endpoint so both apply exactly
 // the same rules (scope, pending-only, payroll lock, anomaly acknowledgement).
-async function reviewOneRecord(connection, user, { staff_attendance_id, status, admin_note, is_paid, acknowledge_anomaly, anomaly_note }) {
+async function reviewOneRecord(connection, user, { staff_attendance_id, status, admin_note, is_paid, acknowledge_anomaly, anomaly_note }, lockCache = null) {
     const adminId = user.user_id;
     await connection.beginTransaction();
     try {
@@ -117,7 +117,15 @@ async function reviewOneRecord(connection, user, { staff_attendance_id, status, 
         }
 
         if (record.status !== 'Submitted') throw new AppError('Cannot review a record that is not in pending status.', 409);
-        await assertStaffDateEditable(connection, record.record_date);
+        if (lockCache) {
+            // Bulk: check each date's payroll lock once, not once per record.
+            const day = String(record.record_date instanceof Date ? record.record_date.toISOString() : record.record_date).slice(0, 10);
+            if (!lockCache.has(day)) lockCache.set(day, assertStaffDateEditable(connection, record.record_date).then(() => null, (e) => e));
+            const lockError = await lockCache.get(day);
+            if (lockError) throw lockError;
+        } else {
+            await assertStaffDateEditable(connection, record.record_date);
+        }
 
         let ackNote = null;
         if (status === 'Approved' && record.anomaly_code && !record.anomaly_ack_at) {
@@ -201,6 +209,7 @@ exports.reviewStaffAttendance = async (req, res) => {
 // transaction, so one failure never undoes the others; the response lists
 // exactly which records succeeded and why each failed one failed.
 const BULK_REVIEW_MAX = 1000;
+const BULK_REVIEW_CONCURRENCY = 4; // pool connectionLimit is 10; leave room for other requests
 exports.bulkReviewStaffAttendance = async (req, res) => {
     const { status, admin_note } = req.body || {};
     const items = Array.isArray(req.body?.items) ? req.body.items : null;
@@ -212,36 +221,62 @@ exports.bulkReviewStaffAttendance = async (req, res) => {
         return sendError(res, error, 'Invalid request.');
     }
 
+    // Unique, valid ids in the order sent.
     const seen = new Set();
     const succeeded = [];
     const failed = [];
-    const connection = await db.getConnection();
-    try {
-        for (const item of items) {
-            const id = Number(item?.staff_attendance_id);
-            if (!Number.isInteger(id) || id <= 0 || seen.has(id)) {
-                if (!seen.has(id)) failed.push({ staff_attendance_id: item?.staff_attendance_id ?? null, message: 'Invalid record id.' });
-                continue;
-            }
-            seen.add(id);
-            try {
-                await reviewOneRecord(connection, req.user, {
-                    staff_attendance_id: id, status, admin_note,
-                    acknowledge_anomaly: item.acknowledge_anomaly,
-                    anomaly_note: item.anomaly_note,
-                });
-                succeeded.push(id);
-            } catch (error) {
-                if (!(error && error.isOperational)) console.error('Bulk staff review failed for record', id, error);
-                failed.push({
-                    staff_attendance_id: id,
-                    ...(error?.extra?.code ? { code: error.extra.code } : {}),
-                    message: error && error.isOperational ? error.message : 'Unexpected error while reviewing this record.',
-                });
-            }
+    const queue = [];
+    for (const item of items) {
+        const id = Number(item?.staff_attendance_id);
+        if (!Number.isInteger(id) || id <= 0) {
+            failed.push({ staff_attendance_id: item?.staff_attendance_id ?? null, message: 'Invalid record id.' });
+            continue;
         }
-    } finally {
-        connection.release();
+        if (seen.has(id)) continue;
+        seen.add(id);
+        queue.push({ id, item });
+    }
+
+    // A few records in parallel (each on its own pooled connection, each in
+    // its own transaction). The DB is remote, so this is what makes 35+
+    // records finish in a few seconds instead of half a minute.
+    const lockCache = new Map();
+    const workers = Math.min(BULK_REVIEW_CONCURRENCY, queue.length);
+    let next = 0;
+    const runWorker = async () => {
+        const connection = await db.getConnection();
+        try {
+            while (next < queue.length) {
+                const { id, item } = queue[next++];
+                try {
+                    await reviewOneRecord(connection, req.user, {
+                        staff_attendance_id: id, status, admin_note,
+                        acknowledge_anomaly: item.acknowledge_anomaly,
+                        anomaly_note: item.anomaly_note,
+                    }, lockCache);
+                    succeeded.push(id);
+                } catch (error) {
+                    if (!(error && error.isOperational)) console.error('Bulk staff review failed for record', id, error);
+                    failed.push({
+                        staff_attendance_id: id,
+                        ...((error?.code || error?.extra?.code) ? { code: error.code || error.extra.code } : {}),
+                        message: error && error.isOperational ? error.message : 'Unexpected error while reviewing this record.',
+                    });
+                }
+            }
+        } finally {
+            connection.release();
+        }
+    };
+    try {
+        await Promise.all(Array.from({ length: workers }, runWorker));
+    } catch (error) {
+        // Only getConnection() can land here; records already done stay done.
+        console.error('Bulk staff review: connection error', error);
+        const done = new Set([...succeeded, ...failed.map((f) => f.staff_attendance_id)]);
+        for (const { id } of queue) {
+            if (!done.has(id)) failed.push({ staff_attendance_id: id, message: 'Database connection error. Please retry.' });
+        }
     }
 
     return res.status(200).json({
