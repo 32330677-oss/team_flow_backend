@@ -12,6 +12,7 @@ router.use(authMiddleware);
 // only assigned staff is applied inside the controller for StaffSupervisor.
 router.get('/pending', restrictTo('Admin', 'StaffSupervisor'), staffAttendanceController.getPendingStaffAttendance);
 router.post('/review', restrictTo('Admin'), staffAttendanceController.reviewStaffAttendance);
+router.post('/review/bulk', restrictTo('Admin'), staffAttendanceController.bulkReviewStaffAttendance);
 router.get('/by-date', restrictTo('Admin', 'StaffSupervisor'), staffAttendanceController.getStaffAttendanceByDate);
 
 const staffAttendanceSupervisorController = require('../controllers/staffAttendanceSupervisorController');

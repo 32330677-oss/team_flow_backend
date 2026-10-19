@@ -94,21 +94,13 @@ exports.getPendingStaffAttendance = async (req, res) => {
 // D-11: Sick is unpaid unless the reviewer explicitly sets is_paid = 1.
 // D-09: flagged records need an explicit acknowledgement to be approved.
 // D-02: no review inside a finalized/paid staff payroll period.
-exports.reviewStaffAttendance = async (req, res) => {
-    const { staff_attendance_id, status, admin_note, is_paid } = req.body;
-    const adminId = req.user.user_id;
-
-    if (!['Approved', 'Rejected'].includes(status)) {
-        return res.status(400).json({ status: 'error', message: 'Status must be Approved or Rejected.' });
-    }
-    if (status === 'Rejected' && (!admin_note || !String(admin_note).trim())) {
-        return res.status(400).json({ status: 'error', message: 'Rejection reason is required.' });
-    }
-
-    const connection = await db.getConnection();
+// Reviews ONE staff attendance record inside its own transaction on the given
+// connection. Shared by the single and the bulk endpoint so both apply exactly
+// the same rules (scope, pending-only, payroll lock, anomaly acknowledgement).
+async function reviewOneRecord(connection, user, { staff_attendance_id, status, admin_note, is_paid, acknowledge_anomaly, anomaly_note }) {
+    const adminId = user.user_id;
+    await connection.beginTransaction();
     try {
-        await connection.beginTransaction();
-
         const [rows] = await connection.execute(
             'SELECT * FROM staff_attendance WHERE staff_attendance_id = ? FOR UPDATE',
             [staff_attendance_id]
@@ -117,8 +109,8 @@ exports.reviewStaffAttendance = async (req, res) => {
         const record = rows[0];
 
         // Scope check: a StaffSupervisor may only review staff explicitly assigned to them.
-        if (req.user.role === 'StaffSupervisor') {
-            const assignedIds = await getAssignedStaffIdsForSupervisor(req.user.user_id, connection);
+        if (user.role === 'StaffSupervisor') {
+            const assignedIds = await getAssignedStaffIdsForSupervisor(user.user_id, connection);
             if (!assignedIds.includes(record.staff_id)) {
                 throw new AppError('You are not authorized to review this staff member\'s attendance.', 403);
             }
@@ -129,8 +121,8 @@ exports.reviewStaffAttendance = async (req, res) => {
 
         let ackNote = null;
         if (status === 'Approved' && record.anomaly_code && !record.anomaly_ack_at) {
-            ackNote = String(req.body.anomaly_note || '').trim();
-            if (req.body.acknowledge_anomaly !== true || ackNote.length < 5) {
+            ackNote = String(anomaly_note || '').trim();
+            if (acknowledge_anomaly !== true || ackNote.length < 5) {
                 throw new AppError(
                     `This record is flagged for review: ${record.anomaly_detail || record.anomaly_code}. Approve only with acknowledge_anomaly = true and a note, or reject / correct it.`,
                     409, { code: 'ANOMALY_ACK_REQUIRED', anomaly_detail: record.anomaly_detail });
@@ -165,13 +157,98 @@ exports.reviewStaffAttendance = async (req, res) => {
         );
 
         await connection.commit();
+    } catch (error) {
+        try { await connection.rollback(); } catch (_) {}
+        throw error;
+    }
+}
+
+function validateReviewInput(status, admin_note) {
+    if (!['Approved', 'Rejected'].includes(status)) {
+        throw new AppError('Status must be Approved or Rejected.');
+    }
+    if (status === 'Rejected' && (!admin_note || !String(admin_note).trim())) {
+        throw new AppError('Rejection reason is required.');
+    }
+}
+
+exports.reviewStaffAttendance = async (req, res) => {
+    const { staff_attendance_id, status, admin_note, is_paid } = req.body;
+    try {
+        validateReviewInput(status, admin_note);
+    } catch (error) {
+        return sendError(res, error, 'Invalid request.');
+    }
+
+    const connection = await db.getConnection();
+    try {
+        await reviewOneRecord(connection, req.user, {
+            staff_attendance_id, status, admin_note, is_paid,
+            acknowledge_anomaly: req.body.acknowledge_anomaly,
+            anomaly_note: req.body.anomaly_note,
+        });
         return res.status(200).json({ status: 'success', message: 'Request processed successfully.' });
     } catch (error) {
-        await connection.rollback();
         return sendError(res, error, 'An error occurred while reviewing the record.');
     } finally {
         connection.release();
     }
+};
+
+// POST /api/staff-attendance/review/bulk
+// { status: 'Approved'|'Rejected', admin_note?, items: [{ staff_attendance_id, acknowledge_anomaly?, anomaly_note? }] }
+// One HTTP request for many records (any dates). Each record is still its own
+// transaction, so one failure never undoes the others; the response lists
+// exactly which records succeeded and why each failed one failed.
+const BULK_REVIEW_MAX = 1000;
+exports.bulkReviewStaffAttendance = async (req, res) => {
+    const { status, admin_note } = req.body || {};
+    const items = Array.isArray(req.body?.items) ? req.body.items : null;
+    try {
+        validateReviewInput(status, admin_note);
+        if (!items || items.length === 0) throw new AppError('No records were sent.');
+        if (items.length > BULK_REVIEW_MAX) throw new AppError(`At most ${BULK_REVIEW_MAX} records per request.`);
+    } catch (error) {
+        return sendError(res, error, 'Invalid request.');
+    }
+
+    const seen = new Set();
+    const succeeded = [];
+    const failed = [];
+    const connection = await db.getConnection();
+    try {
+        for (const item of items) {
+            const id = Number(item?.staff_attendance_id);
+            if (!Number.isInteger(id) || id <= 0 || seen.has(id)) {
+                if (!seen.has(id)) failed.push({ staff_attendance_id: item?.staff_attendance_id ?? null, message: 'Invalid record id.' });
+                continue;
+            }
+            seen.add(id);
+            try {
+                await reviewOneRecord(connection, req.user, {
+                    staff_attendance_id: id, status, admin_note,
+                    acknowledge_anomaly: item.acknowledge_anomaly,
+                    anomaly_note: item.anomaly_note,
+                });
+                succeeded.push(id);
+            } catch (error) {
+                if (!(error && error.isOperational)) console.error('Bulk staff review failed for record', id, error);
+                failed.push({
+                    staff_attendance_id: id,
+                    ...(error?.extra?.code ? { code: error.extra.code } : {}),
+                    message: error && error.isOperational ? error.message : 'Unexpected error while reviewing this record.',
+                });
+            }
+        }
+    } finally {
+        connection.release();
+    }
+
+    return res.status(200).json({
+        status: failed.length === 0 ? 'success' : 'partial',
+        message: `${succeeded.length} succeeded, ${failed.length} failed.`,
+        data: { succeeded, failed },
+    });
 };
 
 // POST /api/staff-attendance/admin/:id/paid  { is_paid: 0|1, reason }
