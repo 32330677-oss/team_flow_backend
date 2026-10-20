@@ -2438,14 +2438,32 @@ doc.fillColor(BRAND.ink);
         if (y + 40 > VBOTTOM - 70) { doc.addPage(); y = VT; }
         doc.font('Helvetica-Bold').fontSize(9).fillColor(COLOR_ACCENT).text('VERSION NOTES', VL, y);
         y += 14;
+        // A line can mix English (labels, numbers) and Arabic (names, the
+        // Admin's note). Each run is written with its own font: the Arabic
+        // font has no Latin letters and Helvetica has no Arabic letters.
+        const latinFont = (bold) => (bold ? 'Helvetica-Bold' : 'Helvetica');
+        const runsOf = (str) => (String(str).match(/[\u0600-\u06FF][\u0600-\u06FF\s.,،]*|[^\u0600-\u06FF]+/g) || [String(str)])
+          .map((tok) => {
+            if (!(hasArabicFont && isArabicText(tok))) return { text: tok, font: null };
+            const lead = tok.match(/^\s*/)[0];
+            const trail = tok.match(/\s*$/)[0];
+            return { text: lead + shapeArabicAware(tok.trim()) + trail, font: 'Arabic' };
+          });
         for (const l of vLines) {
           const indent = l.indent ? 14 : 0;
-          const text = shapeArabicAware(l.text);
-          doc.font(fontNameFor(l.text, Boolean(l.bold))).fontSize(l.bold ? 8.2 : 7.8);
-          const h = doc.heightOfString(text, { width: width - indent });
+          const size = l.bold ? 8.2 : 7.8;
+          const runs = runsOf(l.text);
+          doc.font(latinFont(Boolean(l.bold))).fontSize(size);
+          const h = doc.heightOfString(l.text, { width: width - indent }) + 2;
           if (y + h > VBOTTOM - 60) { doc.addPage(); y = VT; }
-          doc.fillColor(l.bold ? BRAND.ink : BRAND.charcoal).text(text, VL + indent, y, { width: width - indent });
-          y += h + 3;
+          doc.fillColor(l.bold ? BRAND.ink : BRAND.charcoal);
+          runs.forEach((r, i) => {
+            doc.font(r.font || latinFont(Boolean(l.bold))).fontSize(size);
+            const last = i === runs.length - 1;
+            if (i === 0) doc.text(r.text, VL + indent, y, { width: width - indent, continued: !last });
+            else doc.text(r.text, { continued: !last });
+          });
+          y = Math.max(doc.y, y + size + 2) + 3;
         }
         doc.fillColor(BRAND.ink);
         y += 8;
