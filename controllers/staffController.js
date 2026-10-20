@@ -109,19 +109,43 @@ exports.createStaff = async (req, res) => {
 
         const effectiveHireDate = hire_date;
 
-        const [staffResult] = await connection.query(
-            `INSERT INTO staff_members
-                (staff_unique_id, full_name, phone_number, position, site_id,
-                 hire_date, first_hire_date, monthly_salary, standard_daily_hours, paid_leave_types, status)
-             VALUES ('TEMP', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active')`,
-            [
-                full_name, phone_number || null, position || null, site_id || null,
-                effectiveHireDate, effectiveHireDate, numericSalary, numericDailyHours, parsePaidLeaveTypes(paid_leave_types)
-            ]
-        );
-        const newStaffId = staffResult.insertId;
-        const staffUniqueId = `STF-${10000 + newStaffId}`;
-        await connection.query('UPDATE staff_members SET staff_unique_id = ? WHERE staff_id = ?', [staffUniqueId, newStaffId]);
+        // Staff code: next number in the existing STF-001 ... STF-049 series
+        // (highest existing number + 1, at least 3 digits). Codes from the old
+        // "10000 + staff_id" rule (STF-10051 ...) are ignored. The UNIQUE key
+        // on staff_unique_id guarantees no duplicate: if two staff are added
+        // at the same moment, the second one takes the following number.
+        let newStaffId = null;
+        let staffUniqueId = null;
+        for (let attempt = 0; attempt < 5 && newStaffId === null; attempt += 1) {
+            const [[seq]] = await connection.query(
+                `SELECT COALESCE(MAX(CAST(SUBSTRING(staff_unique_id, 5) AS UNSIGNED)), 0) AS n
+                 FROM staff_members
+                 WHERE staff_unique_id REGEXP '^STF-[0-9]+$'
+                   AND CAST(SUBSTRING(staff_unique_id, 5) AS UNSIGNED) < 10000`
+            );
+            staffUniqueId = `STF-${String(Number(seq.n) + 1).padStart(3, '0')}`;
+            try {
+                const [staffResult] = await connection.query(
+                    `INSERT INTO staff_members
+                        (staff_unique_id, full_name, phone_number, position, site_id,
+                         hire_date, first_hire_date, monthly_salary, standard_daily_hours, paid_leave_types, status)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active')`,
+                    [
+                        staffUniqueId,
+                        full_name, phone_number || null, position || null, site_id || null,
+                        effectiveHireDate, effectiveHireDate, numericSalary, numericDailyHours, parsePaidLeaveTypes(paid_leave_types)
+                    ]
+                );
+                newStaffId = staffResult.insertId;
+            } catch (insertError) {
+                const codeTaken = insertError && insertError.code === 'ER_DUP_ENTRY'
+                    && String(insertError.message || '').includes('staff_unique_id');
+                if (!codeTaken) throw insertError;
+            }
+        }
+        if (newStaffId === null) {
+            throw Object.assign(new Error('Could not assign a staff code. Please try again.'), { isOperational: true, statusCode: 409 });
+        }
 
         await connection.commit();
 
