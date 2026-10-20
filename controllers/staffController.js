@@ -2,6 +2,7 @@ const db = require('../config/db');
 const { acquireCreateLock, releaseCreateLock } = require('../middleware/duplicateGuard');
 const { businessToday, isValidDateOnly: isValidBusinessDate } = require('../services/businessDate');
 const { recordStaffCompensationChange } = require('../services/staffCompensationService');
+const { planHireDateChange, applyHireDateChange } = require('../services/staffHireDateService');
 
 const DEFAULT_DAILY_HOURS = 8.00;
 
@@ -194,25 +195,21 @@ exports.updateStaff = async (req, res) => {
             effectiveHireDate = hire_date;
         }
 
-        const currentHireDate = current.hire_date
-            ? String(current.hire_date).slice(0, 10)
-            : null;
-        if (effectiveHireDate !== currentHireDate) {
-            const [payrollRows] = await connection.execute(
-                `SELECT sp.staff_payroll_id
-                 FROM staff_payroll sp
-                 JOIN staff_payroll_batches spb
-                   ON spb.staff_payroll_batch_id = sp.staff_payroll_batch_id
-                 WHERE sp.staff_id = ? AND spb.status IN ('Generated', 'Paid')
-                 LIMIT 1`,
-                [id]
-            );
-            if (payrollRows.length > 0) {
-                throw Object.assign(
-                    new Error('Hire date cannot be changed while this staff member has payroll in a non-superseded batch.'),
-                    { isOperational: true, statusCode: 409 }
-                );
-            }
+        // Hire date correction: moves first_hire_date (what payroll reads) and
+        // the first salary/hours period and assignments with it, or refuses
+        // with the reason (see services/staffHireDateService.js).
+        const currentHireDate = current.hire_date ? String(current.hire_date).slice(0, 10) : null;
+        // Only when the Admin actually changed the date: other edits (salary,
+        // position...) never touch employment dates.
+        if (hire_date !== undefined && effectiveHireDate !== currentHireDate) {
+            const hirePlan = await applyHireDateChange(connection, Number(id), effectiveHireDate, {
+                userId: req.user?.user_id,
+                reason: req.body.hire_date_reason ? String(req.body.hire_date_reason).trim().slice(0, 500) : null,
+            });
+            // The compensation change below anchors its baseline on the
+            // employment start: only move it when the employment start moved.
+            current.hire_date = effectiveHireDate;
+            if (hirePlan.mode === 'full') current.first_hire_date = effectiveHireDate;
         }
 
         if (site_id !== undefined && site_id !== null && site_id !== '') {
@@ -307,13 +304,32 @@ exports.updateStaff = async (req, res) => {
         const status = error.statusCode || (error.isOperational ? 400 : 500);
         return res.status(status).json({
             status: 'error',
-            message: error.isOperational ? error.message : 'An error occurred while updating the staff member'
+            message: error.isOperational ? error.message : 'An error occurred while updating the staff member',
+            ...(error.isOperational && error.extra ? error.extra : {}),
         });
     } finally {
         connection.release();
     }
 };
 
+
+// GET /api/staff/:id/hire-date-impact?new_date=YYYY-MM-DD
+// What a hire-date correction would change, or why it is refused. Read only;
+// the app shows it before saving.
+exports.getHireDateImpact = async (req, res) => {
+    const id = Number(req.params.id);
+    const newDate = String(req.query.new_date || '');
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ status: 'error', message: 'Invalid staff id.' });
+    if (!isValidDateOnly(newDate)) return res.status(400).json({ status: 'error', message: 'new_date (YYYY-MM-DD) is required.' });
+    try {
+        const plan = await planHireDateChange(db, id, newDate);
+        return res.status(200).json({ status: 'success', data: plan });
+    } catch (error) {
+        if (error.isOperational) return res.status(error.statusCode || 400).json({ status: 'error', message: error.message });
+        console.error('HIRE DATE IMPACT ERROR:', error);
+        return res.status(500).json({ status: 'error', message: 'Failed to check the hire date change.' });
+    }
+};
 
 // D3: GET /api/staff/:id/compensation-history
 exports.getCompensationHistory = async (req, res) => {

@@ -170,6 +170,119 @@ exports.unassignCurrent = async (req, res) => {
     connection.release();
   }
 };
+// PATCH /api/staff/:id/supervisor-assignments/:assignmentId/start-date
+// body: { new_start_date, reason }
+// Corrects the FIRST day of one Staff Supervisor assignment (a date entered
+// wrong). Refused when the new start is in the future, after the assignment's
+// last day, before the employment start (fix the hire date first), or when an
+// earlier start would overlap another supervisor assignment of the same staff
+// member. Attendance and payroll are not touched (they never depend on the
+// supervisor assignment). Audited (SUPERVISOR_ASSIGNMENT_START_CHANGED).
+exports.changeStartDate = async (req, res) => {
+  const staffId = Number(req.params.id);
+  const assignmentId = Number(req.params.assignmentId);
+  const newStart = String((req.body || {}).new_start_date || '').trim();
+  const reason = String((req.body || {}).reason || '').trim();
+  const adminId = req.user.user_id;
+
+  if (!Number.isInteger(staffId) || staffId <= 0 || !Number.isInteger(assignmentId) || assignmentId <= 0) {
+    return res.status(400).json({ status: 'error', message: 'Invalid staff or assignment id.' });
+  }
+  if (!isValidDateOnly(newStart)) {
+    return res.status(400).json({ status: 'error', message: 'new_start_date (YYYY-MM-DD) is required: the new FIRST day of the assignment.' });
+  }
+  if (newStart > businessToday()) {
+    return res.status(400).json({ status: 'error', message: 'The start date cannot be in the future.' });
+  }
+  if (reason.length < 3) {
+    return res.status(400).json({ status: 'error', message: 'A reason is required.' });
+  }
+
+  const connection = await db.getConnection();
+  const fail = async (code, message, extra = {}) => {
+    await connection.rollback();
+    return res.status(code).json({ status: 'error', message, ...extra });
+  };
+  try {
+    await connection.beginTransaction();
+    // Same lock order as the other staff changes: staff row first.
+    const [[staff]] = await connection.execute(
+      `SELECT staff_id, DATE_FORMAT(COALESCE(first_hire_date, hire_date), '%Y-%m-%d') AS employment_start
+       FROM staff_members WHERE staff_id = ? FOR UPDATE`, [staffId]);
+    if (!staff) return fail(404, 'Staff member not found.');
+
+    const [[a]] = await connection.execute(
+      `SELECT ssa.staff_assignment_id, ssa.supervisor_user_id, u.full_name AS supervisor_name,
+              DATE_FORMAT(ssa.assigned_date, '%Y-%m-%d') AS assigned_date,
+              DATE_FORMAT(ssa.unassigned_date, '%Y-%m-%d') AS last_day
+       FROM staff_supervisor_assignments ssa
+       JOIN users u ON u.user_id = ssa.supervisor_user_id
+       WHERE ssa.staff_assignment_id = ? AND ssa.staff_id = ? FOR UPDATE`, [assignmentId, staffId]);
+    if (!a) return fail(404, 'Assignment not found.');
+
+    const oldStart = a.assigned_date;
+    if (a.last_day !== null && a.last_day < oldStart) {
+      return fail(409, 'This assignment was cancelled (it has no assigned day); create a new assignment instead.');
+    }
+    if (newStart === oldStart) return fail(400, `The assignment already starts on ${oldStart}.`);
+    if (a.last_day !== null && newStart > a.last_day) {
+      return fail(409, `The new start cannot be after the assignment's last day (${a.last_day}).`);
+    }
+    if (staff.employment_start && newStart < staff.employment_start) {
+      return fail(409,
+        `The new start (${newStart}) is before the hire date (${staff.employment_start}). ` +
+        'If the hire date is wrong, correct it first from Edit (the first assignment moves with it).',
+        { code: 'BEFORE_HIRE_DATE', hire_date: staff.employment_start });
+    }
+
+    const earlier = newStart < oldStart;
+    if (earlier) {
+      // Added days [newStart, oldStart - 1] must not belong to another assignment.
+      const addedTo = addDays(oldStart, -1);
+      const [overlaps] = await connection.execute(
+        `SELECT ssa.staff_assignment_id, u.full_name AS supervisor_name,
+                DATE_FORMAT(ssa.assigned_date, '%Y-%m-%d') AS assigned_date,
+                DATE_FORMAT(ssa.unassigned_date, '%Y-%m-%d') AS last_day
+         FROM staff_supervisor_assignments ssa
+         JOIN users u ON u.user_id = ssa.supervisor_user_id
+         WHERE ssa.staff_id = ? AND ssa.staff_assignment_id <> ?
+           AND (ssa.unassigned_date IS NULL OR ssa.unassigned_date >= ssa.assigned_date)
+           AND ssa.assigned_date <= ? AND (ssa.unassigned_date IS NULL OR ssa.unassigned_date >= ?)
+         ORDER BY ssa.assigned_date LIMIT 1`,
+        [staffId, assignmentId, addedTo, newStart]);
+      if (overlaps.length) {
+        const o = overlaps[0];
+        return fail(409,
+          `The previous assignment to ${o.supervisor_name} covers ${o.assigned_date} to ${o.last_day || 'open'}, ` +
+          `which overlaps ${newStart} to ${addedTo}. End that assignment earlier first, or choose a later start.`,
+          { code: 'OVERLAP', conflict: o });
+      }
+    }
+
+    await connection.execute(
+      'UPDATE staff_supervisor_assignments SET assigned_date = ? WHERE staff_assignment_id = ?',
+      [newStart, assignmentId]);
+    await connection.execute(
+      `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+       VALUES ('staff_members', ?, 'SUPERVISOR_ASSIGNMENT_START_CHANGED', ?, ?, ?)`,
+      [staffId, adminId,
+        JSON.stringify({ staff_assignment_id: assignmentId, supervisor_user_id: a.supervisor_user_id, assigned_date: oldStart }),
+        JSON.stringify({ assigned_date: newStart, reason })]);
+    await connection.commit();
+    return res.status(200).json({
+      status: 'success',
+      message: `${a.supervisor_name} now supervises this staff member from ${newStart}.`,
+      data: { staff_assignment_id: assignmentId, old_start_date: oldStart, new_start_date: newStart },
+    });
+  } catch (error) {
+    try { await connection.rollback(); } catch (_) {}
+    console.error('CHANGE STAFF SUPERVISOR ASSIGNMENT START ERROR:', error);
+    return res.status(500).json({ status: 'error', message: 'An error occurred while changing the start date.' });
+  } finally {
+    connection.release();
+  }
+};
+
 // POST /api/staff/supervisor-assignments/bulk
 // body: { staff_ids: number[], supervisor_user_id, assigned_date, notes }
 // Assigns the SAME supervisor to multiple staff members in one call.

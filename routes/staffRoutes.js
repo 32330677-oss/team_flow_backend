@@ -17,6 +17,7 @@ router.get('/', restrictTo('Admin'), staffController.getAllStaff);
 router.post('/', restrictTo('Admin'), staffController.createStaff);
 router.put('/:id', restrictTo('Admin'), staffController.updateStaff);
 router.get('/:id/compensation-history', restrictTo('Admin'), staffController.getCompensationHistory);
+router.get('/:id/hire-date-impact', restrictTo('Admin'), staffController.getHireDateImpact);
 
 // Recycle bin: safe delete with a 30-day undo window (Admin only).
 router.get('/:id/deletion-check', restrictTo('Admin'), recycleBinController.staff.check);
@@ -44,5 +45,6 @@ router.post('/supervisor-assignments/bulk', restrictTo('Admin'), staffSupervisor
 router.get('/:id/supervisor-assignments', restrictTo('Admin'), staffSupervisorAssignmentController.getHistory);
 router.post('/:id/supervisor-assignments', restrictTo('Admin'), staffSupervisorAssignmentController.assignSupervisor);
 router.delete('/:id/supervisor-assignments/current', restrictTo('Admin'), staffSupervisorAssignmentController.unassignCurrent);
+router.patch('/:id/supervisor-assignments/:assignmentId/start-date', restrictTo('Admin'), staffSupervisorAssignmentController.changeStartDate);
 
 module.exports = router;
