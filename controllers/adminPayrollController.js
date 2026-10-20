@@ -1465,7 +1465,7 @@ async function exportPayrollExcel(req, res) {
       head.font = { bold: true };
       head.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF4E0' } };
       head.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
-      let offTotal = 0;
+      // Notice only: no OFF-CYCLE / PERIOD totals (paid in their own batches).
       offcyclePaid.forEach((o, i) => {
         const inThis = byWorker.has(o.worker_id);
         const r = summarySheet.addRow({
@@ -1478,14 +1478,7 @@ async function exportPayrollExcel(req, res) {
           signature: inThis ? 'Yes (remaining days)' : 'No (whole period)',
         });
         r.getCell(7).numFmt = moneyFmt;
-        offTotal += o.amount;
       });
-      const offTotalRow = summarySheet.addRow({ worker_name: 'OFF-CYCLE TOTAL', net_salary: Math.round(offTotal * 100) / 100 });
-      offTotalRow.font = { bold: true };
-      offTotalRow.getCell(7).numFmt = moneyFmt;
-      const periodRow = summarySheet.addRow({ worker_name: 'PERIOD TOTAL (this batch + off-cycle)', net_salary: Math.round((grandTotalNet + offTotal) * 100) / 100 });
-      periodRow.font = { bold: true, color: { argb: 'FF1A2A6C' } };
-      periodRow.getCell(7).numFmt = moneyFmt;
     }
 
     // Retro pay: adjustments carried by this batch (already inside Net Salary).
@@ -1502,7 +1495,8 @@ async function exportPayrollExcel(req, res) {
     if (String(req.query.version_notes || '') === '1') {
       const history = await payrollVersions.getVersionHistory(pool, batchId);
       const fmtText = (v) => (Math.round(Number(v || 0) * 100) / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      const vLines = payrollVersions.buildVersionNoteLines(history, batchId, fmtText);
+      const vLines = payrollVersions.buildVersionNoteLines(history, batchId, fmtText,
+        payrollVersions.parseSelectedVersions(req.query.versions));
       if (vLines.length) {
         summarySheet.addRow([]);
         const title = summarySheet.addRow({ number: 'VERSION NOTES' });
@@ -2367,7 +2361,7 @@ doc.fillColor(BRAND.ink);
         y += rowH;
       };
       drawRow(cols.map((c) => c.label), { bold: true, fill: COLOR_SUMMARY_BG });
-      let offTotal = 0;
+      // Notice only: no OFF-CYCLE / PERIOD totals (paid in their own batches).
       offcyclePaid.forEach((o, i) => {
         if (y + rowH > VBOTTOM - 40) { doc.addPage(); y = VT; }
         drawRow([
@@ -2376,14 +2370,7 @@ doc.fillColor(BRAND.ink);
           o.status === 'Paid' ? 'Paid' : (o.is_finalized ? 'Finalized, not paid' : 'Not finalized'),
           netByWorker.has(o.worker_id) ? 'Yes (remaining days)' : 'No (whole period)',
         ]);
-        offTotal += o.amount;
       });
-      y += 4;
-      doc.font('Helvetica-Bold').fontSize(8).fillColor(COLOR_ACCENT)
-        .text(`OFF-CYCLE TOTAL: ${Math.round(offTotal).toLocaleString('en-US')} ${CURRENCY_CODE}     ` +
-          `PERIOD TOTAL (this batch + off-cycle): ${Math.round(num(grandTotalNet) + offTotal).toLocaleString('en-US')} ${CURRENCY_CODE}`,
-        VL, y, { lineBreak: false });
-      doc.fillColor(BRAND.ink);
       y += 18;
     }
 
@@ -2432,7 +2419,8 @@ doc.fillColor(BRAND.ink);
     if (String(req.query.version_notes || '') === '1') {
       const history = await payrollVersions.getVersionHistory(pool, batchId);
       const fmtText = (v) => `${Math.round(num(v)).toLocaleString('en-US')} ${CURRENCY_CODE}`;
-      const vLines = payrollVersions.buildVersionNoteLines(history, batchId, fmtText);
+      const vLines = payrollVersions.buildVersionNoteLines(history, batchId, fmtText,
+        payrollVersions.parseSelectedVersions(req.query.versions));
       if (vLines.length) {
         const width = pageWidth;
         if (y + 40 > VBOTTOM - 70) { doc.addPage(); y = VT; }

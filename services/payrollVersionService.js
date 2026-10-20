@@ -113,19 +113,22 @@ function summarizeChanges(c, fmtMoney = (v) => round2(v).toFixed(2), maxNames = 
 }
 
 /**
- * Lines for the optional "VERSION NOTES" section of a printed batch: every
- * version up to the printed one (newest first), with who / when / total, the
- * automatic change summary and the Admin's note; plus "Replaced by" when the
- * printed batch is no longer the active version.
- * Returns [] when there is nothing to say (first and only version, no note).
+ * Lines for the optional "VERSION NOTES" section of a printed batch.
+ * Only the versions the Admin ticked when exporting (`selectedIds`, batch ids)
+ * are printed, oldest first (v1 -> latest), and never versions newer than the
+ * printed batch. Each version: who / when / total, the automatic change
+ * summary and the Admin's note. "Replaced by" is added when the printed batch
+ * is no longer the active version. Returns [] when nothing is selected.
  */
-function buildVersionNoteLines(history, batchId, fmtMoney) {
+function buildVersionNoteLines(history, batchId, fmtMoney, selectedIds = null) {
   if (!Array.isArray(history) || !history.length) return [];
   const idx = history.findIndex((v) => Number(v.payroll_batch_id) === Number(batchId));
   if (idx < 0) return [];
   const current = history[idx];
-  const shown = history.slice(0, idx + 1).reverse();
-  if (shown.length === 1 && !current.note && !current.replaced_by) return [];
+  const wanted = selectedIds ? new Set([...selectedIds].map(Number)) : null;
+  const shown = history.slice(0, idx + 1)
+    .filter((v) => !wanted || wanted.has(Number(v.payroll_batch_id)));
+  if (!shown.length) return [];
   const when = (v) => String(v.generated_at || '').replace('T', ' ').slice(0, 16);
   const lines = [];
   for (const v of shown) {
@@ -144,4 +147,10 @@ function buildVersionNoteLines(history, batchId, fmtMoney) {
   return lines;
 }
 
-module.exports = { getVersionHistory, summarizeChanges, diffVersions, buildVersionNoteLines };
+/** ?versions=101,102 -> [101, 102]; missing / empty -> null (all). */
+function parseSelectedVersions(value) {
+  if (value === undefined || value === null || String(value).trim() === '') return null;
+  return String(value).split(',').map((x) => Number(x.trim())).filter((n) => Number.isInteger(n) && n > 0);
+}
+
+module.exports = { getVersionHistory, summarizeChanges, diffVersions, buildVersionNoteLines, parseSelectedVersions };
