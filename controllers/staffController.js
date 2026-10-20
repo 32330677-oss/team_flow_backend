@@ -3,6 +3,7 @@ const { acquireCreateLock, releaseCreateLock } = require('../middleware/duplicat
 const { businessToday, isValidDateOnly: isValidBusinessDate } = require('../services/businessDate');
 const { recordStaffCompensationChange } = require('../services/staffCompensationService');
 const { planHireDateChange, applyHireDateChange } = require('../services/staffHireDateService');
+const { resplitStaffAttendance } = require('../services/staffHoursResplitService');
 
 const DEFAULT_DAILY_HOURS = 8.00;
 
@@ -250,6 +251,7 @@ exports.updateStaff = async (req, res) => {
             Number(numericDailyHours) !== Number(current.standard_daily_hours) ||
             normalizeJson(nextPaidLeave) !== normalizeJson(current.paid_leave_types);
 
+        let resplit = null;
         if (compensationChanged) {
             const compEffectiveFrom = req.body.compensation_effective_from || businessToday();
             if (!isValidBusinessDate(compEffectiveFrom)) {
@@ -276,6 +278,21 @@ exports.updateStaff = async (req, res) => {
                     JSON.stringify({ monthly_salary: current.monthly_salary, standard_daily_hours: current.standard_daily_hours, paid_leave_types: current.paid_leave_types }),
                     JSON.stringify({ monthly_salary: numericSalary, standard_daily_hours: numericDailyHours, paid_leave_types: normalizeJson(nextPaidLeave), effective_from: compEffectiveFrom, reason: req.body.compensation_reason || null })]
             );
+
+            // Standard daily hours changed from a past date: attendance already
+            // recorded from that date was split on the old standard (e.g.
+            // regular capped at 8, the rest stored as overtime). Re-split it on
+            // the new standard so screens and reports show the real regular /
+            // overtime / shortage hours. Locked (finalized / paid) days stay.
+            if (Number(numericDailyHours) !== Number(current.standard_daily_hours)) {
+                resplit = await resplitStaffAttendance(connection, {
+                    staffId: Number(id),
+                    fromDate: compEffectiveFrom,
+                    standardHours: numericDailyHours,
+                    userId: req.user?.user_id || null,
+                    reason: `Standard daily hours ${current.standard_daily_hours} -> ${numericDailyHours} from ${compEffectiveFrom}`,
+                });
+            }
         }
 
         await connection.query(
@@ -297,7 +314,15 @@ exports.updateStaff = async (req, res) => {
         );
 
         await connection.commit();
-        return res.status(200).json({ status: 'success', message: 'Staff member updated successfully' });
+        let message = 'Staff member updated successfully';
+        if (resplit && (resplit.updated.length || resplit.locked.length)) {
+            message += `. ${resplit.updated.length} attendance day(s) re-split on the new daily hours`;
+            if (resplit.locked.length) {
+                message += `; ${resplit.locked.length} day(s) inside a finalized payroll were left unchanged`;
+            }
+            message += '.';
+        }
+        return res.status(200).json({ status: 'success', message, ...(resplit ? { attendance_resplit: resplit } : {}) });
     } catch (error) {
         await connection.rollback();
         console.error('UPDATE STAFF ERROR:', error);
