@@ -4,6 +4,7 @@ const { BRAND } = require('../services/pdfBrand');
 const settingsCache = require('../services/settingsCache');
 const { activeOn } = require('../services/assignmentDates');
 const { businessToday } = require('../services/businessDate');
+const payrollVersions = require('../services/payrollVersionService');
 
 function isValidDate(value) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(value || '')) && !Number.isNaN(Date.parse(`${value}T00:00:00`));
@@ -89,6 +90,11 @@ async function generatePayrollBatch(req, res) {
   const dryRun = Boolean(offcycle && offcycle.dryRun);
   // An off-cycle batch must include every record of the worker in its period.
   const acknowledgePending = !offcycle && req.body?.acknowledge_pending === true;
+  // Optional note of this version (why it was generated again). A supersede of
+  // a finalized batch keeps its own required reason. Stored in supersede_reason.
+  const versionNote = supersede
+    ? supersede.reason
+    : (String(req.body?.version_note || '').trim().slice(0, 500) || null);
 
   if (!userId) return res.status(401).json({ success: false, message: 'Admin identification not found.' });
   if (!isValidDate(start_date) || !isValidDate(end_date)) {
@@ -610,7 +616,7 @@ let attSql = `
          (start_date, end_date, generated_by_user_id, status, scope_site_id, version_number, supersedes_batch_id,
           currency, supersede_reason, batch_type, scope_worker_id, offcycle_reason)
        VALUES (?, ?, ?, 'Generated', ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [start_date, end_date, userId, scopeSiteId, nextVersion, supersedesId, currency, supersede ? supersede.reason : null,
+      [start_date, end_date, userId, scopeSiteId, nextVersion, supersedesId, currency, versionNote,
         batchType, scopeWorkerId, offcycle ? String(offcycle.reason || '').slice(0, 500) : null]
     );
     const batchId = batchResult.insertId;
@@ -713,7 +719,7 @@ let attSql = `
         `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
          VALUES ('payrollbatches', ?, 'SUPERSEDED', ?, ?, ?)`,
         [old.payroll_batch_id, userId, JSON.stringify({ status: old.status, is_finalized: old.is_finalized }),
-          JSON.stringify({ status: 'Superseded', replaced_by_batch_id: batchId, reason: supersede ? supersede.reason : 'Regenerated (not finalized)' })]
+          JSON.stringify({ status: 'Superseded', replaced_by_batch_id: batchId, reason: supersede ? supersede.reason : (versionNote || 'Regenerated (not finalized)') })]
       );
     }
     // Corrections waiting on a superseded finalized batch are now in the replacement.
@@ -822,27 +828,14 @@ async function getPayrollVersionChain(req, res) {
     return res.status(400).json({ success: false, message: 'Invalid batch id.' });
   }
   try {
-    const [anchorRows] = await pool.execute(
-      'SELECT * FROM payrollbatches WHERE payroll_batch_id = ?',
-      [batchId]
-    );
-    if (!anchorRows.length) {
-      return res.status(404).json({ success: false, message: 'Payroll batch not found.' });
-    }
-    const anchor = anchorRows[0];
-
-    const [all] = await pool.execute(
-      `SELECT pb.*, u.full_name AS generated_by, fu.full_name AS finalized_by
-       FROM payrollbatches pb
-       JOIN users u ON u.user_id = pb.generated_by_user_id
-       LEFT JOIN users fu ON fu.user_id = pb.finalized_by_user_id
-       WHERE pb.start_date = ? AND pb.end_date = ? AND pb.scope_site_id <=> ?
-         AND pb.batch_type = ? AND pb.scope_worker_id <=> ?
-       ORDER BY pb.version_number ASC`,
-      [anchor.start_date, anchor.end_date, anchor.scope_site_id, anchor.batch_type, anchor.scope_worker_id]
-    );
-
-    return res.json({ success: true, data: all });
+    // Every version of the same period / site (oldest first), each with its
+    // optional note and an automatic summary of what changed vs the previous one.
+    const versions = await payrollVersions.getVersionHistory(pool, batchId);
+    if (!versions) return res.status(404).json({ success: false, message: 'Payroll batch not found.' });
+    return res.json({
+      success: true,
+      data: versions.map((v) => ({ ...v, changes_summary: payrollVersions.summarizeChanges(v.changes) })),
+    });
   } catch (error) {
     console.error('getPayrollVersionChain:', error);
     return res.status(500).json({ success: false, message: 'Failed to load version history.' });
@@ -1504,6 +1497,26 @@ async function exportPayrollExcel(req, res) {
       adjNote.font = { italic: true, color: { argb: 'FF1A2A6C' } };
     }
     payrollAdjustments.addAdjustmentsSheet(workbook, batchAdjustments, moneyFmt);
+
+    // ---- Optional version notes (?version_notes=1, chosen when exporting) ----
+    if (String(req.query.version_notes || '') === '1') {
+      const history = await payrollVersions.getVersionHistory(pool, batchId);
+      const fmtText = (v) => (Math.round(Number(v || 0) * 100) / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const vLines = payrollVersions.buildVersionNoteLines(history, batchId, fmtText);
+      if (vLines.length) {
+        summarySheet.addRow([]);
+        const title = summarySheet.addRow({ number: 'VERSION NOTES' });
+        summarySheet.mergeCells(title.number, 3, title.number, 9);
+        title.font = { bold: true, color: { argb: 'FF1A2A6C' } };
+        for (const l of vLines) {
+          const r = summarySheet.addRow({ number: `${l.indent ? '     ' : ''}${l.text}` });
+          summarySheet.mergeCells(r.number, 3, r.number, 9);
+          r.font = l.bold ? { bold: true } : { italic: true, size: 10 };
+          r.getCell(3).alignment = { wrapText: true, vertical: 'top', horizontal: 'left' };
+          r.height = Math.max(18, 15 * Math.ceil(l.text.length / 150));
+        }
+      }
+    }
 
     // ---------------- One worksheet per site (بدون أي تغيير) ----------------
     const usedNames = new Set(['Summary', 'Adjustments']);
@@ -2413,6 +2426,30 @@ doc.fillColor(BRAND.ink);
         .text(`TOTAL ADJUSTMENTS: ${adjTotal > 0 ? '+' : ''}${Math.round(adjTotal).toLocaleString('en-US')} ${CURRENCY_CODE}`, VL, y, { lineBreak: false });
       doc.fillColor(BRAND.ink);
       y += 18;
+    }
+
+    // ---- Optional version notes (?version_notes=1, chosen when exporting) ----
+    if (String(req.query.version_notes || '') === '1') {
+      const history = await payrollVersions.getVersionHistory(pool, batchId);
+      const fmtText = (v) => `${Math.round(num(v)).toLocaleString('en-US')} ${CURRENCY_CODE}`;
+      const vLines = payrollVersions.buildVersionNoteLines(history, batchId, fmtText);
+      if (vLines.length) {
+        const width = pageWidth;
+        if (y + 40 > VBOTTOM - 70) { doc.addPage(); y = VT; }
+        doc.font('Helvetica-Bold').fontSize(9).fillColor(COLOR_ACCENT).text('VERSION NOTES', VL, y);
+        y += 14;
+        for (const l of vLines) {
+          const indent = l.indent ? 14 : 0;
+          const text = shapeArabicAware(l.text);
+          doc.font(fontNameFor(l.text, Boolean(l.bold))).fontSize(l.bold ? 8.2 : 7.8);
+          const h = doc.heightOfString(text, { width: width - indent });
+          if (y + h > VBOTTOM - 60) { doc.addPage(); y = VT; }
+          doc.fillColor(l.bold ? BRAND.ink : BRAND.charcoal).text(text, VL + indent, y, { width: width - indent });
+          y += h + 3;
+        }
+        doc.fillColor(BRAND.ink);
+        y += 8;
+      }
     }
 
     // ---- Signature footer ----
