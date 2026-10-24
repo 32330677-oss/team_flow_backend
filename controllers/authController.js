@@ -4,10 +4,14 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { sendPasswordResetOtp } = require('../services/emailService');
 const { accessFor } = require('../services/accessControl');
+const securityAlerts = require('../services/securityAlerts');
 exports.login = async (req, res) => {
     // 1. Receive identifier (email or username) along with password and device_id
     const loginIdentifier = req.body.email || req.body.username;
-    const { password, device_id } = req.body;
+    const { password } = req.body;
+    // Install id sent by the app (random, one per installation). Used only to
+    // notice logins from a new device; anything that is not a short string is ignored.
+    const device_id = securityAlerts.normalizeDeviceId(req.body.device_id);
 
     if (!loginIdentifier || !password) {
         return res.status(400).json({ 
@@ -62,6 +66,8 @@ exports.login = async (req, res) => {
                 `INSERT INTO loginhistory (user_id, device_id, user_agent, success) VALUES (?, ?, ?, ?)`,
                 [user.user_id, device_id || null, req.headers['user-agent'] || '', 0]
             );
+            // Telegram alert after several failures (not awaited; never changes the response).
+            securityAlerts.failedLogin(user, req);
 
             return res.status(401).json({ 
                 status: "error", 
@@ -97,6 +103,10 @@ exports.login = async (req, res) => {
             const upgraded = await bcrypt.hash(password, 10);
             await db.query('UPDATE users SET password_hash = ? WHERE user_id = ?', [upgraded, user.user_id]);
         }
+
+        // 6b. Telegram alert when an Admin logs in from a device not seen before.
+        // Must run before the success row below is written (it compares with earlier logins).
+        await securityAlerts.successfulLogin(user, req, device_id);
 
         // 7. Log successful login attempt in loginhistory (success = 1) with device_id
         await db.query(

@@ -1,4 +1,5 @@
 const rateLimit = require('express-rate-limit');
+const securityAlerts = require('../services/securityAlerts');
 
 // Limits by IP; combined with the per-email guard below to also curb
 // distributed spam against a single victim's inbox.
@@ -23,6 +24,11 @@ const loginLimiter = rateLimit({
     message: {
         status: 'error',
         message: 'Too many failed login attempts. Please wait 15 minutes and try again.',
+    },
+    // Same response as before; also sends a Telegram security alert (once per IP per 30 min).
+    handler: (req, res, next, options) => {
+        securityAlerts.ipBlocked(req);
+        res.status(options.statusCode).send(options.message);
     },
 });
 
